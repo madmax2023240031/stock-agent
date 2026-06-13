@@ -44,18 +44,34 @@ if user_input:
         history_for_manager = st.session_state.messages[:-1]
         
         with st.status("매니저가 팀원들과 상의 중입니다...", expanded=True) as status:
+            EMPLOYEE_LABELS = {
+                "call_research_employee": "🔍 조회",
+                "call_signal_employee": "📊 시그널",
+                "call_news_employee": "📰 뉴스",
+                "call_fundamental_employee": "🏢 펀더멘털",
+                "call_macro_employee": "🌍 거시",
+                "call_portfolio_employee": "💼 포트폴리오",
+                "call_compare_employee": "⚖️ 비교",
+                "call_risk_review_employee": "🚨 리스크검수",
+            }
+            EMPLOYEE_DETAIL = {
+                "call_research_employee": "🔍 조회 직원에게 정보 요청 중...",
+                "call_signal_employee": "📊 시그널 직원에게 분석 요청 중...",
+                "call_news_employee": "📰 뉴스 직원에게 소식 확인 중...",
+                "call_fundamental_employee": "🏢 펀더멘털 직원에게 재무 분석 요청 중...",
+                "call_macro_employee": "🌍 거시 직원에게 시장 환경 분석 중...",
+                "call_portfolio_employee": "💼 포트폴리오 직원에게 점검 요청 중...",
+                "call_compare_employee": "⚖️ 비교 직원에게 종목 비교 요청 중...",
+                "call_risk_review_employee": "🚨 리스크 검수 직원에게 최종 검증 받는 중...",
+            }
+
             def status_cb(tool_name):
-                employee_names = {
-                    "call_research_employee": "🔍 조회 직원에게 정보 요청 중...",
-                    "call_signal_employee": "📊 시그널 직원에게 분석 요청 중...",
-                    "call_news_employee": "📰 뉴스 직원에게 소식 확인 중...",
-                    "call_fundamental_employee": "🏢 펀더멘털 직원에게 재무 분석 요청 중...",
-                    "call_macro_employee": "🌍 거시 직원에게 시장 환경 분석 중...",
-                    "call_portfolio_employee": "💼 포트폴리오 직원에게 점검 요청 중...",
-                    "call_compare_employee": "⚖️ 비교 직원에게 종목 비교 요청 중...",
-                    "call_risk_review_employee": "🚨 리스크 검수 직원에게 최종 검증 받는 중..."
-                }
-                status.write(employee_names.get(tool_name, f"작업 요청: {tool_name}"))
+                if tool_name.startswith("__parallel_batch__:"):
+                    names = tool_name.split(":", 1)[1].split(",")
+                    labels = [EMPLOYEE_LABELS.get(n, n) for n in names]
+                    status.write(f"🔄 {len(names)}명 직원 **병렬** 동시 분석 중: {' · '.join(labels)}")
+                else:
+                    status.write(EMPLOYEE_DETAIL.get(tool_name, f"작업 요청: {tool_name}"))
                 
             try:
                 response = manager.manager(user_input, history=history_for_manager, status_callback=status_cb)

@@ -5,7 +5,8 @@ manager.py
 """
 
 import os
-import json
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 from anthropic import Anthropic
 
@@ -41,8 +42,18 @@ def manager(user_input: str, history: list = None, status_callback=None) -> str:
         "분석 직원의 결과를 받은 후에는 반드시 그 결과들을 모아 `call_risk_review_employee`를 마지막에 호출하여 "
         "환각이나 숫자 충돌이 없는지, 위험한 주장이 없는지 검증받으세요. 단순 시세 조회라면 생략해도 무방합니다.\n"
         "4. **절대 원칙**: 미래 주가 예측(예: '3개월 뒤 10만원 갑니다')은 절대 하지 마세요.\n"
-        "5. **최종 답변 형식**: 각 직원의 보고를 깔끔하게 종합하여 사용자에게 전달하되, "
-        "답변 마지막에는 반드시 '이 정보는 참고용이며 투자 권유가 아닙니다'라는 문구를 포함하세요."
+        "5. **최종 답변 형식**: 직원이 2명 이상 동원된 복합 질문의 경우, 답변을 아래 두 파트로 구성하세요.\n\n"
+        "   ▶ [파트 1] 한 줄 요약 박스 — 반드시 상세 보고서보다 먼저 작성\n"
+        "   다음 마크다운 형식을 그대로 사용하세요:\n"
+        "   ```\n"
+        "   > 📌 **한 줄 요약**\n"
+        "   > - 📊 **현재 상황**: (오늘 시세·등락 등 가장 눈에 띄는 사실 1줄)\n"
+        "   > - 🧭 **핵심 판단**: (단기·중장기 관점의 균형 잡힌 종합 판단 1줄 — 단정 금지)\n"
+        "   > - ⚠️ **주요 주의점**: (리스크 검수 직원이 짚은 가장 중요한 경고 1줄)\n"
+        "   ```\n"
+        "   ▶ [파트 2] 상세 보고서 — 각 직원의 분석을 섹션별로 정리\n\n"
+        "   단순 시세 조회처럼 직원 1명만 쓴 경우에는 요약 박스 없이 바로 답변해도 됩니다.\n"
+        "   답변 마지막에는 반드시 '이 정보는 참고용이며 투자 권유가 아닙니다'라는 문구를 포함하세요."
     )
     
     # 매니저가 사용할 도구(직원들) 목록
@@ -118,33 +129,54 @@ def manager(user_input: str, history: list = None, status_callback=None) -> str:
         messages.append({"role": "assistant", "content": response.content})
         
         if response.stop_reason == "tool_use":
+            tool_blocks = [b for b in response.content if b.type == "tool_use"]
+
+            # 리스크 검수 직원은 다른 직원 결과가 필요하므로 항상 마지막에 순차 실행
+            parallel_blocks = [b for b in tool_blocks if b.name != "call_risk_review_employee"]
+            risk_blocks = [b for b in tool_blocks if b.name == "call_risk_review_employee"]
+
+            # notify=True: 메인 스레드에서 호출할 때만 status_callback 실행
+            # notify=False: 워커 스레드에서 호출 — Streamlit ScriptRunContext가 없어
+            #               status.write()를 부르면 예외가 발생하므로 콜백을 건너뜀
+            def execute_block(block, notify: bool = True):
+                tool_name = block.name
+                print(f"\n[Manager] 👨‍💼 ➡ 🧑‍💻 직원 호출: {tool_name}")
+                if notify and status_callback:
+                    status_callback(tool_name)
+                if tool_name in tool_map:
+                    try:
+                        result_str = tool_map[tool_name](**block.input)
+                    except Exception as e:
+                        result_str = f"직원 실행 오류: {str(e)}"
+                else:
+                    result_str = f"Unknown tool: {tool_name}"
+                return {"type": "tool_result", "tool_use_id": block.id, "content": result_str}
+
             tool_results = []
-            
-            for block in response.content:
-                if block.type == "tool_use":
-                    tool_name = block.name
-                    tool_id = block.id
-                    tool_args = block.input
-                    
-                    print(f"\n[Manager] 👨‍💼 ➡ 🧑‍💻 직원 호출: {tool_name}")
-                    if status_callback:
-                        status_callback(tool_name)
-                    
-                    if tool_name in tool_map:
-                        try:
-                            # 실제 직원 함수 실행 (API 통신 발생)
-                            result_str = tool_map[tool_name](**tool_args)
-                        except Exception as e:
-                            result_str = f"직원 실행 오류: {str(e)}"
-                    else:
-                        result_str = f"Unknown tool: {tool_name}"
-                        
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": tool_id,
-                        "content": result_str
-                    })
-            
+
+            if len(parallel_blocks) > 1:
+                # 병렬 실행 시작을 메인 스레드에서 한 번에 알림 (워커에서 알리지 않음)
+                names = [b.name for b in parallel_blocks]
+                print(f"\n[Manager] 🔄 {len(parallel_blocks)}명 직원 병렬 실행 시작: {names}")
+                if status_callback:
+                    status_callback(f"__parallel_batch__:{','.join(names)}")
+
+                t0 = time.time()
+                with ThreadPoolExecutor(max_workers=len(parallel_blocks)) as executor:
+                    # notify=False: 워커 스레드에서 Streamlit 콜백 호출 금지
+                    futures = {executor.submit(execute_block, b, False): b for b in parallel_blocks}
+                    for future in as_completed(futures):
+                        tool_results.append(future.result())
+                elapsed = time.time() - t0
+                print(f"\n[Manager] ✅ 병렬 실행 완료: {elapsed:.1f}초 (직원 {len(parallel_blocks)}명 동시 처리)")
+            elif len(parallel_blocks) == 1:
+                # 단일 직원은 메인 스레드에서 직접 실행 → notify=True
+                tool_results.append(execute_block(parallel_blocks[0], notify=True))
+
+            # 리스크 검수는 앞 직원들이 모두 끝난 뒤 메인 스레드에서 순차 실행
+            for block in risk_blocks:
+                tool_results.append(execute_block(block, notify=True))
+
             messages.append({"role": "user", "content": tool_results})
             
         elif response.stop_reason == "end_turn":
