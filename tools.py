@@ -9,6 +9,7 @@ tools.py
 - 함수 시그니처(이름·인자)는 안정적으로 유지한다.
 """
 
+import math
 import re
 import time
 import threading
@@ -970,6 +971,432 @@ def get_sector_comparison(ticker: str) -> dict:
         "assessment":        assessment,
         "peer_median_pct":   peer_median_pct,
         "isolation_gap":     isolation_gap,
+    }
+
+
+# ═══════════════════════════════════════════════
+# 8. get_universe
+# ═══════════════════════════════════════════════
+
+# 유니버스 캐시 (TTL 1시간 — 구성종목은 자주 안 바뀜)
+_universe_cache: dict[str, tuple[float, list]] = {}
+_universe_lock = threading.Lock()
+_UNIVERSE_TTL = 3600
+
+def get_universe(market: str = "ALL") -> dict:
+    """
+    발굴 대상 종목 유니버스를 반환한다.
+
+    Parameters
+    ----------
+    market : str
+        'KR'  → 코스피 시총 상위 200 (우선주 제외) — KOSPI200 근사
+        'US'  → S&P500 구성종목 (503개)
+        'ALL' → KR + US 합산
+
+    Returns
+    -------
+    dict
+        {
+            "market" : str,
+            "count"  : int,
+            "tickers": [{"ticker": str, "name": str, "sector": str | None}]
+        }
+        실패 시: {"error": "..."}
+    """
+    market = market.upper().strip()
+    if market not in ("KR", "US", "ALL"):
+        return {"error": f"지원하지 않는 market: '{market}'. 'KR'·'US'·'ALL' 중 선택하세요."}
+
+    def _fetch_kr() -> list | dict:
+        now = time.time()
+        with _universe_lock:
+            if "KR" in _universe_cache:
+                ts, cached = _universe_cache["KR"]
+                if now - ts < _UNIVERSE_TTL:
+                    return cached
+        try:
+            listing = fdr.StockListing("KRX")
+            listing.columns = [c.lower() for c in listing.columns]
+
+            # KOSPI만 추출
+            kospi = listing[listing["market"] == "KOSPI"].copy()
+
+            # 우선주 제외: 종목명이 '우', '우B', '우C', '1우', '2우' 등으로 끝나는 경우
+            kospi = kospi[~kospi["name"].str.contains(r"\d?우[A-Z]?$", regex=True, na=False)]
+
+            # 시가총액 기준 상위 200
+            kospi["marcap"] = pd.to_numeric(kospi["marcap"], errors="coerce").fillna(0)
+            top200 = kospi.nlargest(200, "marcap")
+
+            result = [
+                {"ticker": str(row["code"]), "name": str(row["name"]), "sector": None}
+                for _, row in top200.iterrows()
+            ]
+            with _universe_lock:
+                _universe_cache["KR"] = (time.time(), result)
+            return result
+        except Exception as e:
+            return {"error": f"KR 유니버스 조회 실패: {e}"}
+
+    def _fetch_us() -> list | dict:
+        now = time.time()
+        with _universe_lock:
+            if "US" in _universe_cache:
+                ts, cached = _universe_cache["US"]
+                if now - ts < _UNIVERSE_TTL:
+                    return cached
+        try:
+            sp500 = fdr.StockListing("S&P500")
+            result = [
+                {
+                    "ticker": str(row["Symbol"]),
+                    "name":   str(row["Name"]),
+                    "sector": str(row["Sector"]) if pd.notna(row.get("Sector")) else None,
+                }
+                for _, row in sp500.iterrows()
+            ]
+            with _universe_lock:
+                _universe_cache["US"] = (time.time(), result)
+            return result
+        except Exception as e:
+            return {"error": f"US 유니버스 조회 실패: {e}"}
+
+    if market == "KR":
+        kr = _fetch_kr()
+        if isinstance(kr, dict):
+            return kr
+        return {"market": "KR", "count": len(kr), "tickers": kr}
+
+    if market == "US":
+        us = _fetch_us()
+        if isinstance(us, dict):
+            return us
+        return {"market": "US", "count": len(us), "tickers": us}
+
+    # ALL
+    kr = _fetch_kr()
+    us = _fetch_us()
+    warnings_list: list[str] = []
+    tickers: list[dict] = []
+
+    if isinstance(kr, dict):
+        warnings_list.append(kr["error"])
+    else:
+        tickers.extend(kr)
+
+    if isinstance(us, dict):
+        warnings_list.append(us["error"])
+    else:
+        tickers.extend(us)
+
+    if not tickers:
+        return {"error": "; ".join(warnings_list)}
+
+    result: dict = {"market": "ALL", "count": len(tickers), "tickers": tickers}
+    if warnings_list:
+        result["warnings"] = warnings_list
+    return result
+
+
+# ═══════════════════════════════════════════════
+# 9. screen_stocks
+# ═══════════════════════════════════════════════
+
+# 스크리닝 데이터 캐시 (TTL 6시간 — 재무지표는 장중에 변하지 않음)
+_screen_cache: dict[str, tuple[float, dict]] = {}
+_screen_lock  = threading.Lock()
+_SCREEN_TTL   = 21600
+
+
+def _fetch_screen_data(ticker: str) -> dict:
+    """
+    스크리닝에 필요한 재무 지표를 yfinance에서 한 번에 수집한다.
+    캐시(6h) + 재시도(최대 2회, 0.5/1.0s 백오프) 포함.
+    """
+    import yfinance as yf
+
+    now = time.time()
+    with _screen_lock:
+        if ticker in _screen_cache:
+            ts, cached = _screen_cache[ticker]
+            # sector 필드가 없는 구버전 캐시는 재수집
+            if now - ts < _SCREEN_TTL and "sector" in cached:
+                return cached
+
+    result = None
+    for attempt in range(3):
+        try:
+            info = yf.Ticker(_yf_ticker(ticker)).info
+            result = {
+                "ticker":      ticker,
+                "name":        info.get("longName") or info.get("shortName") or ticker,
+                "sector":      info.get("sector") or None,
+                "industry":    info.get("industry") or None,
+                "op_margin":   _safe_float(info.get("operatingMargins")),
+                "net_margin":  _safe_float(info.get("profitMargins")),
+                "rev_growth":  _safe_float(info.get("revenueGrowth")),
+                "earn_growth": _safe_float(info.get("earningsGrowth")),
+            }
+            break
+        except Exception:
+            if attempt < 2:
+                time.sleep(0.5 * (attempt + 1))
+
+    if result is None:
+        result = {"ticker": ticker, "error": "데이터 수집 실패"}
+
+    with _screen_lock:
+        _screen_cache[ticker] = (time.time(), result)
+    return result
+
+
+def screen_stocks(
+    market: str = "KR",
+    top_n: int = 20,
+    universe_limit: int | None = None,
+    growth_correction: bool = True,
+    max_per_sector: int | None = 3,
+) -> dict:
+    """
+    유니버스 종목을 실적·성장성 기준으로 평가해 상위 top_n개를 반환한다.
+
+    Parameters
+    ----------
+    market            : 'KR' / 'US' / 'ALL'
+    top_n             : 반환할 상위 종목 수
+    universe_limit    : 유니버스에서 시총 상위 N개만 평가 (테스트·빠른 실행용)
+    growth_correction : True(기본) → 성장률 기저효과 보정 적용
+                        False → 보정 없이 raw 성장률 그대로 사용 (비교용)
+    max_per_sector    : 같은 섹터(업종)에서 결과에 포함할 최대 종목 수.
+                        None → 제한 없음. 기본 3.
+
+    Returns
+    -------
+    dict
+        {market, total_evaluated, scored, top_n, growth_correction,
+         max_per_sector, results:[...]}
+        results 항목: {rank, ticker, name, sector, industry,
+                       profitability_score, growth_score,
+                       total_score, is_turnaround, key_metrics}
+
+    점수화 방식
+    -----------
+    각 지표를 배치 내 percentile rank(0~100)로 변환 후 가중 합산.
+
+    [실적 점수, 50%] — "지금 잘 버는가"  (보정 없음)
+        op_margin  (영업이익률) 60% — 본업 경쟁력, 세금·이자 영향 적음
+        net_margin (순이익률)   40% — 최종 주주 귀속 이익력
+
+    [성장 점수, 50%] — "점점 더 버는가"  (growth_correction=True 시 보정 적용)
+        rev_growth  (매출성장률)  50%
+        earn_growth (이익성장률)  50%
+
+    성장률 기저효과 보정 (growth_correction=True):
+        적자→흑자 전환 시 earn_growth +400~500% 등 극단값이 발생, 꾸준한 성장주를
+        하위권으로 밀어내는 착시 문제를 하드 캡으로 보정한다.
+
+        하드 캡: earn_growth > 100% → 100%로 평탄화, rev_growth > 150% → 150%.
+            동점 처리된 percentile rank로 극단값 그룹이 같은 순위를 받음 →
+            cap 이하 진짜 성장주들이 상대적으로 올라감.
+
+    흑자전환 플래그 (is_turnaround):
+        raw earn_growth > 200% 인 경우 True.
+        점수에서 제외하지 않고 식별 목적으로만 표시.
+
+    섹터 분산 (max_per_sector):
+        점수 정렬 후 결과 선별 단계에서 동일 섹터 종목은 상위 N개까지만 포함.
+        점수 계산에는 영향 없음.
+
+    가중치 근거:
+        · 영업이익률 > 순이익률 : 회계 처리에 덜 민감해 본업 수익력을 더 잘 반영
+        · 성장 : 실적 = 50:50   : 고마진 성숙기업과 고성장 기업 균형 포착
+        · 부분 데이터 허용      : 가용 지표 비중만으로 점수화, 전무하면 제외
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    # ── 1. 유니버스 로드 ─────────────────────────────────────
+    univ = get_universe(market)
+    if "error" in univ:
+        return univ
+
+    tickers_info = univ["tickers"]
+    if universe_limit:
+        tickers_info = tickers_info[:universe_limit]
+
+    ticker_list = [t["ticker"] for t in tickers_info]
+    name_map    = {t["ticker"]: t["name"] for t in tickers_info}
+    total       = len(ticker_list)
+
+    # ── 2. 재무 데이터 병렬 수집 ────────────────────────────
+    print(f"[Screener] {total}개 종목 데이터 수집 시작 "
+          f"(market={market}, correction={growth_correction})")
+    done_count  = [0]
+    report_lock = threading.Lock()
+
+    def _fetch_and_report(t: str) -> dict:
+        r = _fetch_screen_data(t)
+        with report_lock:
+            done_count[0] += 1
+            n = done_count[0]
+            if n % 10 == 0 or n == total:
+                print(f"  [Screener] {n}/{total} 처리 중...")
+        return r
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [executor.submit(_fetch_and_report, t) for t in ticker_list]
+        raw = [f.result() for f in as_completed(futures)]
+
+    valid = [r for r in raw if "error" not in r]
+    print(f"[Screener] 유효 {len(valid)}/{total}개 → 점수 계산 시작")
+
+    # ── 3. 성장률 기저효과 보정 헬퍼 ───────────────────────
+    #
+    # [왜 '하드 캡'인가]
+    #   윈저라이징·로그 변환은 값 크기를 줄이지만 순서를 바꾸지 않는 단조 변환이다.
+    #   Percentile rank는 순서만 보기 때문에 단조 변환 전후 결과가 동일하다.
+    #   → 실제로 순위를 바꾸려면 순서 자체를 바꿔야 하고, 그 방법이 하드 캡이다.
+    #
+    #   earn_growth > CAP 인 종목들을 모두 CAP 값으로 평탄화(clamp) →
+    #   동점 처리 percentile rank에서 같은 순위를 받음 →
+    #   cap 이하 진짜 성장주들이 상대적으로 올라감.
+    #
+    # [흑자전환 플래그]
+    #   raw earn_growth > TURNAROUND_THRESHOLD → is_turnaround = True
+    #   점수에서 제외하지 않고 식별 목적으로만 표시.
+
+    # 성장률 상한 (기저효과가 주로 이 범위를 넘어서 발생)
+    EARN_GROWTH_CAP      = 1.0   # 이익성장 100% 초과 → 100%로 처리
+    REV_GROWTH_CAP       = 1.5   # 매출성장 150% 초과 → 150%로 처리 (기저효과 덜함)
+    TURNAROUND_THRESHOLD = 2.0   # 이익성장 200% 초과 → 흑자전환 의심
+
+    def _clamp(val_dict: dict, cap: float) -> dict:
+        """CAP 이상 값을 CAP으로 평탄화. None은 유지."""
+        return {t: (min(v, cap) if v is not None else None) for t, v in val_dict.items()}
+
+    def _pct_rank(val_dict: dict) -> dict:
+        """
+        유니크 값 기반 percentile rank(0~100).
+        동일한 값은 동일한 순위를 부여 — 캡으로 평탄화된 동점 그룹이 올바르게 묶임.
+        """
+        pairs = [(t, v) for t, v in val_dict.items() if v is not None]
+        if not pairs:
+            return {t: None for t in val_dict}
+        unique_sorted = sorted(set(v for _, v in pairs))
+        n = len(unique_sorted)
+        val_to_rank = {v: round(i / max(n - 1, 1) * 100, 1) for i, v in enumerate(unique_sorted)}
+        lookup = {t: val_to_rank[v] for t, v in pairs}
+        return {t: lookup.get(t) for t in val_dict}
+
+    # ── 4. 지표별 percentile rank 계산 ─────────────────────
+    # 실적 지표: 보정 없이 raw → rank
+    op_rank  = _pct_rank({r["ticker"]: r.get("op_margin")  for r in valid})
+    net_rank = _pct_rank({r["ticker"]: r.get("net_margin") for r in valid})
+
+    # 성장 지표: 보정 여부에 따라 하드 캡 적용 후 → rank
+    rev_raw  = {r["ticker"]: r.get("rev_growth")  for r in valid}
+    earn_raw = {r["ticker"]: r.get("earn_growth") for r in valid}
+
+    if growth_correction:
+        rev_rank  = _pct_rank(_clamp(rev_raw,  REV_GROWTH_CAP))
+        earn_rank = _pct_rank(_clamp(earn_raw, EARN_GROWTH_CAP))
+    else:
+        rev_rank  = _pct_rank(rev_raw)
+        earn_rank = _pct_rank(earn_raw)
+
+    # ── 5. 종목별 점수 계산 ─────────────────────────────────
+    scored: list[dict] = []
+    for r in valid:
+        t = r["ticker"]
+
+        # 실적 점수: op 60% + net 40%
+        op_s, net_s = op_rank.get(t), net_rank.get(t)
+        if   op_s is not None and net_s is not None:
+            profit_score = round(op_s * 0.6 + net_s * 0.4, 1)
+        elif op_s is not None:
+            profit_score = round(op_s, 1)
+        elif net_s is not None:
+            profit_score = round(net_s, 1)
+        else:
+            profit_score = None
+
+        # 성장 점수: rev 50% + earn 50%
+        rev_s, earn_s = rev_rank.get(t), earn_rank.get(t)
+        if   rev_s is not None and earn_s is not None:
+            growth_score = round(rev_s * 0.5 + earn_s * 0.5, 1)
+        elif rev_s is not None:
+            growth_score = round(rev_s, 1)
+        elif earn_s is not None:
+            growth_score = round(earn_s, 1)
+        else:
+            growth_score = None
+
+        # 종합 점수: 실적 50% + 성장 50%
+        if   profit_score is not None and growth_score is not None:
+            total_score = round(profit_score * 0.5 + growth_score * 0.5, 1)
+        elif profit_score is not None:
+            total_score = profit_score
+        elif growth_score is not None:
+            total_score = growth_score
+        else:
+            continue  # 점수화 불가 → 제외
+
+        # 흑자전환 플래그 (raw earn_growth 기준)
+        raw_eg = r.get("earn_growth")
+        is_turnaround = (raw_eg is not None and raw_eg > TURNAROUND_THRESHOLD)
+
+        def _pct(v):
+            return round(v * 100, 2) if v is not None else None
+
+        scored.append({
+            "ticker":              t,
+            "name":                r.get("name") or name_map.get(t, t),
+            "sector":              r.get("sector") or "미분류",
+            "industry":            r.get("industry") or "미분류",
+            "profitability_score": profit_score,
+            "growth_score":        growth_score,
+            "total_score":         total_score,
+            "is_turnaround":       is_turnaround,
+            "key_metrics": {
+                "op_margin_pct":   _pct(r.get("op_margin")),
+                "net_margin_pct":  _pct(r.get("net_margin")),
+                "rev_growth_pct":  _pct(r.get("rev_growth")),   # 항상 raw 수치 표시
+                "earn_growth_pct": _pct(r.get("earn_growth")),  # 항상 raw 수치 표시
+            },
+        })
+
+    # ── 6. 종합 점수 내림차순 정렬 ─────────────────────────
+    scored.sort(key=lambda x: x["total_score"], reverse=True)
+
+    # ── 7. 섹터별 상한 적용 → top_n 선별 ──────────────────
+    # 점수 계산과 분리된 결과 선별 단계. 같은 섹터 종목은 상위 max_per_sector개까지만 포함.
+    if max_per_sector is not None:
+        sector_counts: dict[str, int] = {}
+        top = []
+        for item in scored:
+            sec = item["sector"]
+            cnt = sector_counts.get(sec, 0)
+            if cnt < max_per_sector:
+                top.append(item)
+                sector_counts[sec] = cnt + 1
+            if len(top) >= top_n:
+                break
+    else:
+        top = scored[:top_n]
+
+    for rank, item in enumerate(top, 1):
+        item["rank"] = rank
+
+    print(f"[Screener] 완료 — 점수화 {len(scored)}개, 상위 {len(top)}개 반환 "
+          f"(섹터제한 {max_per_sector if max_per_sector else '없음'})")
+    return {
+        "market":            market,
+        "total_evaluated":   total,
+        "scored":            len(scored),
+        "top_n":             top_n,
+        "growth_correction": growth_correction,
+        "max_per_sector":    max_per_sector,
+        "results":           top,
     }
 
 
