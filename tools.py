@@ -10,6 +10,8 @@ tools.py
 """
 
 import re
+import time
+import threading
 import warnings
 from datetime import datetime, timedelta
 
@@ -17,6 +19,13 @@ import FinanceDataReader as fdr
 import pandas as pd
 
 warnings.filterwarnings("ignore")  # yfinance deprecation 등 노이즈 억제
+
+# ── 피어 종목 견적 캐시 (스레드 안전, TTL 10분) ─────────────────────────
+_quote_cache: dict[str, tuple[float, dict]] = {}
+_cache_lock = threading.Lock()
+_CACHE_TTL = 600        # 초
+_PEER_RETRIES = 2       # 피어 조회 실패 시 최대 재시도 횟수
+_PEER_MIN_COUNT = 2     # 이 수 미만이면 "판별 제한"으로 표시
 
 
 # ═══════════════════════════════════════════════
@@ -88,6 +97,11 @@ def get_quote(ticker: str) -> dict:
         return {"error": f"데이터 없음: {ticker}"}
     if "close" not in df.columns:
         return {"error": f"'close' 컬럼 없음. 실제 컬럼: {list(df.columns)}"}
+
+    # close=NaN 행 제거 (US: 주말/공휴일 부분 데이터 포함될 수 있음)
+    df = df[df["close"].notna()]
+    if df.empty:
+        return {"error": f"유효한 종가 없음: {ticker}"}
 
     latest    = df.iloc[-1]
     date_str  = df.index[-1].strftime("%Y-%m-%d")
@@ -873,42 +887,79 @@ def get_sector_comparison(ticker: str) -> dict:
             "isolation_gap":    None,
         }
 
+    # ── 캐싱+재시도 래퍼 (내부 전용) ────────────────────────
+    def _fetch_with_cache(t: str) -> dict:
+        now = time.time()
+        with _cache_lock:
+            if t in _quote_cache:
+                ts, cached = _quote_cache[t]
+                if now - ts < _CACHE_TTL:
+                    return cached
+
+        result = None
+        last = None
+        for attempt in range(_PEER_RETRIES + 1):
+            try:
+                r = get_quote(t)
+                last = r
+                if "error" not in r and r.get("change_pct") is not None:
+                    result = r
+                    break
+            except Exception:
+                pass
+            if attempt < _PEER_RETRIES:
+                time.sleep(0.4 * (attempt + 1))  # 0.4s → 0.8s 백오프
+
+        final = result if result is not None else (last or {"error": "조회 실패"})
+        with _cache_lock:
+            _quote_cache[t] = (time.time(), final)
+        return final
+
     # ── 대상 종목 등락률 ──────────────────────────────────
-    target_q   = get_quote(ticker)
+    target_q   = _fetch_with_cache(ticker)
     target_pct = target_q.get("change_pct") if "error" not in target_q else None
 
-    # ── 피어 등락률 ──────────────────────────────────────
+    # ── 피어 등락률 (부분 성공 허용) ──────────────────────
     peer_results = []
     for p in peer_tickers:
-        try:
-            q = get_quote(p)
-            if "error" not in q and q.get("change_pct") is not None:
-                peer_results.append({
-                    "ticker":     p,
-                    "name":       q.get("name", p),
-                    "change_pct": q["change_pct"],
-                })
-        except Exception:
-            pass
+        q = _fetch_with_cache(p)
+        if "error" not in q and q.get("change_pct") is not None:
+            peer_results.append({
+                "ticker":     p,
+                "name":       q.get("name", p),
+                "change_pct": q["change_pct"],
+            })
 
     # ── 판별 로직 ─────────────────────────────────────────
     peer_median_pct = None
     isolation_gap   = None
-    assessment      = "피어 데이터 부족으로 판별 불가"
 
-    if peer_results and target_pct is not None:
+    n = len(peer_results)
+    if n == 0 or target_pct is None:
+        assessment = "피어 데이터 없음 — 판별 불가"
+    elif n < _PEER_MIN_COUNT:
+        # 피어가 1개뿐이면 단일 비교로 수치는 산출하되 신뢰도 경고 표시
+        pct0 = peer_results[0]["change_pct"]
+        peer_median_pct = pct0
+        isolation_gap   = round(target_pct - pct0, 2)
+        assessment = f"판별 제한 — 피어 {n}개만 수신 (최소 {_PEER_MIN_COUNT}개 권장). 참고치만 제공"
+    else:
         pcts = sorted(p["change_pct"] for p in peer_results)
         mid  = len(pcts) // 2
-        peer_median_pct = pcts[mid] if len(pcts) % 2 == 1 else round((pcts[mid-1] + pcts[mid]) / 2, 4)
-        isolation_gap   = round(target_pct - peer_median_pct, 2)
+        peer_median_pct = (
+            pcts[mid] if len(pcts) % 2 == 1
+            else round((pcts[mid - 1] + pcts[mid]) / 2, 4)
+        )
+        isolation_gap = round(target_pct - peer_median_pct, 2)
 
         abs_gap = abs(isolation_gap)
+        suffix  = f"(피어 {n}개 기준)" if n < len(peer_tickers) else ""
         if abs_gap <= 1.5:
-            assessment = "섹터·시장 전체 흐름 가능성 높음 (동종 피어와 유사한 변동)"
+            assessment = f"섹터·시장 전체 흐름 가능성 높음 (동종 피어와 유사한 변동) {suffix}".strip()
         elif abs_gap <= 3.5:
-            assessment = "부분적 종목 고유 요인 가능성 (동종 피어보다 다소 큰 변동)"
+            assessment = f"부분적 종목 고유 요인 가능성 (동종 피어보다 다소 큰 변동) {suffix}".strip()
         else:
-            assessment = "종목 고유 이슈 가능성 높음 (동종 피어와 확연히 다른 변동)"
+            assessment = f"종목 고유 이슈 가능성 높음 (동종 피어와 확연히 다른 변동) {suffix}".strip()
 
     return {
         "ticker":            ticker,
