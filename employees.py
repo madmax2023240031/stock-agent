@@ -19,17 +19,18 @@ MODEL_NAME = "claude-sonnet-4-6"
 client = Anthropic(api_key=ANTHROPIC_API_KEY)
 
 
-def _run_agent(system_prompt: str, tools_list: list, tool_map: dict, task: str) -> str:
+def _run_agent(system_prompt: str, tools_list: list, tool_map: dict, task: str,
+               max_tokens: int = 2048) -> str:
     """
     Claude API의 Tool Use(Function Calling) 루프를 처리하는 공통 함수.
     stop_reason이 'tool_use'인 경우 도구를 실행하고 결과를 다시 전달한다.
     """
     messages = [{"role": "user", "content": task}]
-    
+
     while True:
         response = client.messages.create(
             model=MODEL_NAME,
-            max_tokens=2048,
+            max_tokens=max_tokens,
             system=system_prompt,
             messages=messages,
             tools=tools_list
@@ -282,6 +283,100 @@ def risk_review_employee(reports: str) -> str:
     task = f"다음은 직원들의 분석 보고서입니다. 철저히 검증하고 리스크를 지적하세요:\n\n{reports}"
     
     return _run_agent(system_prompt, tools_list, tool_map, task)
+
+
+# ═══════════════════════════════════════════════
+# 9. 발굴 직원 (screener_employee)
+# ═══════════════════════════════════════════════
+def screener_employee(task: str) -> str:
+    """
+    screen_stocks 도구를 호출해 실적·성장성 기준 상위 종목을 발굴하고,
+    각 종목의 근거·주의사항을 사람이 읽기 좋게 정리한다.
+    """
+    system_prompt = (
+        "당신은 실적·성장성 데이터를 기반으로 관심 종목 후보를 찾아주는 '발굴 직원'입니다.\n"
+        "\n"
+        "## 역할과 원칙\n"
+        "- screen_stocks 도구를 호출해 종목을 스크리닝한다.\n"
+        "- 결과를 **사람이 읽기 좋은 보고서** 형태로 정리한다.\n"
+        "- 각 종목마다 **구체적 수치**로 근거를 제시한다. (점수만 나열하지 않는다)\n"
+        "- '이 종목이 오를 것'이 아니라 **'현재 이런 특징을 가진 종목'** 이라는 틀을 유지한다.\n"
+        "- 단정적 매수 권유, 미래 주가 예측은 절대 하지 않는다.\n"
+        "\n"
+        "## 도구 호출 기준\n"
+        "- market: 한국 종목 → 'KR', 미국 종목 → 'US', 전체 → 'ALL'. 미지정 시 'KR'.\n"
+        "- top_n: 보고서 가독성을 위해 기본 10을 사용한다. 사용자가 더 많이 요청하면 조정.\n"
+        "- growth_correction: 항상 True (기저효과 보정).\n"
+        "- max_per_sector: 기본 3 (섹터 쏠림 방지). 특정 섹터에 집중하는 질문이면 None.\n"
+        "\n"
+        "## 보고서 형식 (반드시 이 구조로 작성)\n"
+        "\n"
+        "### 1. 헤더\n"
+        "- 어떤 시장, 어떤 기준으로 스크리닝했는지 1~2줄로 설명\n"
+        "- 유의사항: 종목 수, 섹터 제한 여부, 기저효과 보정 적용 여부\n"
+        "\n"
+        "### 2. 종목별 카드 (상위 10개 이내, 각 종목당 아래 항목)\n"
+        "```\n"
+        "**N위. 종목명 (티커)** [★ 흑자전환 의심] ← is_turnaround=true일 때만 표시\n"
+        "- 실적 점수 X / 성장 점수 X / 종합 X\n"
+        "- 영업이익률 X% | 순이익률 X% | 매출성장 X% | 이익성장 X%\n"
+        "- 섹터: XXX / 업종: XXX\n"
+        "📌 발굴 근거: [실적·성장 수치를 바탕으로 왜 이 종목이 뽑혔는지 1~2문장]\n"
+        "⚠️ 주의: [해당 종목의 리스크 — 흑자전환이면 '기저효과로 성장률이 높게 보일 수 있음' 반드시 포함]\n"
+        "```\n"
+        "\n"
+        "### 3. 섹터 분포 요약\n"
+        "- 어떤 섹터에서 몇 개 선정됐는지 간략히 정리\n"
+        "\n"
+        "### 4. 면책 고지 (반드시 포함)\n"
+        "```\n"
+        "⚠️ 이 목록은 현재 데이터 기준으로 위 지표가 높은 종목들이며,\n"
+        "미래 주가 상승을 보장하지 않습니다.\n"
+        "투자 판단 전 개별 종목의 사업 내용·뉴스·거시 환경을 추가 확인하세요.\n"
+        "이 정보는 참고용이며 투자 권유가 아닙니다.\n"
+        "```\n"
+    )
+
+    tools_list = [
+        {
+            "name": "screen_stocks",
+            "description": (
+                "유니버스 종목을 실적(영업이익률·순이익률)과 성장성(매출·이익성장률) "
+                "기준으로 점수화해 상위 종목을 반환한다. "
+                "기저효과 보정(하드캡), 섹터별 종목 수 제한 지원."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "market": {
+                        "type": "string",
+                        "enum": ["KR", "US", "ALL"],
+                        "description": "KR=코스피200, US=S&P500, ALL=전체"
+                    },
+                    "top_n": {
+                        "type": "integer",
+                        "description": "반환할 상위 종목 수 (기본 10)"
+                    },
+                    "growth_correction": {
+                        "type": "boolean",
+                        "description": "성장률 기저효과 보정. True(기본)=이익성장 100%·매출성장 150% 초과는 동점 처리"
+                    },
+                    "max_per_sector": {
+                        "type": ["integer", "null"],
+                        "description": "동일 섹터 최대 포함 종목 수. null=제한없음. 기본 3"
+                    }
+                },
+                "required": ["market"]
+            }
+        }
+    ]
+
+    tool_map = {
+        "screen_stocks": tools.screen_stocks,
+    }
+
+    # 10개 종목 상세 보고서 생성에 충분한 토큰 할당
+    return _run_agent(system_prompt, tools_list, tool_map, task, max_tokens=4096)
 
 
 # ═══════════════════════════════════════════════

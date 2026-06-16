@@ -38,6 +38,8 @@ def manager(user_input: str, history: list = None, status_callback=None) -> str:
         "   - 금리/환율/거시: call_macro_employee\n"
         "   - 보유 종목 분산/쏠림: call_portfolio_employee\n"
         "   - 두 종목 비교: call_compare_employee\n"
+        "   - 종목 발굴/스크리닝 (성장주 찾아줘, 실적 좋은 종목, 요즘 뜨는 종목 등): call_screener_employee\n"
+        "     → 시장 미지정 시 한국(KR) 기본. '미국 종목'·'S&P500'·'US' 명시 시 US.\n"
         "3. **리스크 검수**: 분석, 비교, 매수 판단 등이 포함된 복합 질문의 경우 여러 분석 직원을 부르게 됩니다. "
         "분석 직원의 결과를 받은 후에는 반드시 그 결과들을 모아 `call_risk_review_employee`를 마지막에 호출하여 "
         "환각이나 숫자 충돌이 없는지, 위험한 주장이 없는지 검증받으세요. 단순 시세 조회라면 생략해도 무방합니다.\n"
@@ -116,6 +118,11 @@ def manager(user_input: str, history: list = None, status_callback=None) -> str:
             "name": "call_risk_review_employee",
             "description": "다른 직원들이 작성한 보고서 텍스트들을 모아 입력받고 환각, 논리 충돌, 과열 위험을 검수받음",
             "input_schema": {"type": "object", "properties": {"reports": {"type": "string", "description": "분석 직원들의 결과 텍스트 모음"}}, "required": ["reports"]}
+        },
+        {
+            "name": "call_screener_employee",
+            "description": "실적·성장성 기준으로 조건에 맞는 종목을 발굴하는 직원 호출. '성장주 찾아줘', '실적 좋은 종목', '요즘 뜨는 종목' 같은 발굴형 질문에 사용.",
+            "input_schema": {"type": "object", "properties": {"task": {"type": "string", "description": "발굴 조건 및 시장(한국/미국/전체)을 포함한 지시"}}, "required": ["task"]}
         }
     ]
     
@@ -128,6 +135,7 @@ def manager(user_input: str, history: list = None, status_callback=None) -> str:
         "call_portfolio_employee": employees.portfolio_employee,
         "call_compare_employee": employees.compare_employee,
         "call_risk_review_employee": employees.risk_review_employee,
+        "call_screener_employee":    employees.screener_employee,
     }
     
     messages = []

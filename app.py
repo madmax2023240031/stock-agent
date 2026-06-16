@@ -72,6 +72,15 @@ with st.sidebar:
             "개별 종목이 아닌 '판 전체'를 보며, 섹터·매크로가 시장에 미치는 영향을 분석합니다."
         )
 
+    # ── 발굴팀 ──
+    st.markdown('<div class="so-grp" style="background:#ede9fe;color:#4c1d95!important;padding:4px 10px;font-size:.7em;font-weight:700;letter-spacing:.5px;text-transform:uppercase;border-radius:5px;margin-top:6px;margin-bottom:2px">🔭 발굴팀</div>', unsafe_allow_html=True)
+    with st.expander("🔭 발굴 (Screener) — 종목 발굴·스크리닝"):
+        st.caption(
+            "`screen_stocks` 도구로 KOSPI200·S&P500 유니버스에서 실적(영업이익률·순이익률)과 "
+            "성장성(매출·이익성장률)이 높은 종목을 발굴합니다. "
+            "기저효과 보정·섹터 분산 필터 적용. '성장주 찾아줘', '실적 좋은 종목 알려줘' 등에 응답합니다."
+        )
+
     # ── 검토팀 ──
     st.markdown('<div class="so-grp so-r">🔎 검토팀</div>', unsafe_allow_html=True)
     with st.expander("💼 포트폴리오 (Portfolio) — 섹터 분산"):
@@ -128,6 +137,7 @@ if user_input:
                 "call_portfolio_employee": "💼 포트폴리오",
                 "call_compare_employee": "⚖️ 비교",
                 "call_risk_review_employee": "🚨 리스크검수",
+                "call_screener_employee":    "🔭 발굴",
             }
             EMPLOYEE_DETAIL = {
                 "call_research_employee": "🔍 조회 직원에게 정보 요청 중...",
@@ -138,6 +148,7 @@ if user_input:
                 "call_portfolio_employee": "💼 포트폴리오 직원에게 점검 요청 중...",
                 "call_compare_employee": "⚖️ 비교 직원에게 종목 비교 요청 중...",
                 "call_risk_review_employee": "🚨 리스크 검수 직원에게 최종 검증 받는 중...",
+                "call_screener_employee": "🔭 발굴 직원에게 종목 스크리닝 요청 중...",
             }
 
             def status_cb(tool_name):
