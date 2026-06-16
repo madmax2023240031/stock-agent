@@ -80,6 +80,9 @@ def research_employee(task: str) -> str:
         "당신은 주식의 현재가, 등락률, 거래량 등 사실 정보를 조회하는 '조회 직원'입니다.\n"
         "- 주어진 도구(get_quote)를 사용하여 사실 정보만 정확하게 전달하세요.\n"
         "- 매수/매도 추천 등 투자 의견은 절대 내지 마세요.\n"
+        "- **중요**: get_quote 결과에 `\"alert\": true`가 포함되어 있으면, 보고서 맨 앞에 "
+        "'🚨 급변동 감지: 등락률 ±5% 이상'을 굵게 표시하고 정확한 등락률 수치를 함께 기재하세요. "
+        "이 표시는 총괄 매니저가 원인 추적 조사를 자동으로 시작하는 신호입니다.\n"
         "- 답변에 항상 '이 정보는 참고용이며 투자 권유가 아닙니다'라는 문구를 명시하세요."
     )
     tools_list = [{
@@ -218,9 +221,12 @@ def portfolio_employee(task: str) -> str:
 # ═══════════════════════════════════════════════
 def compare_employee(task: str) -> str:
     system_prompt = (
-        "당신은 두 종목을 상대 평가하여 장단점을 비교하는 '비교 직원'입니다.\n"
+        "당신은 종목 간 상대 평가와 섹터 비교를 담당하는 '비교 직원'입니다.\n"
         "- 주어진 도구들을 자유롭게 조합하여 두 종목의 주가, 재무, 지표 등을 비교하세요.\n"
         "- 'A vs B' 형태로 명확하게 정리하고, 각 종목의 강점과 약점을 대조하세요.\n"
+        "- get_sector_comparison 도구가 주어진 경우, 대상 종목과 동종 섹터 피어 종목들의 "
+        "  당일 등락률을 비교하여 '종목 고유 이슈'인지 '섹터·시장 전체 흐름'인지 판별하세요. "
+        "  isolation_gap(대상 종목 등락률 - 피어 중앙값)이 클수록 종목 고유 요인 가능성이 높습니다.\n"
         "- 답변에 항상 '상대 비교는 참고용이며 투자 권유가 아닙니다'라고 명시하세요."
     )
     tools_list = [
@@ -238,12 +244,18 @@ def compare_employee(task: str) -> str:
             "name": "get_indicators",
             "description": "기술적 지표(MA, RSI, MACD 등) 조회",
             "input_schema": {"type": "object", "properties": {"ticker": {"type": "string"}}, "required": ["ticker"]}
+        },
+        {
+            "name": "get_sector_comparison",
+            "description": "급변동 종목과 동종 섹터 피어 종목들의 당일 등락률을 비교하여 종목 고유 이슈 vs 섹터/시장 전체 흐름을 판별",
+            "input_schema": {"type": "object", "properties": {"ticker": {"type": "string"}}, "required": ["ticker"]}
         }
     ]
     tool_map = {
-        "get_quote": tools.get_quote,
-        "get_fundamentals": tools.get_fundamentals,
-        "get_indicators": tools.get_indicators
+        "get_quote":              tools.get_quote,
+        "get_fundamentals":       tools.get_fundamentals,
+        "get_indicators":         tools.get_indicators,
+        "get_sector_comparison":  tools.get_sector_comparison,
     }
     return _run_agent(system_prompt, tools_list, tool_map, task)
 

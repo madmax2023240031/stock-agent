@@ -76,7 +76,8 @@ def get_quote(ticker: str) -> dict:
     Returns
     -------
     dict  {ticker, name, date, close, open, high, low, volume,
-           prev_close, change, change_pct, market}
+           prev_close, change, change_pct, market, alert}
+          alert=True : 등락률 절댓값 ≥ 5% (급변동 감지)
           실패 시: {"error": "..."}
     """
     ticker = ticker.strip()
@@ -110,13 +111,20 @@ def get_quote(ticker: str) -> dict:
             listing  = fdr.StockListing("KRX")
             listing.columns = [c.lower() for c in listing.columns]
             code_col = next((c for c in listing.columns if "code" in c or "symbol" in c), None)
-            name_col = next((c for c in listing.columns if "name" in c), None)
+            # "name" 정확 일치 → "name"으로 끝나는 컬럼 → fallback
+            # ("name" in col) 방식은 "unnamed: 0" 같은 컬럼을 먼저 잡는 오류 발생
+            if "name" in listing.columns:
+                name_col = "name"
+            else:
+                name_col = next((c for c in listing.columns if c.endswith("name")), None)
             if code_col and name_col:
                 row = listing[listing[code_col] == ticker]
                 if not row.empty:
                     name = row.iloc[0][name_col]
         except Exception:
             pass
+
+    alert = (abs(change_pct) >= 5.0) if change_pct is not None else False
 
     return {
         "ticker":     ticker,
@@ -131,6 +139,7 @@ def get_quote(ticker: str) -> dict:
         "change":     change,
         "change_pct": change_pct,
         "market":     market,
+        "alert":      alert,
     }
 
 
@@ -731,6 +740,185 @@ def get_portfolio_analysis(holdings: list) -> dict:
             "hhi":      hhi,
             "warning":  warning,
         },
+    }
+
+
+# ═══════════════════════════════════════════════
+# 7. get_sector_comparison
+# ═══════════════════════════════════════════════
+
+# 미국 산업(industry) → 동종 피어 종목 테이블
+_US_INDUSTRY_PEERS: dict[str, list[str]] = {
+    "Semiconductors":                     ["NVDA", "AMD", "INTC", "TSM", "QCOM", "AVGO", "MU"],
+    "Semiconductor Equipment & Materials":["ASML", "AMAT", "KLAC", "LRCX", "TER"],
+    "Software—Infrastructure":            ["MSFT", "ORCL", "IBM", "CSCO"],
+    "Software—Application":               ["CRM", "ADBE", "NOW", "INTU", "WDAY"],
+    "Consumer Electronics":               ["AAPL", "SONO", "HPQ", "DELL"],
+    "Internet Content & Information":     ["GOOGL", "META", "SNAP", "PINS"],
+    "Auto Manufacturers":                 ["TSLA", "GM", "F", "TM", "STLA"],
+    "Drug Manufacturers—General":         ["JNJ", "PFE", "MRK", "ABBV", "LLY"],
+    "Drug Manufacturers—Specialty & Generic": ["BMY", "AMGN", "GILD", "BIIB"],
+    "Biotechnology":                      ["AMGN", "GILD", "BIIB", "MRNA", "REGN"],
+    "Financial Services":                 ["V", "MA", "AXP", "PYPL"],
+    "Banks—Diversified":                  ["JPM", "BAC", "WFC", "C", "GS"],
+    "Investment Banking & Brokerage":     ["GS", "MS", "JPM", "BAC"],
+    "Oil & Gas Integrated":               ["XOM", "CVX", "BP", "SHEL"],
+    "Oil & Gas E&P":                      ["COP", "OXY", "PXD", "DVN"],
+    "Online Retail":                      ["AMZN", "EBAY", "ETSY", "W"],
+    "Specialty Retail":                   ["NKE", "TGT", "COST", "HD", "LOW"],
+    "Restaurants":                        ["MCD", "SBUX", "YUM", "CMG"],
+    "Airlines":                           ["DAL", "UAL", "AAL", "LUV"],
+    "Aerospace & Defense":                ["BA", "LMT", "RTX", "NOC", "GD"],
+    "Telecom Services":                   ["T", "VZ", "TMUS"],
+    "Media—Diversified":                  ["DIS", "NFLX", "WBD", "PARA"],
+    "Real Estate":                        ["AMT", "PLD", "CCI", "EQIX"],
+    "Utilities—Regulated Electric":       ["NEE", "DUK", "SO", "D"],
+}
+
+# 한국 산업(industry) → 피어 종목 테이블 (yfinance industry 기준)
+_KR_INDUSTRY_PEERS: dict[str, list[str]] = {
+    "Consumer Electronics":              ["005930", "000660", "066570", "034220", "009150"],
+    "Semiconductors":                    ["005930", "000660", "000990", "336370", "042700"],
+    "Software—Application":              ["035420", "035720", "259960", "293490"],
+    "Internet Content & Information":    ["035420", "035720", "034730", "036570"],
+    "Auto Manufacturers":                ["005380", "000270", "012330", "064350"],
+    "Auto Parts":                        ["012330", "018880", "161390", "000880"],
+    "Specialty Chemicals":               ["051910", "011170", "010950", "006400"],
+    "Steel":                             ["005490", "004020", "086790", "002680"],
+    "Banks—Diversified":                 ["105560", "055550", "086790", "316140", "138930"],
+    "Insurance":                         ["000810", "032830", "088350", "001450"],
+    "Telecom Services":                  ["030200", "017670", "032640"],
+    "Pharmaceutical Retailers":          ["068270", "207940", "326030", "000100"],
+    "Drug Manufacturers—Specialty & Generic": ["068270", "207940", "128940", "326030"],
+    "Real Estate":                       ["145720", "336370", "042660"],
+    "Oil & Gas Integrated":              ["010130", "078930", "011790"],
+    "Packaged Foods":                    ["097950", "007070", "003070", "004370"],
+    "Aerospace & Defense":               ["047810", "000880", "064350", "012450"],
+    "Department Stores":                 ["023530", "069960", "004170"],
+}
+
+# 미국 섹터 → 피어 fallback 테이블
+_US_SECTOR_PEERS: dict[str, list[str]] = {
+    "Technology":              ["AAPL", "MSFT", "NVDA", "GOOGL", "META", "AMD"],
+    "Healthcare":              ["JNJ", "PFE", "UNH", "ABBV", "MRK", "LLY"],
+    "Financial Services":      ["JPM", "BAC", "GS", "MS", "WFC", "V"],
+    "Consumer Cyclical":       ["AMZN", "TSLA", "NKE", "HD", "MCD"],
+    "Communication Services":  ["GOOGL", "META", "NFLX", "DIS", "T"],
+    "Energy":                  ["XOM", "CVX", "COP", "SLB", "OXY"],
+    "Industrials":             ["CAT", "BA", "GE", "MMM", "HON"],
+    "Consumer Defensive":      ["WMT", "PG", "KO", "PEP", "COST"],
+    "Real Estate":             ["AMT", "PLD", "CCI", "EQIX", "PSA"],
+    "Utilities":               ["NEE", "DUK", "SO", "D", "AEP"],
+    "Basic Materials":         ["LIN", "APD", "SHW", "FCX", "NEM"],
+}
+
+
+def get_sector_comparison(ticker: str) -> dict:
+    """
+    같은 섹터 내 주요 종목들의 당일 등락률을 비교하여
+    '종목 고유 이슈'인지 '섹터·시장 전체 흐름'인지 판별 단서를 제공한다.
+
+    Returns
+    -------
+    dict  {ticker, sector, target_change_pct, peers: [{ticker, name, change_pct}],
+           assessment, peer_median_pct, isolation_gap}
+          실패 시: {"error": "..."}
+    """
+    import yfinance as yf
+
+    ticker = ticker.strip()
+    market = "KR" if _is_korean(ticker) else "US"
+
+    sector   = None
+    industry = None
+    peer_tickers: list[str] = []
+
+    # ── 섹터/피어 탐색 ─────────────────────────────────────
+    if market == "US":
+        try:
+            info     = yf.Ticker(ticker).info
+            sector   = info.get("sector") or "Unknown"
+            industry = info.get("industry") or "Unknown"
+        except Exception:
+            sector = industry = "Unknown"
+
+        # industry 우선 → sector fallback
+        candidates = (
+            _US_INDUSTRY_PEERS.get(industry, [])
+            or _US_SECTOR_PEERS.get(sector, [])
+        )
+        peer_tickers = [p for p in candidates if p != ticker][:4]
+
+    else:  # KR
+        # yfinance로 industry/sector 조회 후 한국 피어 테이블 매칭
+        try:
+            yf_info  = yf.Ticker(_yf_ticker(ticker)).info
+            sector   = yf_info.get("sector") or "Unknown"
+            industry = yf_info.get("industry") or "Unknown"
+        except Exception:
+            sector = industry = "Unknown"
+
+        candidates = _KR_INDUSTRY_PEERS.get(industry, [])
+        peer_tickers = [p for p in candidates if p != ticker][:4]
+
+    if not peer_tickers:
+        return {
+            "ticker":           ticker,
+            "sector":           sector or "Unknown",
+            "industry":         industry,
+            "target_change_pct": None,
+            "peers":            [],
+            "assessment":       "동종 피어 종목을 찾지 못했습니다.",
+            "peer_median_pct":  None,
+            "isolation_gap":    None,
+        }
+
+    # ── 대상 종목 등락률 ──────────────────────────────────
+    target_q   = get_quote(ticker)
+    target_pct = target_q.get("change_pct") if "error" not in target_q else None
+
+    # ── 피어 등락률 ──────────────────────────────────────
+    peer_results = []
+    for p in peer_tickers:
+        try:
+            q = get_quote(p)
+            if "error" not in q and q.get("change_pct") is not None:
+                peer_results.append({
+                    "ticker":     p,
+                    "name":       q.get("name", p),
+                    "change_pct": q["change_pct"],
+                })
+        except Exception:
+            pass
+
+    # ── 판별 로직 ─────────────────────────────────────────
+    peer_median_pct = None
+    isolation_gap   = None
+    assessment      = "피어 데이터 부족으로 판별 불가"
+
+    if peer_results and target_pct is not None:
+        pcts = sorted(p["change_pct"] for p in peer_results)
+        mid  = len(pcts) // 2
+        peer_median_pct = pcts[mid] if len(pcts) % 2 == 1 else round((pcts[mid-1] + pcts[mid]) / 2, 4)
+        isolation_gap   = round(target_pct - peer_median_pct, 2)
+
+        abs_gap = abs(isolation_gap)
+        if abs_gap <= 1.5:
+            assessment = "섹터·시장 전체 흐름 가능성 높음 (동종 피어와 유사한 변동)"
+        elif abs_gap <= 3.5:
+            assessment = "부분적 종목 고유 요인 가능성 (동종 피어보다 다소 큰 변동)"
+        else:
+            assessment = "종목 고유 이슈 가능성 높음 (동종 피어와 확연히 다른 변동)"
+
+    return {
+        "ticker":            ticker,
+        "sector":            sector or "Unknown",
+        "industry":          industry,
+        "target_change_pct": target_pct,
+        "peers":             peer_results,
+        "assessment":        assessment,
+        "peer_median_pct":   peer_median_pct,
+        "isolation_gap":     isolation_gap,
     }
 
 
