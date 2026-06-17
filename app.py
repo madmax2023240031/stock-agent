@@ -15,10 +15,12 @@ with st.sidebar:
         ".so-line{display:flex;justify-content:center;height:12px;margin:2px 0}"
         ".so-line::after{content:'';width:2px;background:#94a3b8;display:block}"
         ".so-grp{padding:4px 10px;font-size:.7em;font-weight:700;letter-spacing:.5px;"
-        "text-transform:uppercase;border-radius:5px;margin-top:6px;margin-bottom:2px}"
-        ".so-a{background:#dbeafe;color:#1e3a5f!important}"
-        ".so-i{background:#d1fae5;color:#064e3b!important}"
-        ".so-r{background:#fef3c7;color:#7c2d12!important}"
+        "text-transform:uppercase;border-radius:5px;margin-top:6px;margin-bottom:2px;"
+        "color:#111827!important}"
+        ".so-a{background:#dbeafe}"
+        ".so-i{background:#d1fae5}"
+        ".so-g{background:#ede9fe}"
+        ".so-r{background:#fef3c7}"
         "@media(prefers-color-scheme:dark){.so-line::after{background:#475569}}"
         "</style>",
         unsafe_allow_html=True,
@@ -73,12 +75,13 @@ with st.sidebar:
         )
 
     # ── 발굴팀 ──
-    st.markdown('<div class="so-grp" style="background:#ede9fe;color:#4c1d95!important;padding:4px 10px;font-size:.7em;font-weight:700;letter-spacing:.5px;text-transform:uppercase;border-radius:5px;margin-top:6px;margin-bottom:2px">🔭 발굴팀</div>', unsafe_allow_html=True)
+    st.markdown('<div class="so-grp so-g">🔭 발굴팀</div>', unsafe_allow_html=True)
     with st.expander("🔭 발굴 (Screener) — 종목 발굴·스크리닝"):
         st.caption(
             "`screen_stocks` 도구로 KOSPI200·S&P500 유니버스에서 실적(영업이익률·순이익률)과 "
-            "성장성(매출·이익성장률)이 높은 종목을 발굴합니다. "
-            "기저효과 보정·섹터 분산 필터 적용. '성장주 찾아줘', '실적 좋은 종목 알려줘' 등에 응답합니다."
+            "성장성(매출·이익성장률) 기준으로 여러 종목을 스크리닝해 후보를 찾아줍니다. "
+            "기저효과 보정·섹터 분산 필터 적용. '성장주 찾아줘', '실적 좋은 종목 알려줘' 등에 응답합니다. "
+            "미래 주가 예측이 아닌 현재 특징 기반 참고용이며, 결과는 투자 권유가 아닙니다."
         )
 
     # ── 검토팀 ──
