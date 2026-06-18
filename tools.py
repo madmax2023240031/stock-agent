@@ -71,6 +71,277 @@ def _fetch_ohlcv(ticker: str, days: int = 200) -> pd.DataFrame | None:
 
 
 # ═══════════════════════════════════════════════
+# 0. KIS 모의투자 인증 (토큰 발급 + 캐싱)
+# ═══════════════════════════════════════════════
+
+_KIS_DOMAIN          = "https://openapivts.koreainvestment.com:29443"
+_KIS_TOKEN_CACHE_FILE = ".kis_token_cache.json"
+_KIS_TOKEN_BUFFER_SEC = 600   # 만료 10분 전에 갱신 트리거
+
+
+def get_kis_token() -> dict:
+    """
+    KIS 모의투자 접근토큰을 반환한다.
+
+    유효한 캐시가 있으면 재사용하고, 없거나 만료 10분 전이면 새로 발급한다.
+    KIS는 토큰 발급 횟수 제한이 있으므로 반드시 캐시를 경유한다.
+
+    환경변수: KIS_APP_KEY, KIS_APP_SECRET  (.env)
+
+    Returns
+    -------
+    dict  {access_token, token_type, expires_at, source}
+          source : "cache" | "new"
+          실패 시: {"error": "..."}
+    """
+    import json
+    import os
+    import requests
+    from dotenv import load_dotenv
+
+    load_dotenv()
+
+    app_key    = os.getenv("KIS_APP_KEY",    "").strip()
+    app_secret = os.getenv("KIS_APP_SECRET", "").strip()
+
+    if not app_key or not app_secret:
+        return {"error": "KIS_APP_KEY 또는 KIS_APP_SECRET 환경변수가 설정되지 않았습니다."}
+
+    now = datetime.now()
+
+    # ── 캐시 확인 ──────────────────────────────────────
+    if os.path.exists(_KIS_TOKEN_CACHE_FILE):
+        try:
+            with open(_KIS_TOKEN_CACHE_FILE, "r", encoding="utf-8") as f:
+                cached = json.load(f)
+            expires_at = datetime.fromisoformat(cached["expires_at"])
+            if now < expires_at - timedelta(seconds=_KIS_TOKEN_BUFFER_SEC):
+                return {
+                    "access_token": cached["access_token"],
+                    "token_type":   cached.get("token_type", "Bearer"),
+                    "expires_at":   cached["expires_at"],
+                    "source":       "cache",
+                }
+        except Exception:
+            pass  # 캐시 손상 → 재발급
+
+    # ── 토큰 신규 발급 ─────────────────────────────────
+    url  = f"{_KIS_DOMAIN}/oauth2/tokenP"
+    body = {
+        "grant_type": "client_credentials",
+        "appkey":     app_key,
+        "appsecret":  app_secret,
+    }
+
+    try:
+        resp = requests.post(url, json=body, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.HTTPError as exc:
+        body_text = exc.response.text if exc.response is not None else ""
+        return {"error": f"KIS 토큰 발급 HTTP 오류: {exc} — {body_text}"}
+    except Exception as exc:
+        return {"error": f"KIS 토큰 발급 실패: {exc}"}
+
+    access_token = data.get("access_token")
+    if not access_token:
+        return {"error": f"KIS 응답에 access_token 없음: {data}"}
+
+    token_type = data.get("token_type", "Bearer")
+
+    # 만료 시각: 응답의 access_token_token_expired 우선, 없으면 expires_in 사용
+    raw_exp = data.get("access_token_token_expired")
+    if raw_exp:
+        try:
+            expires_at = datetime.strptime(raw_exp, "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            expires_at = now + timedelta(seconds=int(data.get("expires_in", 86400)))
+    else:
+        expires_at = now + timedelta(seconds=int(data.get("expires_in", 86400)))
+
+    # ── 캐시 저장 ──────────────────────────────────────
+    try:
+        with open(_KIS_TOKEN_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "access_token": access_token,
+                    "token_type":   token_type,
+                    "expires_at":   expires_at.isoformat(),
+                },
+                f,
+                ensure_ascii=False,
+            )
+    except Exception:
+        pass  # 캐시 저장 실패는 치명적이지 않음
+
+    return {
+        "access_token": access_token,
+        "token_type":   token_type,
+        "expires_at":   expires_at.isoformat(),
+        "source":       "new",
+    }
+
+
+def get_kis_balance() -> dict:
+    """
+    KIS 모의투자 계좌의 잔고와 보유종목을 조회한다.
+
+    국내주식 잔고조회 API (tr_id: VTTC8434R, 모의투자 전용).
+    ⚠️ 조회(읽기) 전용. 주문 기능 없음.
+
+    환경변수: KIS_ACCOUNT_NO (.env)  — "XXXXXXXX-XX" 또는 "XXXXXXXXXX" 형식 모두 허용.
+    토큰은 get_kis_token()을 통해 자동으로 가져온다.
+
+    Returns
+    -------
+    dict
+        {
+            "account_no": str,
+            "as_of": str,           # 조회 시각 (ISO)
+            "holdings": [
+                {
+                    "ticker":          str,    # 종목코드(6자리)
+                    "name":            str,    # 종목명
+                    "qty":             int,    # 보유수량
+                    "avg_price":       float,  # 매입평균가
+                    "current_price":   float,  # 현재가
+                    "eval_amount":     int,    # 평가금액
+                    "purchase_amount": int,    # 매입금액
+                    "profit_loss":     int,    # 평가손익금액
+                    "profit_loss_pct": float,  # 수익률(%)
+                }
+            ],
+            "summary": {
+                "cash":              int,   # 예수금
+                "eval_stock_total":  int,   # 보유주식 평가금액 합계
+                "total_assets":      int,   # 총평가금액 (현금 포함)
+                "net_assets":        int,   # 순자산금액
+                "purchase_total":    int,   # 매입금액 합계
+                "profit_loss_total": int,   # 평가손익 합계
+            }
+        }
+        실패 시: {"error": "..."}
+    """
+    import os
+    import requests
+    from dotenv import load_dotenv
+
+    load_dotenv()
+
+    # ── 환경변수 로드 ──────────────────────────────────
+    app_key    = os.getenv("KIS_APP_KEY",    "").strip()
+    app_secret = os.getenv("KIS_APP_SECRET", "").strip()
+    account_no = os.getenv("KIS_ACCOUNT_NO", "").strip().replace("-", "")
+
+    if not account_no:
+        return {"error": "KIS_ACCOUNT_NO 환경변수가 설정되지 않았습니다."}
+    if len(account_no) != 10:
+        return {"error": f"KIS_ACCOUNT_NO 형식 오류 (10자리 필요): '{account_no}'"}
+
+    cano          = account_no[:8]   # 계좌번호 앞 8자리
+    acnt_prdt_cd  = account_no[8:]   # 계좌상품코드 뒤 2자리
+
+    # ── 토큰 획득 ──────────────────────────────────────
+    tok = get_kis_token()
+    if "error" in tok:
+        return {"error": f"토큰 획득 실패: {tok['error']}"}
+    access_token = tok["access_token"]
+
+    # ── API 호출 ──────────────────────────────────────
+    # 모의투자 tr_id: VTTC8434R  (실전: TTTC8434R)
+    url = f"{_KIS_DOMAIN}/uapi/domestic-stock/v1/trading/inquire-balance"
+    headers = {
+        "content-type":  "application/json",
+        "authorization": f"Bearer {access_token}",
+        "appkey":        app_key,
+        "appsecret":     app_secret,
+        "tr_id":         "VTTC8434R",
+        "custtype":      "P",           # 개인
+    }
+    params = {
+        "CANO":                cano,
+        "ACNT_PRDT_CD":        acnt_prdt_cd,
+        "AFHR_FLPR_YN":        "N",     # 시간외단일가 미포함
+        "OFL_YN":              "",
+        "INQR_DVSN":           "02",    # 종목별
+        "UNPR_DVSN":           "01",
+        "FUND_STTL_ICLD_YN":   "N",
+        "FNCG_AMT_AUTO_RDPT_YN": "N",
+        "PRCS_DVSN":           "01",    # 전일매매 미포함
+        "CTX_AREA_FK100":      "",
+        "CTX_AREA_NK100":      "",
+    }
+
+    try:
+        resp = requests.get(url, headers=headers, params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.HTTPError as exc:
+        body_text = exc.response.text if exc.response is not None else ""
+        return {"error": f"KIS 잔고조회 HTTP 오류: {exc} — {body_text}"}
+    except Exception as exc:
+        return {"error": f"KIS 잔고조회 실패: {exc}"}
+
+    rt_cd = data.get("rt_cd", "")
+    if rt_cd != "0":
+        msg = data.get("msg1") or data.get("msg") or str(data)
+        return {"error": f"KIS API 오류 (rt_cd={rt_cd}): {msg}"}
+
+    # ── output1: 보유종목 리스트 ──────────────────────
+    def _int(v):
+        try:
+            return int(float(v)) if v not in (None, "", "0") else 0
+        except Exception:
+            return 0
+
+    def _float(v):
+        try:
+            return round(float(v), 4) if v not in (None, "") else 0.0
+        except Exception:
+            return 0.0
+
+    holdings = []
+    for item in data.get("output1", []):
+        qty = _int(item.get("hldg_qty", "0"))
+        if qty == 0:
+            continue  # 수량 0인 행 제외
+
+        holdings.append({
+            "ticker":          item.get("pdno", ""),
+            "name":            item.get("prdt_name", ""),
+            "qty":             qty,
+            "avg_price":       _float(item.get("pchs_avg_pric")),
+            "current_price":   _float(item.get("prpr")),
+            "eval_amount":     _int(item.get("evlu_amt")),
+            "purchase_amount": _int(item.get("pchs_amt")),
+            "profit_loss":     _int(item.get("evlu_pfls_amt")),
+            "profit_loss_pct": _float(item.get("evlu_pfls_rt")),
+        })
+
+    # ── output2: 계좌 요약 ────────────────────────────
+    out2 = data.get("output2")
+    if isinstance(out2, list):
+        out2 = out2[0] if out2 else {}
+    out2 = out2 or {}
+
+    summary = {
+        "cash":              _int(out2.get("dnca_tot_amt")),
+        "eval_stock_total":  _int(out2.get("evlu_amt_smtl_amt")),
+        "total_assets":      _int(out2.get("tot_evlu_amt")),
+        "net_assets":        _int(out2.get("nass_amt")),
+        "purchase_total":    _int(out2.get("pchs_amt_smtl_amt")),
+        "profit_loss_total": _int(out2.get("evlu_pfls_smtl_amt")),
+    }
+
+    return {
+        "account_no": f"{cano}-{acnt_prdt_cd}",
+        "as_of":      datetime.now().isoformat(timespec="seconds"),
+        "holdings":   holdings,
+        "summary":    summary,
+    }
+
+
+# ═══════════════════════════════════════════════
 # 1. get_quote
 # ═══════════════════════════════════════════════
 
@@ -1412,6 +1683,16 @@ if __name__ == "__main__":
         print(f"  {label}")
         print(f"{'='*55}")
         print(json.dumps(data, ensure_ascii=False, indent=2, default=str))
+
+    print("\n▶ [0] get_kis_token")
+    tok = get_kis_token()
+    if "error" in tok:
+        _pp("get_kis_token() — 실패", tok)
+    else:
+        # 토큰 값은 일부만 표시 (보안)
+        safe = tok.copy()
+        safe["access_token"] = safe["access_token"][:20] + "..." if safe.get("access_token") else None
+        _pp("get_kis_token()", safe)
 
     print("\n▶ [1] get_quote")
     _pp("get_quote('005930')", get_quote("005930"))

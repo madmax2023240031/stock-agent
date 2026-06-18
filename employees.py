@@ -194,27 +194,66 @@ def macro_employee(task: str) -> str:
 # ═══════════════════════════════════════════════
 def portfolio_employee(task: str) -> str:
     system_prompt = (
-        "당신은 사용자의 보유 종목들의 섹터 쏠림과 리스크를 점검하는 '포트폴리오 직원'입니다.\n"
-        "- 주어진 도구(get_portfolio_analysis)를 사용하여 보유 종목 목록의 섹터 분포와 쏠림도(HHI)를 분석하세요.\n"
-        "- 특정 섹터에 비중이 과도하게 몰려 있다면 분산 투자의 필요성을 경고하세요.\n"
+        "당신은 사용자의 KIS 모의 계좌를 실시간으로 조회하여 포트폴리오를 분석하는 '포트폴리오 직원'입니다.\n"
+        "\n"
+        "## 반드시 지켜야 할 순서\n"
+        "1. **항상 먼저** `get_kis_balance` 도구를 호출하여 실제 모의 계좌의 잔고와 보유종목을 가져옵니다.\n"
+        "2. 결과를 확인합니다:\n"
+        "   - `holdings` 리스트가 **비어 있으면**: 현금(예수금) 잔고를 안내하고,\n"
+        "     '현재 보유 중인 종목이 없어 섹터·분산 분석을 수행할 수 없습니다'라고 설명합니다.\n"
+        "     분석을 위해 종목을 매수하면 그때 분석이 가능하다고 안내합니다.\n"
+        "   - `holdings` 리스트에 **종목이 있으면**: 해당 티커들로 `get_portfolio_analysis` 도구를 호출하여\n"
+        "     섹터 분포와 쏠림도(HHI)를 분석합니다.\n"
+        "\n"
+        "## 보유종목이 있을 때 분석 방법\n"
+        "- `get_kis_balance`의 `holdings[].eval_amount`로 각 종목의 평가금액을 확인하고\n"
+        "  비중이 높은 종목을 강조합니다.\n"
+        "- `get_portfolio_analysis`로 섹터 분산도, HHI 쏠림 지수를 구합니다.\n"
+        "- 특정 섹터에 50% 이상 쏠림이 있으면 분산 투자 필요성을 경고합니다.\n"
+        "- 종목별 평가손익(profit_loss, profit_loss_pct)도 간략히 보고합니다.\n"
+        "\n"
+        "## 절대 원칙\n"
+        "- 조회(읽기)만 수행합니다. 매수/매도 주문이나 종목 추천은 절대 하지 않습니다.\n"
         "- 답변에 항상 '포트폴리오 분석은 참고용이며 투자 권유가 아닙니다'라고 명시하세요."
     )
-    tools_list = [{
-        "name": "get_portfolio_analysis",
-        "description": "보유 종목 리스트를 받아 섹터 분포 및 쏠림도(HHI)를 분석합니다.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "holdings": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "종목 티커 리스트. 예: ['005930', 'AAPL', 'MSFT']"
-                }
-            },
-            "required": ["holdings"]
+    tools_list = [
+        {
+            "name": "get_kis_balance",
+            "description": (
+                "KIS 모의 계좌의 실제 잔고와 보유종목을 조회합니다. "
+                "인자 없이 호출하면 됩니다. "
+                "반환: holdings(보유종목 리스트), summary(예수금·총평가금액 등)."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        },
+        {
+            "name": "get_portfolio_analysis",
+            "description": (
+                "보유 종목 티커 리스트를 받아 섹터 분포 및 쏠림도(HHI)를 분석합니다. "
+                "get_kis_balance로 holdings를 가져온 뒤 ticker 값들을 리스트로 전달하세요."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "holdings": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "종목 티커 리스트. 예: ['005930', 'AAPL']"
+                    }
+                },
+                "required": ["holdings"]
+            }
         }
-    }]
-    return _run_agent(system_prompt, tools_list, {"get_portfolio_analysis": tools.get_portfolio_analysis}, task)
+    ]
+    tool_map = {
+        "get_kis_balance":       tools.get_kis_balance,
+        "get_portfolio_analysis": tools.get_portfolio_analysis,
+    }
+    return _run_agent(system_prompt, tools_list, tool_map, task)
 
 
 # ═══════════════════════════════════════════════

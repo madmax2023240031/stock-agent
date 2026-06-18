@@ -36,7 +36,7 @@ def manager(user_input: str, history: list = None, status_callback=None) -> str:
         "   - 재무/기업가치: call_fundamental_employee\n"
         "   - 뉴스/공시: call_news_employee\n"
         "   - 금리/환율/거시: call_macro_employee\n"
-        "   - 보유 종목 분산/쏠림: call_portfolio_employee\n"
+        "   - 내 계좌·보유종목·잔고·포트폴리오 관련: call_portfolio_employee\n"
         "   - 두 종목 비교: call_compare_employee\n"
         "   - 종목 발굴/스크리닝 (성장주 찾아줘, 실적 좋은 종목, 요즘 뜨는 종목 등): call_screener_employee\n"
         "     → 시장 미지정 시 한국(KR) 기본. '미국 종목'·'S&P500'·'US' 명시 시 US.\n"
@@ -106,7 +106,11 @@ def manager(user_input: str, history: list = None, status_callback=None) -> str:
         },
         {
             "name": "call_portfolio_employee",
-            "description": "보유 종목 리스트의 섹터 분포 및 쏠림 리스크 분석 직원 호출",
+            "description": (
+                "KIS 모의 계좌를 직접 조회하여 실제 보유종목의 섹터 분포·쏠림 리스크를 분석하는 직원 호출. "
+                "'내 계좌', '내 포트폴리오', '내 보유종목', '내 잔고', '계좌 분석', '포트폴리오 점검' "
+                "같은 질문에 호출하세요."
+            ),
             "input_schema": {"type": "object", "properties": {"task": {"type": "string"}}, "required": ["task"]}
         },
         {
