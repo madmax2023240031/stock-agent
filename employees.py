@@ -430,6 +430,154 @@ def screener_employee(task: str) -> str:
 
 
 # ═══════════════════════════════════════════════
+# 10. 추천 직원 (advisor_employee)
+# ═══════════════════════════════════════════════
+def advisor_employee(task: str) -> str:
+    """
+    내 포트폴리오를 진단하고 분산 관점에서 보강할 종목 후보를 제안하는 '추천 직원'.
+    get_kis_balance → get_portfolio_analysis → screen_stocks 순서로 호출한다.
+    이번 버전은 매수 후보 제안만. 매도 권유 없음.
+    """
+    system_prompt = (
+        "당신은 사용자의 포트폴리오를 분석해 분산 관점에서 보강할 종목 후보를 제안하는 '추천 직원'입니다.\n"
+        "\n"
+        "⚠️ 절대 원칙 — 어떤 상황에도 예외 없이 지켜야 합니다:\n"
+        "1. 실제 매수·매도 주문은 절대 하지 않습니다. '제안'만 합니다. 실행은 사람이 직접.\n"
+        "2. '반드시 사라', '강력 추천', '지금이 기회', '무조건 오른다' 같은 단정적·선동적 표현은 절대 사용 금지.\n"
+        "3. 미래 주가 예측 금지. '오를 것이다' 대신 '현재 이런 특징을 가진 종목'으로 표현.\n"
+        "4. 이번 버전은 매수 후보 제안만. 매도 권유는 하지 않습니다.\n"
+        "5. 모든 제안에 근거(실적·성장 수치)와 반대 위험을 반드시 함께 제시. '최종 결정은 본인이 직접' 명시.\n"
+        "\n"
+        "## 반드시 따라야 할 동작 순서\n"
+        "\n"
+        "### 1단계: 포트폴리오 진단\n"
+        "- `get_kis_balance` 도구를 호출해 현재 계좌 잔고와 보유종목을 가져옵니다.\n"
+        "- `holdings` 리스트에서 ticker 목록을 추출합니다.\n"
+        "- holdings가 비어 있으면(현금만): '현재 보유종목 없이 현금만 보유 중'임을 파악하고,\n"
+        "  여러 섹터에서 고르게 시작 포트폴리오 후보를 제안하는 방향으로 진행합니다. (2단계 생략)\n"
+        "\n"
+        "### 2단계: 섹터 쏠림·공백 진단 (보유종목이 있을 때만)\n"
+        "- `get_portfolio_analysis` 도구를 holdings의 ticker 목록을 인자로 호출합니다.\n"
+        "- 어느 섹터에 과도하게 집중돼 있는지, 어느 섹터가 전혀 없는지 파악합니다.\n"
+        "- 이미 보유한 ticker 목록을 기억해 3단계에서 제외합니다.\n"
+        "\n"
+        "### 3단계: 부족 섹터 종목 발굴\n"
+        "- `screen_stocks` 도구를 호출해 실적·성장 기준 우량 종목을 발굴합니다.\n"
+        "  - market: 보유 종목 구성에 맞게 선택.\n"
+        "    한국 종목만 있으면 'KR', 미국 종목만 있으면 'US', 혼합이면 'ALL'.\n"
+        "    보유종목이 없으면 'ALL'.\n"
+        "  - top_n: 20 이상 요청해 다양한 섹터 결과를 확보합니다.\n"
+        "  - max_per_sector: null (섹터 제한 해제, 다양한 섹터 확보).\n"
+        "  - growth_correction: true (항상).\n"
+        "- 발굴 결과 중 **이미 보유 중인 종목은 제외**합니다.\n"
+        "- 2단계에서 공백·부족으로 파악된 섹터의 종목을 우선 선택합니다.\n"
+        "\n"
+        "### 4단계: 제안 보고서 작성\n"
+        "아래 구조를 그대로 사용하세요.\n"
+        "\n"
+        "**[A] 내 포트폴리오 현황 진단**\n"
+        "- 총 보유종목 수, 총자산(원화 환산 포함)\n"
+        "- 섹터별 비중 (상위 섹터부터)\n"
+        "- 핵심 진단: 집중 섹터와 공백 섹터를 명확히 기술\n"
+        "\n"
+        "**[B] 분산 보강 후보 종목** (최대 5개)\n"
+        "각 종목마다 아래 형식:\n"
+        "```\n"
+        "N. 종목명 (티커) — [채워주는 섹터명] [★ 흑자전환 의심: is_turnaround=true일 때만]\n"
+        "- 실적: 영업이익률 X% / 순이익률 X%\n"
+        "- 성장: 매출성장 X% / 이익성장 X%\n"
+        "- 종합점수: X (실적 X / 성장 X)\n"
+        "📌 분산 근거: 이 종목이 내 포트폴리오 어느 섹터 공백을 채우는지 1~2문장\n"
+        "⚠️ 주의사항: 이 종목의 구체적 위험. 흑자전환이면 '기저효과로 성장률이 과장될 수 있음' 반드시 포함.\n"
+        "```\n"
+        "\n"
+        "**[C] 분산 관점 우선순위 (참고용)**\n"
+        "- 분산 효과가 가장 큰 순서로 간략 정리 (단정적 권유 절대 금지)\n"
+        "- 현재 시장 개장 여부 참고: 한국장 09:00~15:30(KST) / 미국장은 시차로 한국 기준 밤에 열림\n"
+        "\n"
+        "**[D] 면책 고지 (반드시 포함)**\n"
+        "```\n"
+        "⚠️ 이 제안은 현재 데이터 기준 분산 관점의 참고 후보이며, 미래 주가 상승을 보장하지 않습니다.\n"
+        "실제 매수는 사용자 본인이 직접 판단하고 실행하셔야 합니다.\n"
+        "투자 전 개별 종목의 사업 내용·뉴스·거시 환경을 추가로 확인하세요.\n"
+        "이 정보는 참고용이며 투자 권유가 아닙니다.\n"
+        "```\n"
+    )
+
+    tools_list = [
+        {
+            "name": "get_kis_balance",
+            "description": (
+                "KIS 모의 계좌의 실제 잔고와 보유종목을 조회합니다. "
+                "인자 없이 호출. holdings(보유종목 리스트), domestic(예수금 등) 반환."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        },
+        {
+            "name": "get_portfolio_analysis",
+            "description": (
+                "보유 종목 티커 리스트를 받아 섹터 분포 및 쏠림도(HHI)를 분석합니다. "
+                "get_kis_balance의 holdings에서 ticker 값들을 문자열 리스트로 전달하세요."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "holdings": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "종목 티커 리스트. 예: ['005930', 'AAPL']"
+                    }
+                },
+                "required": ["holdings"]
+            }
+        },
+        {
+            "name": "screen_stocks",
+            "description": (
+                "유니버스 종목을 실적(영업이익률·순이익률)과 성장성(매출·이익성장률) 기준으로 "
+                "점수화해 상위 종목을 반환합니다. "
+                "분산 제안 목적이면 top_n=20 이상, max_per_sector=null 로 호출하세요."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "market": {
+                        "type": "string",
+                        "enum": ["KR", "US", "ALL"],
+                        "description": "KR=코스피200, US=S&P500, ALL=전체"
+                    },
+                    "top_n": {
+                        "type": "integer",
+                        "description": "반환할 상위 종목 수. 분산 제안 목적이면 20 이상 권장."
+                    },
+                    "growth_correction": {
+                        "type": "boolean",
+                        "description": "성장률 기저효과 보정. 항상 true 사용."
+                    },
+                    "max_per_sector": {
+                        "type": ["integer", "null"],
+                        "description": "동일 섹터 최대 포함 종목 수. 분산 목적이면 null 권장."
+                    }
+                },
+                "required": ["market"]
+            }
+        }
+    ]
+
+    tool_map = {
+        "get_kis_balance":        tools.get_kis_balance,
+        "get_portfolio_analysis": tools.get_portfolio_analysis,
+        "screen_stocks":          tools.screen_stocks,
+    }
+
+    return _run_agent(system_prompt, tools_list, tool_map, task, max_tokens=4096)
+
+
+# ═══════════════════════════════════════════════
 # 직접 실행 테스트
 # ═══════════════════════════════════════════════
 
@@ -449,3 +597,10 @@ if __name__ == "__main__":
     print("-" * 50)
     result = risk_review_employee(fake_reports)
     print(result)
+
+    import sys
+    if "--advisor" in sys.argv:
+        print("\n\nTask: 추천 직원 단독 테스트 — 내 포트폴리오 보고 매수 후보 추천")
+        print("-" * 50)
+        result = advisor_employee("내 포트폴리오를 보고 분산 관점에서 매수를 고려해볼 만한 종목을 추천해줘.")
+        print(result)

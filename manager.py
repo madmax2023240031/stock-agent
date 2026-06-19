@@ -40,6 +40,10 @@ def manager(user_input: str, history: list = None, status_callback=None) -> str:
         "   - 두 종목 비교: call_compare_employee\n"
         "   - 종목 발굴/스크리닝 (성장주 찾아줘, 실적 좋은 종목, 요즘 뜨는 종목 등): call_screener_employee\n"
         "     → 시장 미지정 시 한국(KR) 기본. '미국 종목'·'S&P500'·'US' 명시 시 US.\n"
+        "   - 내 계좌를 보고 추천 / 뭐 사면 좋을까 / 내 포트폴리오에 뭘 보태면 좋아 등\n"
+        "     내 포트폴리오 맥락에서 매수 후보를 제안해달라는 질문: call_advisor_employee\n"
+        "     → '내 계좌'가 맥락에 있고 '추천'·'뭐 사면'·'보태면'·'보강' 같은 단어가 포함된 경우 해당.\n"
+        "       단순 포트폴리오 현황·잔고 조회만이면 call_portfolio_employee 사용.\n"
         "3. **리스크 검수**: 분석, 비교, 매수 판단 등이 포함된 복합 질문의 경우 여러 분석 직원을 부르게 됩니다. "
         "분석 직원의 결과를 받은 후에는 반드시 그 결과들을 모아 `call_risk_review_employee`를 마지막에 호출하여 "
         "환각이나 숫자 충돌이 없는지, 위험한 주장이 없는지 검증받으세요. 단순 시세 조회라면 생략해도 무방합니다.\n"
@@ -127,6 +131,16 @@ def manager(user_input: str, history: list = None, status_callback=None) -> str:
             "name": "call_screener_employee",
             "description": "실적·성장성 기준으로 조건에 맞는 종목을 발굴하는 직원 호출. '성장주 찾아줘', '실적 좋은 종목', '요즘 뜨는 종목' 같은 발굴형 질문에 사용.",
             "input_schema": {"type": "object", "properties": {"task": {"type": "string", "description": "발굴 조건 및 시장(한국/미국/전체)을 포함한 지시"}}, "required": ["task"]}
+        },
+        {
+            "name": "call_advisor_employee",
+            "description": (
+                "내 포트폴리오(KIS 모의 계좌)를 진단해 분산 관점에서 매수를 고려해볼 만한 종목 후보를 제안하는 직원 호출. "
+                "'내 포트폴리오 보고 추천해줘', '뭐 사면 좋을까', '내 계좌에 뭘 보태면 좋아', "
+                "'내 포트폴리오 보강', '섹터 다양화' 같은 질문에 사용. "
+                "단순 잔고·포트폴리오 현황 조회만이면 call_portfolio_employee를 사용."
+            ),
+            "input_schema": {"type": "object", "properties": {"task": {"type": "string", "description": "추천 요청 내용"}}, "required": ["task"]}
         }
     ]
     
@@ -140,6 +154,7 @@ def manager(user_input: str, history: list = None, status_callback=None) -> str:
         "call_compare_employee": employees.compare_employee,
         "call_risk_review_employee": employees.risk_review_employee,
         "call_screener_employee":    employees.screener_employee,
+        "call_advisor_employee":     employees.advisor_employee,
     }
     
     messages = []
