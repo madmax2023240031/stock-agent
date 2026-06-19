@@ -78,6 +78,30 @@ _KIS_DOMAIN          = "https://openapivts.koreainvestment.com:29443"
 _KIS_TOKEN_CACHE_FILE = ".kis_token_cache.json"
 _KIS_TOKEN_BUFFER_SEC = 600   # 만료 10분 전에 갱신 트리거
 
+# 모의투자에서 조회할 미국 거래소 목록 (거래소코드, 통화코드)
+_KIS_US_EXCHANGES = [
+    ("NASD", "USD"),   # 나스닥
+    ("NYSE", "USD"),   # 뉴욕증권거래소
+    ("AMEX", "USD"),   # 아멕스
+]
+
+
+def _fetch_usd_krw_rate() -> float | None:
+    """USD/KRW 환율을 FinanceDataReader에서 가져온다. 실패 시 None."""
+    try:
+        end   = datetime.today()
+        start = end - timedelta(days=7)
+        df    = fdr.DataReader("USD/KRW",
+                               start=start.strftime("%Y-%m-%d"),
+                               end=end.strftime("%Y-%m-%d"))
+        if df is None or df.empty:
+            return None
+        df.columns = [c.lower() for c in df.columns]
+        col = "close" if "close" in df.columns else df.columns[0]
+        return _safe_float(df[col].dropna().iloc[-1])
+    except Exception:
+        return None
+
 
 def get_kis_token() -> dict:
     """
@@ -184,9 +208,10 @@ def get_kis_token() -> dict:
 
 def get_kis_balance() -> dict:
     """
-    KIS 모의투자 계좌의 잔고와 보유종목을 조회한다.
+    KIS 모의투자 계좌의 국내 + 해외(미국) 주식 잔고를 통합 조회한다.
 
-    국내주식 잔고조회 API (tr_id: VTTC8434R, 모의투자 전용).
+    - 국내주식: tr_id VTTC8434R  (모의투자 전용)
+    - 해외주식: tr_id VTTS3012R  (모의투자 전용, NASD·NYSE·AMEX 각각 조회 후 합산)
     ⚠️ 조회(읽기) 전용. 주문 기능 없음.
 
     환경변수: KIS_ACCOUNT_NO (.env)  — "XXXXXXXX-XX" 또는 "XXXXXXXXXX" 형식 모두 허용.
@@ -197,28 +222,42 @@ def get_kis_balance() -> dict:
     dict
         {
             "account_no": str,
-            "as_of": str,           # 조회 시각 (ISO)
+            "as_of":      str,           # 조회 시각 (ISO)
             "holdings": [
                 {
-                    "ticker":          str,    # 종목코드(6자리)
-                    "name":            str,    # 종목명
-                    "qty":             int,    # 보유수량
-                    "avg_price":       float,  # 매입평균가
-                    "current_price":   float,  # 현재가
-                    "eval_amount":     int,    # 평가금액
-                    "purchase_amount": int,    # 매입금액
-                    "profit_loss":     int,    # 평가손익금액
+                    "ticker":          str,    # 종목코드 (국내 6자리 / 미국 티커)
+                    "name":            str,
+                    "qty":             int,
+                    "avg_price":       float,
+                    "current_price":   float,
+                    "eval_amount":     float,  # 평가금액 (currency 단위)
+                    "purchase_amount": float,  # 매입금액 (currency 단위)
+                    "profit_loss":     float,  # 평가손익 (currency 단위)
                     "profit_loss_pct": float,  # 수익률(%)
+                    "currency":        str,    # "KRW" | "USD"
+                    "market":          str,    # "KR"  | "US"
+                    "exchange":        str,    # "KRX" | "NASD" | "NYSE" | "AMEX"
                 }
             ],
-            "summary": {
-                "cash":              int,   # 예수금
-                "eval_stock_total":  int,   # 보유주식 평가금액 합계
-                "total_assets":      int,   # 총평가금액 (현금 포함)
-                "net_assets":        int,   # 순자산금액
-                "purchase_total":    int,   # 매입금액 합계
-                "profit_loss_total": int,   # 평가손익 합계
-            }
+            "domestic": {
+                "cash_krw":           int,   # 예수금(원화)
+                "eval_stock_krw":     int,   # 국내주식 평가금액
+                "total_assets_krw":   int,   # 국내 총평가금액(현금 포함)
+                "net_assets_krw":     int,   # 순자산금액
+                "purchase_total_krw": int,
+                "profit_loss_krw":    int,
+            },
+            "overseas": {
+                "eval_total_usd":    float,  # 해외주식 평가금액 합계(USD)
+                "purchase_total_usd": float,
+                "profit_loss_usd":   float,
+                "errors":            list,   # 거래소별 조회 실패 메시지 (정상이면 빈 리스트)
+            },
+            "fx": {
+                "usd_krw":             float | None,   # 참고 환율
+                "eval_total_usd_krw":  int   | None,   # 해외 평가금액 원화 환산
+                "total_assets_krw_all": int  | None,   # 국내+해외 합산 원화 환산
+            },
         }
         실패 시: {"error": "..."}
     """
@@ -228,7 +267,6 @@ def get_kis_balance() -> dict:
 
     load_dotenv()
 
-    # ── 환경변수 로드 ──────────────────────────────────
     app_key    = os.getenv("KIS_APP_KEY",    "").strip()
     app_secret = os.getenv("KIS_APP_SECRET", "").strip()
     account_no = os.getenv("KIS_ACCOUNT_NO", "").strip().replace("-", "")
@@ -238,106 +276,186 @@ def get_kis_balance() -> dict:
     if len(account_no) != 10:
         return {"error": f"KIS_ACCOUNT_NO 형식 오류 (10자리 필요): '{account_no}'"}
 
-    cano          = account_no[:8]   # 계좌번호 앞 8자리
-    acnt_prdt_cd  = account_no[8:]   # 계좌상품코드 뒤 2자리
+    cano         = account_no[:8]
+    acnt_prdt_cd = account_no[8:]
 
-    # ── 토큰 획득 ──────────────────────────────────────
     tok = get_kis_token()
     if "error" in tok:
         return {"error": f"토큰 획득 실패: {tok['error']}"}
-    access_token = tok["access_token"]
 
-    # ── API 호출 ──────────────────────────────────────
-    # 모의투자 tr_id: VTTC8434R  (실전: TTTC8434R)
-    url = f"{_KIS_DOMAIN}/uapi/domestic-stock/v1/trading/inquire-balance"
-    headers = {
+    base_headers = {
         "content-type":  "application/json",
-        "authorization": f"Bearer {access_token}",
+        "authorization": f"Bearer {tok['access_token']}",
         "appkey":        app_key,
         "appsecret":     app_secret,
-        "tr_id":         "VTTC8434R",
-        "custtype":      "P",           # 개인
-    }
-    params = {
-        "CANO":                cano,
-        "ACNT_PRDT_CD":        acnt_prdt_cd,
-        "AFHR_FLPR_YN":        "N",     # 시간외단일가 미포함
-        "OFL_YN":              "",
-        "INQR_DVSN":           "02",    # 종목별
-        "UNPR_DVSN":           "01",
-        "FUND_STTL_ICLD_YN":   "N",
-        "FNCG_AMT_AUTO_RDPT_YN": "N",
-        "PRCS_DVSN":           "01",    # 전일매매 미포함
-        "CTX_AREA_FK100":      "",
-        "CTX_AREA_NK100":      "",
+        "custtype":      "P",
     }
 
-    try:
-        resp = requests.get(url, headers=headers, params=params, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-    except requests.HTTPError as exc:
-        body_text = exc.response.text if exc.response is not None else ""
-        return {"error": f"KIS 잔고조회 HTTP 오류: {exc} — {body_text}"}
-    except Exception as exc:
-        return {"error": f"KIS 잔고조회 실패: {exc}"}
-
-    rt_cd = data.get("rt_cd", "")
-    if rt_cd != "0":
-        msg = data.get("msg1") or data.get("msg") or str(data)
-        return {"error": f"KIS API 오류 (rt_cd={rt_cd}): {msg}"}
-
-    # ── output1: 보유종목 리스트 ──────────────────────
-    def _int(v):
+    def _i(v):
         try:
             return int(float(v)) if v not in (None, "", "0") else 0
         except Exception:
             return 0
 
-    def _float(v):
+    def _f(v):
         try:
             return round(float(v), 4) if v not in (None, "") else 0.0
         except Exception:
             return 0.0
 
-    holdings = []
-    for item in data.get("output1", []):
-        qty = _int(item.get("hldg_qty", "0"))
-        if qty == 0:
-            continue  # 수량 0인 행 제외
+    # ── 1. 국내주식 잔고 (VTTC8434R) ───────────────────────
+    dom_holdings: list[dict] = []
+    domestic: dict = {}
 
-        holdings.append({
-            "ticker":          item.get("pdno", ""),
-            "name":            item.get("prdt_name", ""),
-            "qty":             qty,
-            "avg_price":       _float(item.get("pchs_avg_pric")),
-            "current_price":   _float(item.get("prpr")),
-            "eval_amount":     _int(item.get("evlu_amt")),
-            "purchase_amount": _int(item.get("pchs_amt")),
-            "profit_loss":     _int(item.get("evlu_pfls_amt")),
-            "profit_loss_pct": _float(item.get("evlu_pfls_rt")),
-        })
+    try:
+        resp = requests.get(
+            f"{_KIS_DOMAIN}/uapi/domestic-stock/v1/trading/inquire-balance",
+            headers={**base_headers, "tr_id": "VTTC8434R"},
+            params={
+                "CANO": cano, "ACNT_PRDT_CD": acnt_prdt_cd,
+                "AFHR_FLPR_YN": "N", "OFL_YN": "",
+                "INQR_DVSN": "02", "UNPR_DVSN": "01",
+                "FUND_STTL_ICLD_YN": "N", "FNCG_AMT_AUTO_RDPT_YN": "N",
+                "PRCS_DVSN": "01",
+                "CTX_AREA_FK100": "", "CTX_AREA_NK100": "",
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        d = resp.json()
+        if d.get("rt_cd") == "0":
+            for item in d.get("output1", []):
+                qty = _i(item.get("hldg_qty", "0"))
+                if qty == 0:
+                    continue
+                dom_holdings.append({
+                    "ticker":          item.get("pdno", ""),
+                    "name":            item.get("prdt_name", ""),
+                    "qty":             qty,
+                    "avg_price":       _f(item.get("pchs_avg_pric")),
+                    "current_price":   _f(item.get("prpr")),
+                    "eval_amount":     _i(item.get("evlu_amt")),
+                    "purchase_amount": _i(item.get("pchs_amt")),
+                    "profit_loss":     _i(item.get("evlu_pfls_amt")),
+                    "profit_loss_pct": _f(item.get("evlu_pfls_rt")),
+                    "currency":        "KRW",
+                    "market":          "KR",
+                    "exchange":        "KRX",
+                })
+            o2 = d.get("output2") or {}
+            if isinstance(o2, list):
+                o2 = o2[0] if o2 else {}
+            domestic = {
+                "cash_krw":           _i(o2.get("dnca_tot_amt")),
+                "eval_stock_krw":     _i(o2.get("evlu_amt_smtl_amt")),
+                "total_assets_krw":   _i(o2.get("tot_evlu_amt")),
+                "net_assets_krw":     _i(o2.get("nass_amt")),
+                "purchase_total_krw": _i(o2.get("pchs_amt_smtl_amt")),
+                "profit_loss_krw":    _i(o2.get("evlu_pfls_smtl_amt")),
+            }
+        else:
+            msg = d.get("msg1") or d.get("msg") or str(d)
+            domestic = {"error": f"국내 잔고 API 오류: {msg}"}
+    except Exception as exc:
+        domestic = {"error": f"국내 잔고 조회 실패: {exc}"}
 
-    # ── output2: 계좌 요약 ────────────────────────────
-    out2 = data.get("output2")
-    if isinstance(out2, list):
-        out2 = out2[0] if out2 else {}
-    out2 = out2 or {}
+    # ── 2. 해외주식 잔고 (VTTS3012R, 거래소별 순회) ────────
+    ovrs_holdings: list[dict] = []
+    ovrs_errors:   list[str]  = []
 
-    summary = {
-        "cash":              _int(out2.get("dnca_tot_amt")),
-        "eval_stock_total":  _int(out2.get("evlu_amt_smtl_amt")),
-        "total_assets":      _int(out2.get("tot_evlu_amt")),
-        "net_assets":        _int(out2.get("nass_amt")),
-        "purchase_total":    _int(out2.get("pchs_amt_smtl_amt")),
-        "profit_loss_total": _int(out2.get("evlu_pfls_smtl_amt")),
-    }
+    def _fetch_ovrs_exchange(excg_cd: str, crcy_cd: str) -> tuple[list, str | None]:
+        """단일 거래소 해외잔고 조회. rate-limit(EGW00201) 시 1.5초 후 1회 재시도."""
+        params = {
+            "CANO": cano, "ACNT_PRDT_CD": acnt_prdt_cd,
+            "OVRS_EXCG_CD":   excg_cd,
+            "TR_CRCY_CD":     crcy_cd,
+            "CTX_AREA_FK200": "",
+            "CTX_AREA_NK200": "",
+        }
+        for attempt in range(2):
+            try:
+                r = requests.get(
+                    f"{_KIS_DOMAIN}/uapi/overseas-stock/v1/trading/inquire-balance",
+                    headers={**base_headers, "tr_id": "VTTS3012R"},
+                    params=params,
+                    timeout=10,
+                )
+                r.raise_for_status()
+                d = r.json()
+                if d.get("rt_cd") == "0":
+                    items = []
+                    for item in d.get("output1", []):
+                        qty = _i(item.get("ovrs_cblc_qty", "0"))
+                        if qty == 0:
+                            continue
+                        items.append({
+                            "ticker":          item.get("ovrs_pdno", ""),
+                            "name":            item.get("ovrs_item_name", ""),
+                            "qty":             qty,
+                            "avg_price":       _f(item.get("pchs_avg_pric")),
+                            "current_price":   _f(item.get("now_pric2")),
+                            "eval_amount":     _f(item.get("ovrs_stck_evlu_amt")),
+                            "purchase_amount": _f(item.get("frcr_pchs_amt1")),
+                            "profit_loss":     _f(item.get("frcr_evlu_pfls_amt")),
+                            "profit_loss_pct": _f(item.get("evlu_pfls_rt")),
+                            "currency":        crcy_cd,
+                            "market":          "US",
+                            "exchange":        excg_cd,
+                        })
+                    return items, None
+                # rate-limit → 재시도
+                if d.get("msg_cd") == "EGW00201" and attempt == 0:
+                    time.sleep(1.5)
+                    continue
+                msg = d.get("msg1") or d.get("msg") or str(d)
+                return [], f"{excg_cd}: {msg}"
+            except requests.HTTPError as exc:
+                body = exc.response.text if exc.response is not None else ""
+                # rate-limit HTTP 응답 → 재시도
+                if "EGW00201" in body and attempt == 0:
+                    time.sleep(1.5)
+                    continue
+                return [], f"{excg_cd} HTTP오류: {body[:120]}"
+            except Exception as exc:
+                return [], f"{excg_cd}: {exc}"
+        return [], f"{excg_cd}: 재시도 후에도 실패"
+
+    for idx, (excg_cd, crcy_cd) in enumerate(_KIS_US_EXCHANGES):
+        if idx > 0:
+            time.sleep(1.1)   # KIS 초당 거래건수 초과 방지
+        items, err = _fetch_ovrs_exchange(excg_cd, crcy_cd)
+        ovrs_holdings.extend(items)
+        if err:
+            ovrs_errors.append(err)
+
+    # ── 3. 해외 합산 및 환율 환산 ──────────────────────────
+    ovrs_eval_usd     = round(sum(h["eval_amount"]     for h in ovrs_holdings), 2)
+    ovrs_purchase_usd = round(sum(h["purchase_amount"] for h in ovrs_holdings), 2)
+    ovrs_pnl_usd      = round(sum(h["profit_loss"]     for h in ovrs_holdings), 2)
+
+    usd_krw              = _fetch_usd_krw_rate()
+    eval_usd_krw         = round(ovrs_eval_usd * usd_krw)   if usd_krw else None
+    total_assets_krw_all = (
+        domestic.get("total_assets_krw", 0) + eval_usd_krw
+        if usd_krw and "error" not in domestic else None
+    )
 
     return {
         "account_no": f"{cano}-{acnt_prdt_cd}",
         "as_of":      datetime.now().isoformat(timespec="seconds"),
-        "holdings":   holdings,
-        "summary":    summary,
+        "holdings":   dom_holdings + ovrs_holdings,
+        "domestic":   domestic,
+        "overseas": {
+            "eval_total_usd":     ovrs_eval_usd,
+            "purchase_total_usd": ovrs_purchase_usd,
+            "profit_loss_usd":    ovrs_pnl_usd,
+            "errors":             ovrs_errors,
+        },
+        "fx": {
+            "usd_krw":              usd_krw,
+            "eval_total_usd_krw":   eval_usd_krw,
+            "total_assets_krw_all": total_assets_krw_all,
+        },
     }
 
 
