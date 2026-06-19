@@ -18,6 +18,9 @@
   (기저효과 보정, 섹터 분산 필터 적용)
 - **리스크 검수**: 다른 직원들의 분석을 교차 검증해 숫자 오류·과장·환각을 걸러냄
 - **대화 맥락 기억**: 이전 질문을 기억해 "그럼 그건?" 같은 이어지는 질문 가능
+- **KIS 모의 계좌 연동 (조회 전용)**: KIS 모의투자 API로 모의 계좌의 국내·해외(미국) 보유종목과
+  잔고를 실시간으로 읽어와, 포트폴리오 직원이 실제 보유 현황·섹터 분산·손익을 분석
+  — **읽기(조회)만 하며 주문 기능은 없습니다**
 
 ---
 
@@ -31,7 +34,7 @@
 | 펀더멘털 (Fundamental) | PER·PBR·재무 가치 분석 |
 | 뉴스 (News) | 최신 공시·뉴스 요약, 호재/악재 분류 |
 | 거시 (Macro) | 금리·환율·지수 등 거시환경 분석 |
-| 포트폴리오 (Portfolio) | 섹터 분산·쏠림 점검 |
+| 포트폴리오 (Portfolio) | KIS 모의 계좌 실시간 조회 → 국내·미국 종목 통합 섹터 분산·쏠림 점검 |
 | 비교 (Compare) | 두 종목 상대 평가, 섹터 비교 |
 | 발굴 (Screener) | 실적+성장 기준 종목 스크리닝 |
 | 리스크 검수 (Risk Review) | 환각·숫자 오류 검증, 과열 경고 |
@@ -76,14 +79,28 @@ pip install -r requirements.txt
 프로젝트 루트에 `.env` 파일을 만들고 키를 입력합니다.
 
 ```
-ANTHROPIC_API_KEY=sk-ant-...
-DART_API_KEY=...
+# LLM
+ANTHROPIC_API_KEY=sk-ant-api03-xxxxxx
+
+# 한국 공시
+DART_API_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+# KIS 모의투자 (선택 — 없으면 포트폴리오 계좌 조회 기능만 비활성화)
+KIS_APP_KEY=PSxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+KIS_APP_SECRET=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+KIS_ACCOUNT_NO=50123456-01
+KIS_HTS_ID=myid1234
 ```
 
 - **ANTHROPIC_API_KEY**: [Anthropic Console](https://console.anthropic.com)에서 발급 (직원들의 LLM 호출용)
 - **DART_API_KEY**: [OpenDART](https://opendart.fss.or.kr)에서 무료 발급 (한국 공시 조회용)
+- **KIS_APP_KEY / KIS_APP_SECRET**: KIS Developers([apiportal.koreainvestment.com](https://apiportal.koreainvestment.com))에서
+  모의투자 계좌로 앱 등록 후 발급
+- **KIS_ACCOUNT_NO**: 모의투자 계좌번호 (`XXXXXXXX-XX` 형식)
+- **KIS_HTS_ID**: 한국투자증권 HTS 로그인 아이디
 
-> ⚠️ `.env` 파일은 절대 GitHub에 올리지 마세요. (`.gitignore`에 등록되어 있습니다)
+> ⚠️ `.env` 파일과 `.kis_token_cache.json`(토큰 캐시)은 절대 GitHub에 올리지 마세요.
+> 두 파일 모두 `.gitignore`에 등록되어 있습니다.
 
 ### 4. 실행
 
@@ -104,9 +121,17 @@ streamlit run app.py
 지금 시장 거시 환경 어때?
 미국 성장주 찾아줘
 요즘 실적 좋은 한국 종목 찾아줘
+
+# KIS 모의 계좌 연동 시 사용 가능
+내 포트폴리오 어때?
+내 보유종목 분석해줘
+내 계좌 잔고 확인해줘
 ```
 
 급변동(±5% 이상)이 있는 종목을 물으면 자동으로 원인 추적 분석이 작동합니다.
+
+KIS 모의 계좌를 연동하면 "내 포트폴리오" 질문 시 실제 보유 중인 국내·미국 종목의
+섹터 분산, 쏠림 지수(HHI), 종목별 손익을 실시간으로 분석합니다.
 
 ---
 
@@ -114,12 +139,13 @@ streamlit run app.py
 
 ```
 stock-agent/
-├── tools.py        # 데이터·지표·뉴스·재무·거시·스크리닝 함수
-├── employees.py    # 직원(에이전트) 정의
-├── manager.py      # 총괄 매니저 + 실행 로직
-├── app.py          # Streamlit 웹 UI
-├── CLAUDE.md       # 프로젝트 지침 (개발용)
-├── .env            # API 키 (git 제외)
+├── tools.py              # 데이터·지표·뉴스·재무·거시·스크리닝·KIS 함수
+├── employees.py          # 직원(에이전트) 정의
+├── manager.py            # 총괄 매니저 + 실행 로직
+├── app.py                # Streamlit 웹 UI
+├── CLAUDE.md             # 프로젝트 지침 (개발용)
+├── .env                  # API 키 (git 제외)
+├── .kis_token_cache.json # KIS 접근토큰 캐시 (자동 생성, git 제외)
 └── .gitignore
 ```
 
@@ -130,7 +156,8 @@ stock-agent/
 - **역할 분리**: 각 직원은 자기 전용 도구만 사용하며 역할을 섞지 않음
 - **정직성 우선**: 미래 주가 예측을 하지 않으며, 모든 분석은 "현재 데이터 기반 참고용"
 - **견고성**: 무료 데이터 소스의 간헐적 실패에 대비해 캐싱·재시도·부분 성공 처리
-- **안전성**: 실매매 기능은 포함하지 않음
+- **안전성**: 실매매 기능은 포함하지 않음. KIS 연동도 잔고·보유종목 **읽기(조회)만** 수행하며,
+  주문·취소·수정 API는 일절 호출하지 않음
 
 ---
 
