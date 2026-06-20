@@ -1497,6 +1497,11 @@ _screen_cache: dict[str, tuple[float, dict]] = {}
 _screen_lock  = threading.Lock()
 _SCREEN_TTL   = 21600
 
+# 스크리닝 결과 캐시 (TTL 6시간, key=(market, ulimit, correction))
+# 점수화까지 완료된 scored 리스트를 보관 — top_n/sector 필터는 조회 시 적용
+_scored_cache: dict[tuple, tuple[float, tuple]] = {}
+_scored_lock  = threading.Lock()
+
 
 def _fetch_screen_data(ticker: str) -> dict:
     """
@@ -1555,6 +1560,7 @@ def screen_stocks(
     market            : 'KR' / 'US' / 'ALL'
     top_n             : 반환할 상위 종목 수
     universe_limit    : 유니버스에서 시총 상위 N개만 평가 (테스트·빠른 실행용)
+                        추천 목적: KR=50, US=100, ALL=150 권장
     growth_correction : True(기본) → 성장률 기저효과 보정 적용
                         False → 보정 없이 raw 성장률 그대로 사용 (비교용)
     max_per_sector    : 같은 섹터(업종)에서 결과에 포함할 최대 종목 수.
@@ -1601,164 +1607,191 @@ def screen_stocks(
         · 영업이익률 > 순이익률 : 회계 처리에 덜 민감해 본업 수익력을 더 잘 반영
         · 성장 : 실적 = 50:50   : 고마진 성숙기업과 고성장 기업 균형 포착
         · 부분 데이터 허용      : 가용 지표 비중만으로 점수화, 전무하면 제외
+
+    캐시 전략:
+        (market, universe_limit, growth_correction) 조합의 scored 리스트를 6시간 보관.
+        max_per_sector / top_n 필터는 캐시 조회 후 적용하므로 캐시 키에 포함하지 않는다.
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    # ── 1. 유니버스 로드 ─────────────────────────────────────
-    univ = get_universe(market)
-    if "error" in univ:
-        return univ
+    market = market.upper().strip()
 
-    tickers_info = univ["tickers"]
-    if universe_limit:
-        tickers_info = tickers_info[:universe_limit]
+    # ── 결과 레벨 캐시 확인 ──────────────────────────────────
+    # key: (market, universe_limit or 0, growth_correction)
+    # 점수화 완료된 scored 리스트를 재사용 → 데이터 수집 전체를 건너뜀
+    rkey   = (market, universe_limit or 0, growth_correction)
+    scored: list[dict] | None = None
+    total  = 0
 
-    ticker_list = [t["ticker"] for t in tickers_info]
-    name_map    = {t["ticker"]: t["name"] for t in tickers_info}
-    total       = len(ticker_list)
+    with _scored_lock:
+        if rkey in _scored_cache:
+            ts, (cached_total, cached_scored) = _scored_cache[rkey]
+            if time.time() - ts < _SCREEN_TTL:
+                total  = cached_total
+                scored = cached_scored
+                print(f"[Screener] 결과 캐시 히트 — {total}개 평가 결과 재사용 "
+                      f"(market={market}, ulimit={universe_limit or '전체'})")
 
-    # ── 2. 재무 데이터 병렬 수집 ────────────────────────────
-    print(f"[Screener] {total}개 종목 데이터 수집 시작 "
-          f"(market={market}, correction={growth_correction})")
-    done_count  = [0]
-    report_lock = threading.Lock()
+    if scored is None:
+        # ── 1. 유니버스 로드 ─────────────────────────────────────
+        univ = get_universe(market)
+        if "error" in univ:
+            return univ
 
-    def _fetch_and_report(t: str) -> dict:
-        r = _fetch_screen_data(t)
-        with report_lock:
-            done_count[0] += 1
-            n = done_count[0]
-            if n % 10 == 0 or n == total:
-                print(f"  [Screener] {n}/{total} 처리 중...")
-        return r
+        tickers_info = univ["tickers"]
+        if universe_limit:
+            tickers_info = tickers_info[:universe_limit]
 
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        futures = [executor.submit(_fetch_and_report, t) for t in ticker_list]
-        raw = [f.result() for f in as_completed(futures)]
+        ticker_list = [t["ticker"] for t in tickers_info]
+        name_map    = {t["ticker"]: t["name"] for t in tickers_info}
+        total       = len(ticker_list)
 
-    valid = [r for r in raw if "error" not in r]
-    print(f"[Screener] 유효 {len(valid)}/{total}개 → 점수 계산 시작")
+        # ── 2. 재무 데이터 병렬 수집 ────────────────────────────
+        print(f"[Screener] {total}개 종목 데이터 수집 시작 "
+              f"(market={market}, correction={growth_correction})")
+        done_count  = [0]
+        report_lock = threading.Lock()
 
-    # ── 3. 성장률 기저효과 보정 헬퍼 ───────────────────────
-    #
-    # [왜 '하드 캡'인가]
-    #   윈저라이징·로그 변환은 값 크기를 줄이지만 순서를 바꾸지 않는 단조 변환이다.
-    #   Percentile rank는 순서만 보기 때문에 단조 변환 전후 결과가 동일하다.
-    #   → 실제로 순위를 바꾸려면 순서 자체를 바꿔야 하고, 그 방법이 하드 캡이다.
-    #
-    #   earn_growth > CAP 인 종목들을 모두 CAP 값으로 평탄화(clamp) →
-    #   동점 처리 percentile rank에서 같은 순위를 받음 →
-    #   cap 이하 진짜 성장주들이 상대적으로 올라감.
-    #
-    # [흑자전환 플래그]
-    #   raw earn_growth > TURNAROUND_THRESHOLD → is_turnaround = True
-    #   점수에서 제외하지 않고 식별 목적으로만 표시.
+        def _fetch_and_report(t: str) -> dict:
+            r = _fetch_screen_data(t)
+            with report_lock:
+                done_count[0] += 1
+                n = done_count[0]
+                if n % 10 == 0 or n == total:
+                    print(f"  [Screener] {n}/{total} 처리 중...")
+            return r
 
-    # 성장률 상한 (기저효과가 주로 이 범위를 넘어서 발생)
-    EARN_GROWTH_CAP      = 1.0   # 이익성장 100% 초과 → 100%로 처리
-    REV_GROWTH_CAP       = 1.5   # 매출성장 150% 초과 → 150%로 처리 (기저효과 덜함)
-    TURNAROUND_THRESHOLD = 2.0   # 이익성장 200% 초과 → 흑자전환 의심
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            futures = [executor.submit(_fetch_and_report, t) for t in ticker_list]
+            raw = [f.result() for f in as_completed(futures)]
 
-    def _clamp(val_dict: dict, cap: float) -> dict:
-        """CAP 이상 값을 CAP으로 평탄화. None은 유지."""
-        return {t: (min(v, cap) if v is not None else None) for t, v in val_dict.items()}
+        valid = [r for r in raw if "error" not in r]
+        print(f"[Screener] 유효 {len(valid)}/{total}개 → 점수 계산 시작")
 
-    def _pct_rank(val_dict: dict) -> dict:
-        """
-        유니크 값 기반 percentile rank(0~100).
-        동일한 값은 동일한 순위를 부여 — 캡으로 평탄화된 동점 그룹이 올바르게 묶임.
-        """
-        pairs = [(t, v) for t, v in val_dict.items() if v is not None]
-        if not pairs:
-            return {t: None for t in val_dict}
-        unique_sorted = sorted(set(v for _, v in pairs))
-        n = len(unique_sorted)
-        val_to_rank = {v: round(i / max(n - 1, 1) * 100, 1) for i, v in enumerate(unique_sorted)}
-        lookup = {t: val_to_rank[v] for t, v in pairs}
-        return {t: lookup.get(t) for t in val_dict}
+        # ── 3. 성장률 기저효과 보정 헬퍼 ───────────────────────
+        #
+        # [왜 '하드 캡'인가]
+        #   윈저라이징·로그 변환은 값 크기를 줄이지만 순서를 바꾸지 않는 단조 변환이다.
+        #   Percentile rank는 순서만 보기 때문에 단조 변환 전후 결과가 동일하다.
+        #   → 실제로 순위를 바꾸려면 순서 자체를 바꿔야 하고, 그 방법이 하드 캡이다.
+        #
+        #   earn_growth > CAP 인 종목들을 모두 CAP 값으로 평탄화(clamp) →
+        #   동점 처리 percentile rank에서 같은 순위를 받음 →
+        #   cap 이하 진짜 성장주들이 상대적으로 올라감.
+        #
+        # [흑자전환 플래그]
+        #   raw earn_growth > TURNAROUND_THRESHOLD → is_turnaround = True
+        #   점수에서 제외하지 않고 식별 목적으로만 표시.
 
-    # ── 4. 지표별 percentile rank 계산 ─────────────────────
-    # 실적 지표: 보정 없이 raw → rank
-    op_rank  = _pct_rank({r["ticker"]: r.get("op_margin")  for r in valid})
-    net_rank = _pct_rank({r["ticker"]: r.get("net_margin") for r in valid})
+        # 성장률 상한 (기저효과가 주로 이 범위를 넘어서 발생)
+        EARN_GROWTH_CAP      = 1.0   # 이익성장 100% 초과 → 100%로 처리
+        REV_GROWTH_CAP       = 1.5   # 매출성장 150% 초과 → 150%로 처리 (기저효과 덜함)
+        TURNAROUND_THRESHOLD = 2.0   # 이익성장 200% 초과 → 흑자전환 의심
 
-    # 성장 지표: 보정 여부에 따라 하드 캡 적용 후 → rank
-    rev_raw  = {r["ticker"]: r.get("rev_growth")  for r in valid}
-    earn_raw = {r["ticker"]: r.get("earn_growth") for r in valid}
+        def _clamp(val_dict: dict, cap: float) -> dict:
+            """CAP 이상 값을 CAP으로 평탄화. None은 유지."""
+            return {t: (min(v, cap) if v is not None else None) for t, v in val_dict.items()}
 
-    if growth_correction:
-        rev_rank  = _pct_rank(_clamp(rev_raw,  REV_GROWTH_CAP))
-        earn_rank = _pct_rank(_clamp(earn_raw, EARN_GROWTH_CAP))
-    else:
-        rev_rank  = _pct_rank(rev_raw)
-        earn_rank = _pct_rank(earn_raw)
+        def _pct_rank(val_dict: dict) -> dict:
+            """
+            유니크 값 기반 percentile rank(0~100).
+            동일한 값은 동일한 순위를 부여 — 캡으로 평탄화된 동점 그룹이 올바르게 묶임.
+            """
+            pairs = [(t, v) for t, v in val_dict.items() if v is not None]
+            if not pairs:
+                return {t: None for t in val_dict}
+            unique_sorted = sorted(set(v for _, v in pairs))
+            n = len(unique_sorted)
+            val_to_rank = {v: round(i / max(n - 1, 1) * 100, 1) for i, v in enumerate(unique_sorted)}
+            lookup = {t: val_to_rank[v] for t, v in pairs}
+            return {t: lookup.get(t) for t in val_dict}
 
-    # ── 5. 종목별 점수 계산 ─────────────────────────────────
-    scored: list[dict] = []
-    for r in valid:
-        t = r["ticker"]
+        # ── 4. 지표별 percentile rank 계산 ─────────────────────
+        # 실적 지표: 보정 없이 raw → rank
+        op_rank  = _pct_rank({r["ticker"]: r.get("op_margin")  for r in valid})
+        net_rank = _pct_rank({r["ticker"]: r.get("net_margin") for r in valid})
 
-        # 실적 점수: op 60% + net 40%
-        op_s, net_s = op_rank.get(t), net_rank.get(t)
-        if   op_s is not None and net_s is not None:
-            profit_score = round(op_s * 0.6 + net_s * 0.4, 1)
-        elif op_s is not None:
-            profit_score = round(op_s, 1)
-        elif net_s is not None:
-            profit_score = round(net_s, 1)
+        # 성장 지표: 보정 여부에 따라 하드 캡 적용 후 → rank
+        rev_raw  = {r["ticker"]: r.get("rev_growth")  for r in valid}
+        earn_raw = {r["ticker"]: r.get("earn_growth") for r in valid}
+
+        if growth_correction:
+            rev_rank  = _pct_rank(_clamp(rev_raw,  REV_GROWTH_CAP))
+            earn_rank = _pct_rank(_clamp(earn_raw, EARN_GROWTH_CAP))
         else:
-            profit_score = None
+            rev_rank  = _pct_rank(rev_raw)
+            earn_rank = _pct_rank(earn_raw)
 
-        # 성장 점수: rev 50% + earn 50%
-        rev_s, earn_s = rev_rank.get(t), earn_rank.get(t)
-        if   rev_s is not None and earn_s is not None:
-            growth_score = round(rev_s * 0.5 + earn_s * 0.5, 1)
-        elif rev_s is not None:
-            growth_score = round(rev_s, 1)
-        elif earn_s is not None:
-            growth_score = round(earn_s, 1)
-        else:
-            growth_score = None
+        # ── 5. 종목별 점수 계산 ─────────────────────────────────
+        scored = []
+        for r in valid:
+            t = r["ticker"]
 
-        # 종합 점수: 실적 50% + 성장 50%
-        if   profit_score is not None and growth_score is not None:
-            total_score = round(profit_score * 0.5 + growth_score * 0.5, 1)
-        elif profit_score is not None:
-            total_score = profit_score
-        elif growth_score is not None:
-            total_score = growth_score
-        else:
-            continue  # 점수화 불가 → 제외
+            # 실적 점수: op 60% + net 40%
+            op_s, net_s = op_rank.get(t), net_rank.get(t)
+            if   op_s is not None and net_s is not None:
+                profit_score = round(op_s * 0.6 + net_s * 0.4, 1)
+            elif op_s is not None:
+                profit_score = round(op_s, 1)
+            elif net_s is not None:
+                profit_score = round(net_s, 1)
+            else:
+                profit_score = None
 
-        # 흑자전환 플래그 (raw earn_growth 기준)
-        raw_eg = r.get("earn_growth")
-        is_turnaround = (raw_eg is not None and raw_eg > TURNAROUND_THRESHOLD)
+            # 성장 점수: rev 50% + earn 50%
+            rev_s, earn_s = rev_rank.get(t), earn_rank.get(t)
+            if   rev_s is not None and earn_s is not None:
+                growth_score = round(rev_s * 0.5 + earn_s * 0.5, 1)
+            elif rev_s is not None:
+                growth_score = round(rev_s, 1)
+            elif earn_s is not None:
+                growth_score = round(earn_s, 1)
+            else:
+                growth_score = None
 
-        def _pct(v):
-            return round(v * 100, 2) if v is not None else None
+            # 종합 점수: 실적 50% + 성장 50%
+            if   profit_score is not None and growth_score is not None:
+                total_score = round(profit_score * 0.5 + growth_score * 0.5, 1)
+            elif profit_score is not None:
+                total_score = profit_score
+            elif growth_score is not None:
+                total_score = growth_score
+            else:
+                continue  # 점수화 불가 → 제외
 
-        scored.append({
-            "ticker":              t,
-            "name":                r.get("name") or name_map.get(t, t),
-            "sector":              r.get("sector") or "미분류",
-            "industry":            r.get("industry") or "미분류",
-            "profitability_score": profit_score,
-            "growth_score":        growth_score,
-            "total_score":         total_score,
-            "is_turnaround":       is_turnaround,
-            "key_metrics": {
-                "op_margin_pct":   _pct(r.get("op_margin")),
-                "net_margin_pct":  _pct(r.get("net_margin")),
-                "rev_growth_pct":  _pct(r.get("rev_growth")),   # 항상 raw 수치 표시
-                "earn_growth_pct": _pct(r.get("earn_growth")),  # 항상 raw 수치 표시
-            },
-        })
+            # 흑자전환 플래그 (raw earn_growth 기준)
+            raw_eg = r.get("earn_growth")
+            is_turnaround = (raw_eg is not None and raw_eg > TURNAROUND_THRESHOLD)
 
-    # ── 6. 종합 점수 내림차순 정렬 ─────────────────────────
-    scored.sort(key=lambda x: x["total_score"], reverse=True)
+            def _pct(v):
+                return round(v * 100, 2) if v is not None else None
+
+            scored.append({
+                "ticker":              t,
+                "name":                r.get("name") or name_map.get(t, t),
+                "sector":              r.get("sector") or "미분류",
+                "industry":            r.get("industry") or "미분류",
+                "profitability_score": profit_score,
+                "growth_score":        growth_score,
+                "total_score":         total_score,
+                "is_turnaround":       is_turnaround,
+                "key_metrics": {
+                    "op_margin_pct":   _pct(r.get("op_margin")),
+                    "net_margin_pct":  _pct(r.get("net_margin")),
+                    "rev_growth_pct":  _pct(r.get("rev_growth")),   # 항상 raw 수치 표시
+                    "earn_growth_pct": _pct(r.get("earn_growth")),  # 항상 raw 수치 표시
+                },
+            })
+
+        # ── 6. 종합 점수 내림차순 정렬 ─────────────────────────
+        scored.sort(key=lambda x: x["total_score"], reverse=True)
+
+        # 결과 캐시에 저장 (top_n/max_per_sector 필터 전 상태로 보관)
+        with _scored_lock:
+            _scored_cache[rkey] = (time.time(), (total, scored))
 
     # ── 7. 섹터별 상한 적용 → top_n 선별 ──────────────────
-    # 점수 계산과 분리된 결과 선별 단계. 같은 섹터 종목은 상위 max_per_sector개까지만 포함.
+    # 캐시 히트·미스 공통 경로. 캐시 데이터 변형을 막기 위해 shallow copy 사용.
     if max_per_sector is not None:
         sector_counts: dict[str, int] = {}
         top = []
@@ -1766,12 +1799,12 @@ def screen_stocks(
             sec = item["sector"]
             cnt = sector_counts.get(sec, 0)
             if cnt < max_per_sector:
-                top.append(item)
+                top.append({**item})
                 sector_counts[sec] = cnt + 1
             if len(top) >= top_n:
                 break
     else:
-        top = scored[:top_n]
+        top = [{**item} for item in scored[:top_n]]
 
     for rank, item in enumerate(top, 1):
         item["rank"] = rank
