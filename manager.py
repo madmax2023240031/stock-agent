@@ -44,6 +44,10 @@ def manager(user_input: str, history: list = None, status_callback=None) -> str:
         "     내 포트폴리오 맥락에서 매수 후보를 제안해달라는 질문: call_advisor_employee\n"
         "     → '내 계좌'가 맥락에 있고 '추천'·'뭐 사면'·'보태면'·'보강' 같은 단어가 포함된 경우 해당.\n"
         "       단순 포트폴리오 현황·잔고 조회만이면 call_portfolio_employee 사용.\n"
+        "   ⚠️ **call_advisor_employee를 호출하면 call_screener_employee는 절대 추가로 부르지 마세요.**\n"
+        "     advisor_employee가 내부적으로 발굴(KR 50종목 + US 100종목)을 이미 수행합니다.\n"
+        "     screener를 중복 호출하면 503개 전체 스크리닝이 추가로 돌아 5분이 낭비됩니다.\n"
+        "   ⚠️ **같은 직원을 한 번의 답변에서 두 번 이상 호출하지 마세요.** (중복 호출 금지)\n"
         "3. **리스크 검수**: 분석, 비교, 매수 판단 등이 포함된 복합 질문의 경우 여러 분석 직원을 부르게 됩니다. "
         "분석 직원의 결과를 받은 후에는 반드시 그 결과들을 모아 `call_risk_review_employee`를 마지막에 호출하여 "
         "환각이나 숫자 충돌이 없는지, 위험한 주장이 없는지 검증받으세요. 단순 시세 조회라면 생략해도 무방합니다.\n"
@@ -185,6 +189,39 @@ def manager(user_input: str, history: list = None, status_callback=None) -> str:
         if response.stop_reason == "tool_use":
             tool_blocks = [b for b in response.content if b.type == "tool_use"]
 
+            # ── 중복·충돌 제거 ──────────────────────────────────────────
+            # 1. 같은 직원을 두 번 부른 경우 → 첫 번째만 실행, 나머지 skip
+            seen_names: set = set()
+            active_blocks = []
+            skipped_blocks = []
+            for b in tool_blocks:
+                if b.name not in seen_names:
+                    seen_names.add(b.name)
+                    active_blocks.append(b)
+                else:
+                    skipped_blocks.append(b)
+                    print(f"\n[Manager] ⚠️ 중복 호출 제거: {b.name} (이미 이 라운드에 호출됨)")
+
+            # 2. advisor_employee가 있으면 screener_employee 제거
+            #    (advisor가 내부에서 KR50+US100을 이미 돌림 — 전체 스크리닝 중복 방지)
+            if "call_advisor_employee" in seen_names:
+                conflicting = [b for b in active_blocks if b.name == "call_screener_employee"]
+                if conflicting:
+                    active_blocks = [b for b in active_blocks if b.name != "call_screener_employee"]
+                    skipped_blocks.extend(conflicting)
+                    print(f"\n[Manager] ⚠️ advisor+screener 중복 제거: call_screener_employee 건너뜀 "
+                          f"(advisor가 내부 발굴 수행)")
+
+            # skip된 block에 더미 결과 반환 (API는 모든 tool_use_id에 결과를 요구함)
+            tool_results = [
+                {"type": "tool_result", "tool_use_id": b.id,
+                 "content": f"[중복 제거] {b.name}은(는) 이 라운드에서 이미 처리되었습니다."}
+                for b in skipped_blocks
+            ]
+
+            tool_blocks = active_blocks
+            # ────────────────────────────────────────────────────────────
+
             # 리스크 검수 직원은 다른 직원 결과가 필요하므로 항상 마지막에 순차 실행
             parallel_blocks = [b for b in tool_blocks if b.name != "call_risk_review_employee"]
             risk_blocks = [b for b in tool_blocks if b.name == "call_risk_review_employee"]
@@ -205,8 +242,6 @@ def manager(user_input: str, history: list = None, status_callback=None) -> str:
                 else:
                     result_str = f"Unknown tool: {tool_name}"
                 return {"type": "tool_result", "tool_use_id": block.id, "content": result_str}
-
-            tool_results = []
 
             if len(parallel_blocks) > 1:
                 # 병렬 실행 시작을 메인 스레드에서 한 번에 알림 (워커에서 알리지 않음)
