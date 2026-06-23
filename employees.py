@@ -264,7 +264,7 @@ def portfolio_employee(task: str) -> str:
         "get_kis_balance":       tools.get_kis_balance,
         "get_portfolio_analysis": tools.get_portfolio_analysis,
     }
-    return _run_agent(system_prompt, tools_list, tool_map, task)
+    return _run_agent(system_prompt, tools_list, tool_map, task, max_tokens=4096)
 
 
 # ═══════════════════════════════════════════════

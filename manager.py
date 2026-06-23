@@ -174,7 +174,8 @@ def manager(user_input: str, history: list = None, status_callback=None) -> str:
         messages.extend(history)
     messages.append({"role": "user", "content": user_input})
 
-    
+    called_employees: set = set()  # 이 대화 전체에서 실행된 직원 (라운드 간 중복 방지)
+
     while True:
         response = client.messages.create(
             model=MODEL_NAME,
@@ -190,21 +191,24 @@ def manager(user_input: str, history: list = None, status_callback=None) -> str:
             tool_blocks = [b for b in response.content if b.type == "tool_use"]
 
             # ── 중복·충돌 제거 ──────────────────────────────────────────
-            # 1. 같은 직원을 두 번 부른 경우 → 첫 번째만 실행, 나머지 skip
-            seen_names: set = set()
+            # 1. 같은 직원을 이번 라운드에서 두 번 부르거나 이전 라운드에서 이미 실행된 경우 → skip
+            seen_this_round: set = set()
             active_blocks = []
             skipped_blocks = []
             for b in tool_blocks:
-                if b.name not in seen_names:
-                    seen_names.add(b.name)
+                if b.name not in seen_this_round and b.name not in called_employees:
+                    seen_this_round.add(b.name)
                     active_blocks.append(b)
                 else:
                     skipped_blocks.append(b)
-                    print(f"\n[Manager] ⚠️ 중복 호출 제거: {b.name} (이미 이 라운드에 호출됨)")
+                    if b.name in called_employees:
+                        print(f"\n[Manager] ⚠️ 라운드 간 중복 제거: {b.name} (이전 라운드에서 이미 실행됨)")
+                    else:
+                        print(f"\n[Manager] ⚠️ 라운드 내 중복 제거: {b.name} (이 라운드에서 이미 호출됨)")
 
             # 2. advisor_employee가 있으면 screener_employee 제거
             #    (advisor가 내부에서 KR50+US100을 이미 돌림 — 전체 스크리닝 중복 방지)
-            if "call_advisor_employee" in seen_names:
+            if "call_advisor_employee" in seen_this_round:
                 conflicting = [b for b in active_blocks if b.name == "call_screener_employee"]
                 if conflicting:
                     active_blocks = [b for b in active_blocks if b.name != "call_screener_employee"]
@@ -265,6 +269,10 @@ def manager(user_input: str, history: list = None, status_callback=None) -> str:
             # 리스크 검수는 앞 직원들이 모두 끝난 뒤 메인 스레드에서 순차 실행
             for block in risk_blocks:
                 tool_results.append(execute_block(block, notify=True))
+
+            # 이번 라운드에서 실제 실행된 직원을 전체 추적 집합에 등록
+            called_employees.update(b.name for b in active_blocks)
+            called_employees.update(b.name for b in risk_blocks)
 
             messages.append({"role": "user", "content": tool_results})
             
