@@ -460,6 +460,178 @@ def get_kis_balance() -> dict:
 
 
 # ═══════════════════════════════════════════════
+# 0-B. get_benchmark_comparison
+# ═══════════════════════════════════════════════
+
+def get_benchmark_comparison(period_days: int = 30) -> dict:
+    """
+    내 포트폴리오 수익률을 지수(KOSPI, S&P500)와 비교한다.
+
+    - 국내 포트폴리오: 매입가 대비 현재 평가금액 수익률(KRW 기준) vs KOSPI
+    - 해외 포트폴리오: 매입가 대비 현재 평가금액 수익률(USD 기준) vs S&P500
+      → 환율 영향은 제외하고 달러 기준 순수 주식 성적만 비교
+    - 지수 비교 구간: 최근 period_days일(기본 30일) — 실제 보유 기간과 다를 수 있으며
+      이는 근사치임을 결과에 명시
+
+    ⚠️ 정밀 벤치마크가 아님. 종목별 보유 기간이 다르기 때문에 지수 구간을 최근
+    고정 기간으로 근사한 "방향성 참고" 비교다.
+
+    Parameters
+    ----------
+    period_days : int
+        지수 수익률 비교 구간 (달력 기준 일수, 기본 30일).
+
+    Returns
+    -------
+    dict
+        {
+            "as_of"       : str,          # 조회 시각 (ISO)
+            "period_days" : int,
+            "period_note" : str,          # 근사 방식 설명 문구
+            "domestic"    : {             # 국내 포트폴리오 (보유 종목 없으면 None)
+                "portfolio_return_pct" : float | None,
+                "benchmark"            : "KOSPI",
+                "benchmark_return_pct" : float | None,
+                "excess_return_pct"    : float | None,
+                "assessment"           : str,
+                "holdings_count"       : int,
+                "purchase_total_krw"   : int,
+                "eval_total_krw"       : int,
+                "currency"             : "KRW",
+            } | None,
+            "overseas"    : {             # 해외 포트폴리오 (보유 종목 없으면 None)
+                "portfolio_return_pct" : float | None,
+                "benchmark"            : "S&P500",
+                "benchmark_return_pct" : float | None,
+                "excess_return_pct"    : float | None,
+                "assessment"           : str,
+                "holdings_count"       : int,
+                "purchase_total_usd"   : float,
+                "eval_total_usd"       : float,
+                "currency"             : "USD",
+                "note_fx"              : str,
+            } | None,
+            "disclaimer"  : str,
+        }
+        실패 시: {"error": "..."}
+    """
+    # ── 1. KIS 잔고 조회 ──────────────────────────────────
+    balance = get_kis_balance()
+    if "error" in balance:
+        return {"error": f"잔고 조회 실패: {balance['error']}"}
+
+    holdings = balance.get("holdings", [])
+    kr_holdings = [h for h in holdings if h.get("market") == "KR"]
+    us_holdings = [h for h in holdings if h.get("market") == "US"]
+
+    # ── 2. 지수 수익률 (최근 period_days일) ──────────────
+    def _index_return_pct(symbol: str, days: int) -> float | None:
+        """지수의 최근 days일(달력 기준) 수익률(%)을 반환. 실패 시 None."""
+        end   = datetime.today()
+        start = end - timedelta(days=days + 10)   # 주말/공휴일 여유
+        try:
+            df = fdr.DataReader(symbol,
+                                start=start.strftime("%Y-%m-%d"),
+                                end=end.strftime("%Y-%m-%d"))
+            if df is None or df.empty:
+                return None
+            df.columns = [c.lower() for c in df.columns]
+            col    = "close" if "close" in df.columns else df.columns[0]
+            closes = df[col].dropna()
+            if len(closes) < 2:
+                return None
+            p_start = float(closes.iloc[0])
+            p_end   = float(closes.iloc[-1])
+            if p_start == 0:
+                return None
+            return round((p_end - p_start) / p_start * 100, 2)
+        except Exception:
+            return None
+
+    kospi_ret = _index_return_pct("KS11",  period_days)
+    sp500_ret = _index_return_pct("US500", period_days)
+
+    # ── 3. 국내 포트폴리오 수익률 ─────────────────────────
+    domestic_result = None
+    if kr_holdings:
+        purchase_kr = sum(h.get("purchase_amount", 0) for h in kr_holdings)
+        eval_kr     = sum(h.get("eval_amount",     0) for h in kr_holdings)
+        port_ret_kr = (
+            round((eval_kr - purchase_kr) / purchase_kr * 100, 2)
+            if purchase_kr > 0 else None
+        )
+        excess_kr = (
+            round(port_ret_kr - kospi_ret, 2)
+            if (port_ret_kr is not None and kospi_ret is not None) else None
+        )
+        if excess_kr is not None:
+            direction  = "초과" if excess_kr >= 0 else "미달"
+            assessment = f"KOSPI 대비 {direction} {abs(excess_kr):.2f}%p"
+        else:
+            assessment = "지수 데이터 없음 — 비교 불가"
+
+        domestic_result = {
+            "portfolio_return_pct": port_ret_kr,
+            "benchmark":            "KOSPI",
+            "benchmark_return_pct": kospi_ret,
+            "excess_return_pct":    excess_kr,
+            "assessment":           assessment,
+            "holdings_count":       len(kr_holdings),
+            "purchase_total_krw":   round(purchase_kr),
+            "eval_total_krw":       round(eval_kr),
+            "currency":             "KRW",
+        }
+
+    # ── 4. 해외 포트폴리오 수익률 (USD 기준) ───────────────
+    overseas_result = None
+    if us_holdings:
+        purchase_us = sum(h.get("purchase_amount", 0) for h in us_holdings)
+        eval_us     = sum(h.get("eval_amount",     0) for h in us_holdings)
+        port_ret_us = (
+            round((eval_us - purchase_us) / purchase_us * 100, 2)
+            if purchase_us > 0 else None
+        )
+        excess_us = (
+            round(port_ret_us - sp500_ret, 2)
+            if (port_ret_us is not None and sp500_ret is not None) else None
+        )
+        if excess_us is not None:
+            direction  = "초과" if excess_us >= 0 else "미달"
+            assessment = f"S&P500 대비 {direction} {abs(excess_us):.2f}%p"
+        else:
+            assessment = "지수 데이터 없음 — 비교 불가"
+
+        overseas_result = {
+            "portfolio_return_pct": port_ret_us,
+            "benchmark":            "S&P500",
+            "benchmark_return_pct": sp500_ret,
+            "excess_return_pct":    excess_us,
+            "assessment":           assessment,
+            "holdings_count":       len(us_holdings),
+            "purchase_total_usd":   round(purchase_us, 2),
+            "eval_total_usd":       round(eval_us,     2),
+            "currency":             "USD",
+            "note_fx":              "달러 기준 순수 주식 성적 — 환율(USD/KRW) 효과 제외",
+        }
+
+    if domestic_result is None and overseas_result is None:
+        return {"error": "보유 종목이 없어 벤치마크 비교를 수행할 수 없습니다."}
+
+    return {
+        "as_of":       datetime.now().isoformat(timespec="seconds"),
+        "period_days": period_days,
+        "period_note": (
+            f"⚠️ 지수 비교 구간은 최근 {period_days}일(달력 기준)로 근사했습니다. "
+            "보유 기간이 종목마다 다르므로, 이 비교는 '대략 지수보다 나았나'의 "
+            "방향성을 참고하는 용도이며 정밀 벤치마크가 아닙니다."
+        ),
+        "domestic":    domestic_result,
+        "overseas":    overseas_result,
+        "disclaimer":  "이 정보는 참고용이며 투자 권유가 아닙니다. 미래 수익률을 보장하지 않습니다.",
+    }
+
+
+# ═══════════════════════════════════════════════
 # 1. get_quote
 # ═══════════════════════════════════════════════
 
@@ -1863,6 +2035,9 @@ if __name__ == "__main__":
     print("\n▶ [5] search_news")
     _pp("search_news('005930')", search_news("005930"))
     _pp("search_news('AAPL')",   search_news("AAPL"))
+
+    print("\n▶ [6-B] get_benchmark_comparison")
+    _pp("get_benchmark_comparison()", get_benchmark_comparison())
 
     print("\n▶ [6] get_portfolio_analysis")
     sample_holdings = [

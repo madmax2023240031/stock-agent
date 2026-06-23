@@ -200,10 +200,12 @@ def portfolio_employee(task: str) -> str:
         "1. **항상 먼저** `get_kis_balance` 도구를 호출하여 실제 모의 계좌의 잔고와 보유종목을 가져옵니다.\n"
         "2. 결과를 확인합니다:\n"
         "   - `holdings` 리스트가 **비어 있으면**: 현금(예수금) 잔고를 안내하고,\n"
-        "     '현재 보유 중인 종목이 없어 섹터·분산 분석을 수행할 수 없습니다'라고 설명합니다.\n"
-        "     분석을 위해 종목을 매수하면 그때 분석이 가능하다고 안내합니다.\n"
-        "   - `holdings` 리스트에 **종목이 있으면**: 해당 티커들로 `get_portfolio_analysis` 도구를 호출하여\n"
-        "     섹터 분포와 쏠림도(HHI)를 분석합니다.\n"
+        "     '현재 보유 중인 종목이 없어 섹터·분산·벤치마크 분석을 수행할 수 없습니다'라고 설명합니다.\n"
+        "   - `holdings` 리스트에 **종목이 있으면**: 아래 3·4단계를 수행합니다.\n"
+        "3. 종목이 있으면 **`get_portfolio_analysis`와 `get_benchmark_comparison`을 호출**합니다.\n"
+        "   - `get_portfolio_analysis`: 전체 holdings의 ticker 목록을 넘겨 섹터 분산도·HHI를 구합니다.\n"
+        "   - `get_benchmark_comparison`: 인자 없이 호출. 국내·해외 수익률과 지수(KOSPI/S&P500) 비교를 가져옵니다.\n"
+        "4. 두 도구의 결과를 모아 아래 보고서 형식으로 작성합니다.\n"
         "\n"
         "## get_kis_balance 응답 구조 (반드시 숙지)\n"
         "- `holdings[]`     : 국내(KR) + 해외(US) 보유종목 통합 리스트\n"
@@ -216,12 +218,35 @@ def portfolio_employee(task: str) -> str:
         "- `fx.usd_krw`     : 참고 환율 (None이면 조회 실패)\n"
         "- `fx.total_assets_krw_all` : 국내+해외 합산 원화 환산 총자산\n"
         "\n"
-        "## 보유종목이 있을 때 분석 방법\n"
+        "## 보고서 형식 (종목이 있을 때)\n"
+        "\n"
+        "### [1] 계좌 현황\n"
         "- 국내 종목은 원화(KRW), 미국 종목은 달러(USD)로 평가금액을 표시합니다.\n"
         "- `fx.usd_krw` 환율이 있으면 미국 종목도 원화 환산 금액을 함께 표시합니다.\n"
-        "- `get_portfolio_analysis`에 전체 holdings의 ticker 목록을 넘겨 섹터 분산도·HHI를 구합니다.\n"
+        "- 국내+해외 합산 총자산(원화 환산)을 요약합니다.\n"
+        "- 종목별 평가손익(profit_loss, profit_loss_pct)을 간략히 표시합니다.\n"
+        "\n"
+        "### [2] 섹터 분산 분석\n"
+        "- `get_portfolio_analysis` 결과를 바탕으로 섹터 비중과 쏠림도(HHI)를 설명합니다.\n"
         "- 특정 섹터에 50% 이상 쏠림이 있으면 분산 투자 필요성을 경고합니다.\n"
-        "- 종목별 평가손익(profit_loss, profit_loss_pct)도 간략히 보고합니다.\n"
+        "\n"
+        "### [3] 📊 지수 대비 성과 비교 (참고용)\n"
+        "- `get_benchmark_comparison` 결과를 사용해 아래 표를 작성합니다.\n"
+        "  (해당 시장에 보유종목이 없으면 그 행은 생략)\n"
+        "\n"
+        "  | 구분 | 내 수익률 | 지수 수익률 | 차이 |\n"
+        "  |------|-----------|-------------|------|\n"
+        "  | 🇰🇷 국내 (vs KOSPI) | X.XX% | X.XX% | ±X.XX%p |\n"
+        "  | 🌏 해외 (vs S&P500, 달러 기준) | X.XX% | X.XX% | ±X.XX%p |\n"
+        "\n"
+        "- 표 아래에 반드시 다음 **세 가지 주의사항**을 간결하게 명시하세요:\n"
+        "  1. **근사 구간**: 지수 수익률은 최근 30일(달력 기준) 구간의 근사치이며,\n"
+        "     실제 보유 기간과 다를 수 있어 정밀한 비교가 아닙니다.\n"
+        "  2. **보유 기간 효과**: 보유 기간이 짧거나 종목마다 매입 시점이 다르면\n"
+        "     지수와의 차이가 실제보다 크거나 작게 보일 수 있습니다.\n"
+        "  3. **단기 변동성**: 단기 비교는 운(시장 타이밍)의 영향이 크므로,\n"
+        "     이 수치는 방향성을 참고하는 용도입니다. '지수보다 못하니 종목이 나쁘다'거나\n"
+        "     '지수보다 나으니 종목이 좋다'는 단정은 하지 마세요.\n"
         "\n"
         "## 절대 원칙\n"
         "- 조회(읽기)만 수행합니다. 매수/매도 주문이나 종목 추천은 절대 하지 않습니다.\n"
@@ -258,11 +283,25 @@ def portfolio_employee(task: str) -> str:
                 },
                 "required": ["holdings"]
             }
-        }
+        },
+        {
+            "name": "get_benchmark_comparison",
+            "description": (
+                "내 포트폴리오 수익률(매입가 대비)을 KOSPI(국내)·S&P500(해외) 지수와 비교합니다. "
+                "인자 없이 호출. 국내·해외 각각의 수익률, 지수 수익률(최근 30일 근사), "
+                "초과/미달 %p를 반환합니다. 해외는 달러 기준(환율 효과 제외)."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        },
     ]
     tool_map = {
-        "get_kis_balance":       tools.get_kis_balance,
-        "get_portfolio_analysis": tools.get_portfolio_analysis,
+        "get_kis_balance":            tools.get_kis_balance,
+        "get_portfolio_analysis":     tools.get_portfolio_analysis,
+        "get_benchmark_comparison":   tools.get_benchmark_comparison,
     }
     return _run_agent(system_prompt, tools_list, tool_map, task, max_tokens=4096)
 
