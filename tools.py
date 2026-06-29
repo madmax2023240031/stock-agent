@@ -675,6 +675,99 @@ def place_kis_order(
 
 
 # ═══════════════════════════════════════════════
+# 0-B-2. propose_and_confirm_order
+# ═══════════════════════════════════════════════
+
+def propose_and_confirm_order(
+    ticker: str,
+    side: str,
+    qty: int,
+    order_type: str,
+    price: int = 0,
+) -> dict:
+    """
+    AI가 제안한 주문을 사람이 승인한 뒤에만 실행하는 안전 래퍼.
+
+    흐름
+    ----
+    1. place_kis_order(dry_run=True) → 주문서 생성 + 안전장치 통과 여부 확인
+    2. 주문 내역을 터미널에 보기 좋게 출력
+    3. input()으로 'y' 입력 시에만 place_kis_order(dry_run=False) 실행
+       'y' 이외의 모든 입력 → 주문 취소
+
+    승인 없이 자동 실행되는 경로는 없다.
+    """
+    # ── 1단계: dry_run으로 주문서 생성 + 안전장치 확인 ────────
+    draft = place_kis_order(ticker, side, qty, order_type, price, dry_run=True)
+
+    if "error" in draft:
+        print(f"\n❌ 주문 사전 검증 실패: {draft['error']}")
+        return draft
+
+    order = draft["order"]
+    safety = draft["safety"]
+
+    # 종목명 조회 (실패해도 코드로 대체)
+    try:
+        q = get_quote(ticker)
+        stock_name = q.get("name", ticker) if "error" not in q else ticker
+    except Exception:
+        stock_name = ticker
+
+    side_kor      = "매수" if order["side"] == "BUY" else "매도"
+    order_type_kor = "시장가" if order["order_type"] == "MARKET" else "지정가"
+    price_display = (
+        f"{order['price']:,}원" if order["price"] is not None else "시장가(현재가 근사)"
+    )
+
+    # ── 2단계: 사람이 읽기 쉬운 주문서 출력 ───────────────────
+    print("\n" + "=" * 55)
+    print("  📋 주문 제안서 — 사람 승인 필요")
+    print("=" * 55)
+    print(f"  종목명  : {stock_name} ({order['ticker']})")
+    print(f"  구분    : {side_kor}")
+    print(f"  주문유형: {order_type_kor}")
+    print(f"  수량    : {order['qty']:,}주")
+    print(f"  주문단가: {price_display}")
+    print(f"  예상금액: {order['estimated_amount_krw']:,}원  ({order['price_source']})")
+    print(f"  계좌    : {order['account']}  [모의투자]")
+    print(f"  금액상한: {safety['limit_krw']:,}원  ✅ 통과")
+    print("=" * 55)
+    print("  ⚠️  이 주문은 모의투자 계좌로 전송됩니다.")
+    print("=" * 55)
+
+    # ── 3단계: 사람의 승인 ─────────────────────────────────────
+    try:
+        answer = input("\n이 주문을 실행할까요? (y/n): ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print("\n주문 취소됨 (입력 중단)")
+        return {"cancelled": True, "reason": "입력 중단", "order": order}
+
+    if answer != "y":
+        print(f"\n주문 취소됨 (입력값: '{answer}')")
+        return {"cancelled": True, "reason": f"사용자가 '{answer}' 입력", "order": order}
+
+    # ── 4단계: 실제 주문 실행 ──────────────────────────────────
+    print("\n주문 전송 중...")
+    result = place_kis_order(ticker, side, qty, order_type, price, dry_run=False)
+
+    if "error" in result:
+        print(f"\n❌ 주문 실패: {result['error']}")
+        return result
+
+    r = result.get("result", {})
+    print("\n" + "=" * 55)
+    print("  ✅ 주문 완료")
+    print("=" * 55)
+    print(f"  주문번호: {r.get('order_no', '—')}")
+    print(f"  주문시각: {r.get('order_time', '—')}")
+    print(f"  메시지  : {r.get('msg', '—')}")
+    print("=" * 55)
+
+    return result
+
+
+# ═══════════════════════════════════════════════
 # 0-C. get_benchmark_comparison
 # ═══════════════════════════════════════════════
 
@@ -2239,6 +2332,12 @@ if __name__ == "__main__":
     # 안전장치 테스트: 해외 종목 입력 거부
     _pp("안전장치: 해외 종목 거부 — AAPL",
         place_kis_order("AAPL", "BUY", 1, "MARKET", dry_run=True))
+
+    print("\n▶ [0-B-2] propose_and_confirm_order — 주문서+승인 흐름 테스트")
+    print("  (터미널에서 'y' 또는 'n' 을 입력해 흐름을 확인합니다.)")
+    print("  ※ 'n' 입력 시 실제 주문 없이 취소 흐름만 확인합니다.\n")
+    _pp("propose_and_confirm_order 결과",
+        propose_and_confirm_order("005930", "BUY", 1, "LIMIT", price=60000))
 
     print("\n▶ [0] get_kis_token")
     tok = get_kis_token()
