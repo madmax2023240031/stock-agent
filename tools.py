@@ -78,6 +78,16 @@ _KIS_DOMAIN          = "https://openapivts.koreainvestment.com:29443"
 _KIS_TOKEN_CACHE_FILE = ".kis_token_cache.json"
 _KIS_TOKEN_BUFFER_SEC = 600   # 만료 10분 전에 갱신 트리거
 
+# ── place_kis_order 안전장치 상수 ──────────────────────────────
+_KIS_MOCK_ACCOUNT   = "50193730-01"   # 허용된 모의투자 계좌 (하드코딩)
+_KIS_ORDER_LIMIT_KRW = 1_000_000      # 1회 주문 금액 상한 (100만 원)
+
+# 모의투자 tr_id (국내주식 주문)
+# ⚠️ 실전: TTTC0802U(매수) / TTTC0801U(매도) — 이 코드에서 절대 사용 금지
+# ⚠️ 모의: VTTC0802U(매수) / VTTC0801U(매도)
+_KIS_MOCK_TR_BUY  = "VTTC0802U"
+_KIS_MOCK_TR_SELL = "VTTC0801U"
+
 # 모의투자에서 조회할 미국 거래소 목록 (거래소코드, 통화코드)
 _KIS_US_EXCHANGES = [
     ("NASD", "USD"),   # 나스닥
@@ -460,7 +470,212 @@ def get_kis_balance() -> dict:
 
 
 # ═══════════════════════════════════════════════
-# 0-B. get_benchmark_comparison
+# 0-B. place_kis_order
+# ═══════════════════════════════════════════════
+
+def place_kis_order(
+    ticker: str,
+    side: str,
+    qty: int,
+    order_type: str,
+    price: int = 0,
+    dry_run: bool = True,
+) -> dict:
+    """
+    KIS 모의투자 국내주식 주문을 낸다.
+
+    Parameters
+    ----------
+    ticker     : str   한국 6자리 종목코드 (예: "005930"). 국내 주문만 지원.
+    side       : str   "BUY" | "SELL"
+    qty        : int   주문 수량 (1 이상 정수)
+    order_type : str   "MARKET"(시장가) | "LIMIT"(지정가)
+    price      : int   지정가 주문 시 주문단가 (원). 시장가면 0 또는 생략.
+    dry_run    : bool  True(기본) → 실제 주문 없이 주문서만 반환.
+                       False      → KIS API 실제 호출 (평일 장중에만 체결 가능).
+
+    안전장치 (하드코딩, 변경 불가)
+    --------------------------------
+    1. 허용 계좌: _KIS_MOCK_ACCOUNT(50193730-01)만 허용.
+       환경변수 계좌가 다르면 즉시 거부.
+    2. 주문 금액 상한: 1회 ≤ 100만 원.
+       - 지정가: price × qty
+       - 시장가: get_quote() 현재가 × qty (근사)
+       초과 시 즉시 거부.
+
+    Returns
+    -------
+    dict
+        dry_run=True  : {"dry_run": True,  "order": {...}, "api_body": {...}, "safety": {...}, "message": str}
+        dry_run=False : {"dry_run": False, "order": {...}, "result": {...}}
+        오류 시       : {"error": "..."}
+    """
+    import os
+    import requests
+    from dotenv import load_dotenv
+
+    load_dotenv()
+
+    # ── 입력 검증 ──────────────────────────────────────────────
+    ticker = ticker.strip()
+    if not _is_korean(ticker):
+        return {"error": f"place_kis_order는 국내 종목(6자리 코드)만 지원합니다. 입력: '{ticker}'"}
+
+    side = side.upper().strip()
+    if side not in ("BUY", "SELL"):
+        return {"error": f"side는 'BUY' 또는 'SELL' 이어야 합니다. 입력: '{side}'"}
+
+    order_type = order_type.upper().strip()
+    if order_type not in ("MARKET", "LIMIT"):
+        return {"error": f"order_type은 'MARKET' 또는 'LIMIT' 이어야 합니다. 입력: '{order_type}'"}
+
+    if not isinstance(qty, int) or qty < 1:
+        return {"error": f"qty는 1 이상 정수여야 합니다. 입력: {qty}"}
+
+    if order_type == "LIMIT" and (not isinstance(price, int) or price <= 0):
+        return {"error": f"LIMIT 주문에는 price(양수 정수)가 필요합니다. 입력: {price}"}
+
+    # ── 환경변수 로드 ───────────────────────────────────────────
+    app_key    = os.getenv("KIS_APP_KEY",    "").strip()
+    app_secret = os.getenv("KIS_APP_SECRET", "").strip()
+    account_no = os.getenv("KIS_ACCOUNT_NO", "").strip().replace("-", "")
+
+    if not account_no:
+        return {"error": "KIS_ACCOUNT_NO 환경변수가 설정되지 않았습니다."}
+    if len(account_no) != 10:
+        return {"error": f"KIS_ACCOUNT_NO 형식 오류 (10자리 필요): '{account_no}'"}
+
+    cano         = account_no[:8]
+    acnt_prdt_cd = account_no[8:]
+    account_fmt  = f"{cano}-{acnt_prdt_cd}"
+
+    # ── 안전장치 1: 계좌 확인 ──────────────────────────────────
+    allowed_no = _KIS_MOCK_ACCOUNT.replace("-", "")
+    if account_no != allowed_no:
+        return {
+            "error": (
+                f"계좌 불일치 — 허용 모의계좌: {_KIS_MOCK_ACCOUNT}, "
+                f"현재 설정: {account_fmt}. "
+                "실전 계좌 또는 다른 모의 계좌에는 주문할 수 없습니다."
+            )
+        }
+
+    # ── 안전장치 2: 주문 금액 상한 ─────────────────────────────
+    if order_type == "LIMIT":
+        estimated_amount = price * qty
+        price_source     = f"지정가({price:,}원)"
+    else:
+        quote = get_quote(ticker)
+        if "error" in quote:
+            return {"error": f"시장가 금액 확인을 위한 현재가 조회 실패: {quote['error']}"}
+        current_price = quote.get("close")
+        if current_price is None:
+            return {"error": "현재가 조회 결과에 종가(close)가 없습니다."}
+        estimated_amount = int(current_price) * qty
+        price_source     = f"현재가 근사({int(current_price):,}원)"
+
+    if estimated_amount > _KIS_ORDER_LIMIT_KRW:
+        return {
+            "error": (
+                f"주문 금액 상한 초과 — 상한: {_KIS_ORDER_LIMIT_KRW:,}원, "
+                f"예상 주문금액: {estimated_amount:,}원 "
+                f"({price_source} × {qty}주). "
+                "수량을 줄이거나 낮은 가격 종목을 선택해 주세요."
+            )
+        }
+
+    # ── 주문 파라미터 구성 ─────────────────────────────────────
+    # KIS API 주문구분 코드: 00=지정가, 01=시장가
+    ord_dvsn = "01" if order_type == "MARKET" else "00"
+    tr_id    = _KIS_MOCK_TR_BUY if side == "BUY" else _KIS_MOCK_TR_SELL
+
+    api_body = {
+        "CANO":         cano,
+        "ACNT_PRDT_CD": acnt_prdt_cd,
+        "PDNO":         ticker,
+        "ORD_DVSN":     ord_dvsn,
+        "ORD_QTY":      str(qty),
+        "ORD_UNPR":     str(price) if order_type == "LIMIT" else "0",
+    }
+
+    order_summary = {
+        "account":               account_fmt,
+        "ticker":                ticker,
+        "side":                  side,
+        "order_type":            order_type,
+        "qty":                   qty,
+        "price":                 price if order_type == "LIMIT" else None,
+        "tr_id":                 tr_id,
+        "estimated_amount_krw":  estimated_amount,
+        "price_source":          price_source,
+    }
+
+    safety_info = {
+        "account_ok":    True,
+        "amount_ok":     True,
+        "limit_krw":     _KIS_ORDER_LIMIT_KRW,
+        "estimated_krw": estimated_amount,
+        "mock_account":  _KIS_MOCK_ACCOUNT,
+    }
+
+    # ── dry_run 모드: 주문서만 반환 ───────────────────────────
+    if dry_run:
+        return {
+            "dry_run":  True,
+            "order":    order_summary,
+            "api_body": api_body,
+            "safety":   safety_info,
+            "message":  (
+                "[DRY RUN] 실제 주문이 전송되지 않았습니다. "
+                "order/api_body 내용을 확인한 뒤 dry_run=False로 재호출하면 실제 주문이 전송됩니다."
+            ),
+        }
+
+    # ── 실제 주문 API 호출 (dry_run=False) ────────────────────
+    tok = get_kis_token()
+    if "error" in tok:
+        return {"error": f"토큰 획득 실패: {tok['error']}"}
+
+    headers = {
+        "content-type":  "application/json; charset=utf-8",
+        "authorization": f"Bearer {tok['access_token']}",
+        "appkey":        app_key,
+        "appsecret":     app_secret,
+        "tr_id":         tr_id,
+        "custtype":      "P",
+    }
+
+    url = f"{_KIS_DOMAIN}/uapi/domestic-stock/v1/trading/order-cash"
+
+    try:
+        resp = requests.post(url, json=api_body, headers=headers, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.HTTPError as exc:
+        body_text = exc.response.text if exc.response is not None else ""
+        return {"error": f"KIS 주문 HTTP 오류: {exc} — {body_text}"}
+    except Exception as exc:
+        return {"error": f"KIS 주문 요청 실패: {exc}"}
+
+    if data.get("rt_cd") != "0":
+        msg = data.get("msg1") or data.get("msg") or str(data)
+        return {"error": f"KIS 주문 API 오류: {msg}", "raw": data}
+
+    output = data.get("output", {})
+    return {
+        "dry_run": False,
+        "order":   order_summary,
+        "result": {
+            "order_no":   output.get("ODNO", ""),
+            "order_time": output.get("ORD_TMD", ""),
+            "rt_cd":      data.get("rt_cd"),
+            "msg":        data.get("msg1", ""),
+        },
+    }
+
+
+# ═══════════════════════════════════════════════
+# 0-C. get_benchmark_comparison
 # ═══════════════════════════════════════════════
 
 def get_benchmark_comparison(period_days: int = 30) -> dict:
@@ -2006,6 +2221,24 @@ if __name__ == "__main__":
         print(f"  {label}")
         print(f"{'='*55}")
         print(json.dumps(data, ensure_ascii=False, indent=2, default=str))
+
+    print("\n▶ [0-B] place_kis_order — dry_run 테스트")
+
+    # 정상 케이스: 삼성전자 시장가 매수 1주 (dry_run)
+    _pp("place_kis_order('005930', 'BUY', 1, 'MARKET', dry_run=True)",
+        place_kis_order("005930", "BUY", 1, "MARKET", dry_run=True))
+
+    # 정상 케이스: 지정가 매수 1주 (dry_run)
+    _pp("place_kis_order('005930', 'BUY', 1, 'LIMIT', price=60000, dry_run=True)",
+        place_kis_order("005930", "BUY", 1, "LIMIT", price=60000, dry_run=True))
+
+    # 안전장치 테스트: 금액 상한 초과 (60,000원 × 20주 = 120만원)
+    _pp("안전장치: 금액 상한 초과 — LIMIT 60000 × 20주",
+        place_kis_order("005930", "BUY", 20, "LIMIT", price=60000, dry_run=True))
+
+    # 안전장치 테스트: 해외 종목 입력 거부
+    _pp("안전장치: 해외 종목 거부 — AAPL",
+        place_kis_order("AAPL", "BUY", 1, "MARKET", dry_run=True))
 
     print("\n▶ [0] get_kis_token")
     tok = get_kis_token()
