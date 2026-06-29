@@ -2303,6 +2303,149 @@ def screen_stocks(
 
 
 # ═══════════════════════════════════════════════
+# 10. evaluate_sell_rules
+# ═══════════════════════════════════════════════
+
+def evaluate_sell_rules() -> dict:
+    """
+    보유 종목을 손절·익절 규칙에 비춰 "팔아야 할 후보"를 분류한다.
+
+    ⚠️ 실제 매도 주문을 내지 않는다. 판단/제안만 한다 (dry_run 성격).
+    ⚠️ 미래 예측 아님. 규칙상 분류이며 실제 매도 여부는 사람이 직접 결정한다.
+
+    임계값 상수 (함수 상단에서 수정 가능)
+    ----------------------------------------
+    STOP_LOSS_PCT   : 수익률 ≤ 이 값이면 손절 후보
+    TAKE_PROFIT_PCT : 수익률 ≥ 이 값이면 익절 후보
+
+    Returns
+    -------
+    dict
+        {
+            "as_of": str,
+            "rules": {
+                "stop_loss_pct":   float,   # 손절 임계값 (예: -10.0)
+                "take_profit_pct": float,   # 익절 임계값 (예:  20.0)
+            },
+            "stop_loss": [
+                {
+                    "ticker":          str,
+                    "name":            str,
+                    "profit_loss_pct": float,
+                    "reason":          str,
+                    "action":          str,
+                    "market":          str,   # "KR" | "US"
+                    "currency":        str,   # "KRW" | "USD"
+                }
+            ],
+            "take_profit": [...],   # 같은 구조, 수익률 높은 순 정렬
+            "hold": {
+                "count":    int,
+                "domestic": int,
+                "overseas": int,
+            },
+            "summary": {
+                "total_holdings":    int,
+                "stop_loss_count":   int,
+                "take_profit_count": int,
+                "hold_count":        int,
+            },
+            "disclaimer": str,
+        }
+        실패 시: {"error": "..."}
+    """
+    # ── 규칙 임계값 ─────────────────────────────────────────────
+    STOP_LOSS_PCT   = -10.0   # 수익률 <= 이 값 → 손절 후보
+    TAKE_PROFIT_PCT =  20.0   # 수익률 >= 이 값 → 익절 후보
+
+    # ── 1. 잔고 조회 ─────────────────────────────────────────────
+    balance = get_kis_balance()
+    if "error" in balance:
+        return {"error": f"잔고 조회 실패: {balance['error']}"}
+
+    holdings = balance.get("holdings", [])
+    if not holdings:
+        return {"error": "보유 종목이 없습니다."}
+
+    # ── 2. 규칙 분류 ─────────────────────────────────────────────
+    stop_loss:   list[dict] = []
+    take_profit: list[dict] = []
+    hold:        list[dict] = []
+
+    for h in holdings:
+        pct      = h.get("profit_loss_pct")
+        ticker   = h.get("ticker", "")
+        name     = h.get("name", ticker)
+        market   = h.get("market", "?")
+        currency = h.get("currency", "?")
+
+        if pct is None:
+            continue
+
+        entry = {
+            "ticker":          ticker,
+            "name":            name,
+            "profit_loss_pct": pct,
+            "market":          market,
+            "currency":        currency,
+        }
+
+        if pct <= STOP_LOSS_PCT:
+            entry["reason"] = (
+                f"손절 규칙: 수익률 {pct:+.2f}% ≤ {STOP_LOSS_PCT:+.1f}%"
+            )
+            entry["action"] = "손절 후보"
+            stop_loss.append(entry)
+        elif pct >= TAKE_PROFIT_PCT:
+            entry["reason"] = (
+                f"익절 규칙: 수익률 {pct:+.2f}% ≥ +{TAKE_PROFIT_PCT:.1f}%"
+            )
+            entry["action"] = "익절 후보"
+            take_profit.append(entry)
+        else:
+            entry["reason"] = (
+                f"보유 유지: 수익률 {pct:+.2f}%"
+                f" ({STOP_LOSS_PCT:+.1f}% ~ +{TAKE_PROFIT_PCT:.1f}% 범위)"
+            )
+            entry["action"] = "보유 유지"
+            hold.append(entry)
+
+    # ── 3. 정렬 (손절: 수익률 낮은 순, 익절: 수익률 높은 순) ──
+    stop_loss.sort(key=lambda x: x["profit_loss_pct"])
+    take_profit.sort(key=lambda x: x["profit_loss_pct"], reverse=True)
+
+    # ── 4. 보유 유지 국내/해외 집계 ─────────────────────────────
+    hold_kr = sum(1 for h in hold if h["market"] == "KR")
+    hold_us = sum(1 for h in hold if h["market"] == "US")
+
+    return {
+        "as_of": datetime.now().isoformat(timespec="seconds"),
+        "rules": {
+            "stop_loss_pct":   STOP_LOSS_PCT,
+            "take_profit_pct": TAKE_PROFIT_PCT,
+        },
+        "stop_loss":   stop_loss,
+        "take_profit": take_profit,
+        "hold": {
+            "count":    len(hold),
+            "domestic": hold_kr,
+            "overseas": hold_us,
+        },
+        "summary": {
+            "total_holdings":    len(holdings),
+            "stop_loss_count":   len(stop_loss),
+            "take_profit_count": len(take_profit),
+            "hold_count":        len(hold),
+        },
+        "disclaimer": (
+            "이 분류는 규칙 기반 참고 정보이며 투자 권유가 아닙니다. "
+            "실제 매도 여부는 본인이 판단·결정하세요. "
+            "미래 가격을 예측하지 않습니다."
+        ),
+    }
+
+
+# ═══════════════════════════════════════════════
 # 직접 실행 테스트
 # ═══════════════════════════════════════════════
 
@@ -2314,6 +2457,9 @@ if __name__ == "__main__":
         print(f"  {label}")
         print(f"{'='*55}")
         print(json.dumps(data, ensure_ascii=False, indent=2, default=str))
+
+    print("\n▶ [10] evaluate_sell_rules — 매도 규칙 분류")
+    _pp("evaluate_sell_rules()", evaluate_sell_rules())
 
     print("\n▶ [0-B] place_kis_order — dry_run 테스트")
 
