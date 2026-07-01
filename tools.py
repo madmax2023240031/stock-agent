@@ -2446,6 +2446,295 @@ def evaluate_sell_rules() -> dict:
 
 
 # ═══════════════════════════════════════════════
+# 11. evaluate_buy_rule_A  (점수 집중 방식)
+# ═══════════════════════════════════════════════
+
+def evaluate_buy_rule_A(market: str = "ALL", universe_limit: int | None = None) -> dict:
+    """
+    [매수 규칙 A — 점수 집중] 스크리닝 점수 상위 종목을 매수 후보로 제안한다.
+
+    ⚠️ 실제 매수 주문을 내지 않는다. 판단/제안만 한다 (dry_run 성격).
+    ⚠️ 미래 예측 아님. "지금 점수가 높다"는 사실만 기술한다.
+
+    임계값 상수 (함수 상단에서 수정 가능)
+    ----------------------------------------
+    BUY_SCORE_MIN  : 이 값 이상인 종목만 후보에 포함 (0~100)
+    MAX_CANDIDATES : 반환할 최대 후보 수
+
+    Parameters
+    ----------
+    market         : 'KR' / 'US' / 'ALL'
+    universe_limit : 유니버스에서 평가할 최대 종목 수 (None=전체, 속도 조절용)
+
+    Returns
+    -------
+    dict
+        {
+            "rule"        : "A — 점수 집중",
+            "as_of"       : str,
+            "params"      : dict,
+            "held_tickers": list,
+            "candidates"  : [
+                {
+                    "ticker"     : str,
+                    "name"       : str,
+                    "score"      : float,   # total_score (0~100)
+                    "sector"     : str,
+                    "market"     : str,     # "KR" | "US"
+                    "reason"     : "점수 상위",
+                    "key_metrics": dict,
+                }
+            ],
+            "count"     : int,
+            "disclaimer": str,
+        }
+        실패 시: {"error": "..."}
+    """
+    # ── 규칙 임계값 ─────────────────────────────────────────────
+    BUY_SCORE_MIN  = 80    # 점수 이 값 미만이면 후보 제외
+    MAX_CANDIDATES = 5     # 최대 반환 후보 수
+
+    # ── 1. 잔고 조회 (보유 종목 제외용) ─────────────────────────
+    balance = get_kis_balance()
+    if "error" in balance:
+        return {"error": f"잔고 조회 실패: {balance['error']}"}
+
+    held_tickers = {h["ticker"] for h in balance.get("holdings", [])}
+
+    # ── 2. 스크리닝 실행 ─────────────────────────────────────────
+    screened = screen_stocks(
+        market=market,
+        top_n=50,
+        universe_limit=universe_limit,
+        max_per_sector=None,   # 섹터 제한 없이 점수 순으로만
+    )
+    if "error" in screened:
+        return {"error": f"스크리닝 실패: {screened['error']}"}
+
+    # ── 3. 필터: 점수 기준 + 미보유 ─────────────────────────────
+    candidates: list[dict] = []
+    for item in screened.get("results", []):
+        if item["total_score"] < BUY_SCORE_MIN:
+            break   # results는 점수 내림차순 — 이후는 모두 기준 미달
+        if item["ticker"] in held_tickers:
+            continue
+        candidates.append({
+            "ticker":      item["ticker"],
+            "name":        item["name"],
+            "score":       item["total_score"],
+            "sector":      item["sector"],
+            "market":      "KR" if _is_korean(item["ticker"]) else "US",
+            "reason":      "점수 상위",
+            "key_metrics": item["key_metrics"],
+        })
+        if len(candidates) >= MAX_CANDIDATES:
+            break
+
+    return {
+        "rule":  "A — 점수 집중",
+        "as_of": datetime.now().isoformat(timespec="seconds"),
+        "params": {
+            "buy_score_min":  BUY_SCORE_MIN,
+            "max_candidates": MAX_CANDIDATES,
+            "market":         market,
+            "universe_limit": universe_limit,
+        },
+        "held_tickers": sorted(held_tickers),
+        "candidates":   candidates,
+        "count":        len(candidates),
+        "disclaimer": (
+            "이 목록은 규칙 기반 참고 정보이며 투자 권유가 아닙니다. "
+            "실제 매수 여부는 본인이 판단·결정하세요. 미래 가격을 예측하지 않습니다."
+        ),
+    }
+
+
+# ═══════════════════════════════════════════════
+# 12. evaluate_buy_rule_B  (분산 채우기 방식)
+# ═══════════════════════════════════════════════
+
+def evaluate_buy_rule_B(market: str = "ALL", universe_limit: int | None = None) -> dict:
+    """
+    [매수 규칙 B — 분산 채우기] 포트폴리오에서 비중이 낮은 섹터를
+    스크리닝 점수 상위 종목으로 보강할 후보를 제안한다.
+
+    ⚠️ 실제 매수 주문을 내지 않는다. 판단/제안만 한다 (dry_run 성격).
+    ⚠️ 미래 예측 아님. "현재 섹터 비중이 낮다"는 사실만 기술한다.
+
+    섹터 비중은 yfinance 기준으로 계산한다 (screen_stocks와 동일 출처 → 섹터명 일치).
+    "부족 섹터" 정의: 스크리닝 유니버스에 등장하는 섹터 중 내 포트폴리오 비중이
+    SECTOR_UNDERWEIGHT_PCT 미만인 섹터.
+
+    임계값 상수 (함수 상단에서 수정 가능)
+    ----------------------------------------
+    BUY_SCORE_MIN          : 점수 기준 (0~100)
+    MAX_CANDIDATES         : 반환할 최대 후보 수
+    SECTOR_UNDERWEIGHT_PCT : 이 값 미만인 섹터를 "부족 섹터"로 분류
+
+    Parameters
+    ----------
+    market         : 'KR' / 'US' / 'ALL'
+    universe_limit : 유니버스에서 평가할 최대 종목 수 (None=전체, 속도 조절용)
+
+    Returns
+    -------
+    dict
+        {
+            "rule"             : "B — 분산 채우기",
+            "as_of"            : str,
+            "params"           : dict,
+            "portfolio_sectors": {섹터명: weight_pct},   # 현재 내 섹터 비중 (%)
+            "deficit_sectors"  : [str],                  # 부족 섹터 목록
+            "held_tickers"     : list,
+            "candidates"       : [
+                {
+                    "ticker"     : str,
+                    "name"       : str,
+                    "score"      : float,
+                    "sector"     : str,
+                    "market"     : str,
+                    "reason"     : "부족섹터 OO 보강",
+                    "key_metrics": dict,
+                }
+            ],
+            "count"    : int,
+            "disclaimer": str,
+        }
+        실패 시: {"error": "..."}
+    """
+    import yfinance as yf
+
+    # ── 규칙 임계값 ─────────────────────────────────────────────
+    BUY_SCORE_MIN          = 80    # 점수 이 값 미만이면 후보 제외
+    MAX_CANDIDATES         = 5     # 최대 반환 후보 수
+    SECTOR_UNDERWEIGHT_PCT = 10.0  # 이 값 미만인 섹터 → 부족 섹터
+
+    # ── 1. 잔고 조회 ─────────────────────────────────────────────
+    balance = get_kis_balance()
+    if "error" in balance:
+        return {"error": f"잔고 조회 실패: {balance['error']}"}
+
+    holdings = balance.get("holdings", [])
+    if not holdings:
+        return {"error": "보유 종목이 없어 섹터 분산 분석을 수행할 수 없습니다."}
+
+    held_tickers = {h["ticker"] for h in holdings}
+
+    # ── 2. 포트폴리오 섹터 비중 (yfinance 기준 — screen_stocks와 동일 출처) ──
+    # USD 종목은 KRW로 환산해 비중을 통일
+    usd_krw = balance.get("fx", {}).get("usd_krw") or 1.0
+    sector_eval: dict[str, float] = {}
+
+    for h in holdings:
+        ev = h.get("eval_amount", 0) or 0
+        if h.get("currency") == "USD":
+            ev = ev * usd_krw
+        t = h["ticker"]
+        try:
+            info = yf.Ticker(_yf_ticker(t)).info
+            sec  = info.get("sector") or info.get("industry") or "기타/미분류"
+        except Exception:
+            sec = "기타/미분류"
+        sector_eval[sec] = sector_eval.get(sec, 0) + ev
+
+    total_ev = sum(sector_eval.values())
+    if total_ev <= 0:
+        return {"error": "포트폴리오 평가금액 합산이 0 이하입니다. 잔고를 확인하세요."}
+
+    portfolio_sector_pct = {
+        sec: round(ev / total_ev * 100, 1)
+        for sec, ev in sorted(sector_eval.items(), key=lambda x: -x[1])
+    }
+
+    # ── 3. 스크리닝 실행 ─────────────────────────────────────────
+    screened = screen_stocks(
+        market=market,
+        top_n=100,
+        universe_limit=universe_limit,
+        max_per_sector=None,
+    )
+    if "error" in screened:
+        return {"error": f"스크리닝 실패: {screened['error']}"}
+
+    # 유니버스에 등장하는 섹터 목록
+    universe_sectors = {item["sector"] for item in screened.get("results", [])}
+
+    # ── 4. 부족 섹터: 유니버스 섹터 중 내 비중 < SECTOR_UNDERWEIGHT_PCT ──
+    deficit_sectors: set[str] = {
+        sec for sec in universe_sectors
+        if portfolio_sector_pct.get(sec, 0.0) < SECTOR_UNDERWEIGHT_PCT
+    }
+
+    if not deficit_sectors:
+        return {
+            "rule":  "B — 분산 채우기",
+            "as_of": datetime.now().isoformat(timespec="seconds"),
+            "params": {
+                "buy_score_min":          BUY_SCORE_MIN,
+                "max_candidates":         MAX_CANDIDATES,
+                "sector_underweight_pct": SECTOR_UNDERWEIGHT_PCT,
+                "market":                 market,
+                "universe_limit":         universe_limit,
+            },
+            "portfolio_sectors": portfolio_sector_pct,
+            "deficit_sectors":   [],
+            "held_tickers":      sorted(held_tickers),
+            "candidates":        [],
+            "count":             0,
+            "message": (
+                f"유니버스 내 모든 섹터의 포트폴리오 비중이 "
+                f"{SECTOR_UNDERWEIGHT_PCT}% 이상입니다. 현재 분산 상태가 양호합니다."
+            ),
+            "disclaimer": (
+                "이 분석은 참고 정보이며 투자 권유가 아닙니다. "
+                "실제 매수 여부는 본인이 판단·결정하세요."
+            ),
+        }
+
+    # ── 5. 후보 필터: 부족 섹터 + 점수 기준 + 미보유 ─────────────
+    candidates: list[dict] = []
+    for item in screened.get("results", []):
+        if item["total_score"] < BUY_SCORE_MIN:
+            break   # 점수 내림차순 — 이후는 모두 기준 미달
+        if item["ticker"] in held_tickers:
+            continue
+        if item["sector"] not in deficit_sectors:
+            continue
+        candidates.append({
+            "ticker":      item["ticker"],
+            "name":        item["name"],
+            "score":       item["total_score"],
+            "sector":      item["sector"],
+            "market":      "KR" if _is_korean(item["ticker"]) else "US",
+            "reason":      f"부족섹터 {item['sector']} 보강",
+            "key_metrics": item["key_metrics"],
+        })
+        if len(candidates) >= MAX_CANDIDATES:
+            break
+
+    return {
+        "rule":  "B — 분산 채우기",
+        "as_of": datetime.now().isoformat(timespec="seconds"),
+        "params": {
+            "buy_score_min":          BUY_SCORE_MIN,
+            "max_candidates":         MAX_CANDIDATES,
+            "sector_underweight_pct": SECTOR_UNDERWEIGHT_PCT,
+            "market":                 market,
+            "universe_limit":         universe_limit,
+        },
+        "portfolio_sectors": portfolio_sector_pct,
+        "deficit_sectors":   sorted(deficit_sectors),
+        "held_tickers":      sorted(held_tickers),
+        "candidates":        candidates,
+        "count":             len(candidates),
+        "disclaimer": (
+            "이 목록은 규칙 기반 참고 정보이며 투자 권유가 아닙니다. "
+            "실제 매수 여부는 본인이 판단·결정하세요. 미래 가격을 예측하지 않습니다."
+        ),
+    }
+
+
+# ═══════════════════════════════════════════════
 # 직접 실행 테스트
 # ═══════════════════════════════════════════════
 
@@ -2457,6 +2746,56 @@ if __name__ == "__main__":
         print(f"  {label}")
         print(f"{'='*55}")
         print(json.dumps(data, ensure_ascii=False, indent=2, default=str))
+
+    # ── 매수 규칙 A vs B 비교 ──────────────────────────────────
+    # universe_limit=50: 속도 우선 (KR 시총 상위 50개 근사)
+    # 전체 유니버스를 쓰려면 universe_limit=None (느림)
+    ULIMIT = 50
+
+    print("\n" + "=" * 55)
+    print("  📊 매수 규칙 비교: Rule A vs Rule B")
+    print(f"  (universe_limit={ULIMIT}, market='ALL')")
+    print("=" * 55)
+
+    print("\n▶ [11] evaluate_buy_rule_A — 점수 집중 방식")
+    result_a = evaluate_buy_rule_A(market="ALL", universe_limit=ULIMIT)
+    _pp("evaluate_buy_rule_A()", result_a)
+
+    print("\n▶ [12] evaluate_buy_rule_B — 분산 채우기 방식")
+    result_b = evaluate_buy_rule_B(market="ALL", universe_limit=ULIMIT)
+    _pp("evaluate_buy_rule_B()", result_b)
+
+    # ── 나란히 요약 출력 ──────────────────────────────────────
+    print("\n" + "=" * 55)
+    print("  🔍 Rule A vs B 비교 요약")
+    print("=" * 55)
+
+    def _fmt_candidates(result: dict) -> list[str]:
+        lines = []
+        for c in result.get("candidates", []):
+            lines.append(
+                f"  {c['market']} | {c['name']} ({c['ticker']}) "
+                f"| 점수 {c['score']} | {c['sector']} | {c['reason']}"
+            )
+        return lines or ["  (후보 없음)"]
+
+    print(f"\n[Rule A — 점수 집중]  후보 {result_a.get('count', 0)}개")
+    for line in _fmt_candidates(result_a):
+        print(line)
+
+    print(f"\n[Rule B — 분산 채우기]  후보 {result_b.get('count', 0)}개")
+    if "portfolio_sectors" in result_b:
+        print("  현재 포트폴리오 섹터 비중:")
+        for sec, pct in result_b.get("portfolio_sectors", {}).items():
+            marker = " ◀ 부족" if sec in result_b.get("deficit_sectors", []) else ""
+            print(f"    {sec}: {pct}%{marker}")
+        print(f"  부족 섹터: {result_b.get('deficit_sectors', [])}")
+    for line in _fmt_candidates(result_b):
+        print(line)
+
+    print("\n" + "=" * 55)
+    print("  ⚠️  위 목록은 참고용이며 투자 권유가 아닙니다.")
+    print("=" * 55)
 
     print("\n▶ [10] evaluate_sell_rules — 매도 규칙 분류")
     _pp("evaluate_sell_rules()", evaluate_sell_rules())
