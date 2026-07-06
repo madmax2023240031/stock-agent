@@ -30,3 +30,6 @@ build/
 # KIS API 캐시 (토큰 포함 — 절대 커밋하지 않음)
 .dart_corp_codes.json
 .kis_token_cache.json
+
+# 거래 로그 (개인 거래기록 — 절대 커밋하지 않음)
+trade_log.json

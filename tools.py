@@ -28,6 +28,10 @@ _CACHE_TTL = 600        # 초
 _PEER_RETRIES = 2       # 피어 조회 실패 시 최대 재시도 횟수
 _PEER_MIN_COUNT = 2     # 이 수 미만이면 "판별 제한"으로 표시
 
+# ── 거래 로그 ─────────────────────────────────────────────────
+TRADE_LOG_PATH = "trade_log.json"
+_VALID_RULE_TAGS = {"A", "B", "MANUAL"}
+
 
 # ═══════════════════════════════════════════════
 # 내부 헬퍼
@@ -2927,17 +2931,240 @@ def check_guardrails(
 
 
 # ═══════════════════════════════════════════════
+# 14. log_trade / get_trade_log / summarize_trades_by_rule
+# ═══════════════════════════════════════════════
+
+def log_trade(
+    rule_tag: str,
+    ticker: str,
+    side: str,
+    qty: int,
+    price: float,
+    reason: str,
+) -> dict:
+    """
+    거래 1건을 TRADE_LOG_PATH(trade_log.json)에 기록한다.
+
+    Parameters
+    ----------
+    rule_tag : str   "A" | "B" | "MANUAL"
+    ticker   : str   종목코드 (한국 6자리 / 미국 티커)
+    side     : str   "BUY" | "SELL"
+    qty      : int   수량 (1 이상)
+    price    : float 체결 단가
+    reason   : str   기록 사유 (자유 텍스트)
+
+    Returns
+    -------
+    dict  {"logged": True, "entry": {...}}
+          실패 시: {"error": "..."}
+    """
+    import json
+
+    rule_tag = rule_tag.upper().strip()
+    if rule_tag not in _VALID_RULE_TAGS:
+        return {
+            "error": (
+                f"잘못된 rule_tag: '{rule_tag}'. "
+                f"허용값: {sorted(_VALID_RULE_TAGS)}"
+            )
+        }
+
+    side = side.upper().strip()
+    if side not in ("BUY", "SELL"):
+        return {"error": f"side는 'BUY' 또는 'SELL' 이어야 합니다. 입력: '{side}'"}
+
+    if not isinstance(qty, int) or qty < 1:
+        return {"error": f"qty는 1 이상 정수여야 합니다. 입력: {qty}"}
+
+    entry = {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "rule_tag":  rule_tag,
+        "ticker":    ticker.strip(),
+        "side":      side,
+        "qty":       qty,
+        "price":     price,
+        "reason":    reason,
+    }
+
+    try:
+        try:
+            with open(TRADE_LOG_PATH, "r", encoding="utf-8") as f:
+                records = json.load(f)
+            if not isinstance(records, list):
+                records = []
+        except (FileNotFoundError, json.JSONDecodeError):
+            records = []
+
+        records.append(entry)
+
+        with open(TRADE_LOG_PATH, "w", encoding="utf-8") as f:
+            json.dump(records, f, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        return {"error": f"로그 파일 쓰기 실패: {exc}"}
+
+    return {"logged": True, "entry": entry}
+
+
+def get_trade_log(rule_tag: str | None = None) -> dict:
+    """
+    거래 로그를 반환한다.
+
+    Parameters
+    ----------
+    rule_tag : str | None
+        None이면 전체, 지정하면 해당 규칙 것만 필터링.
+        허용값: "A" | "B" | "MANUAL"
+
+    Returns
+    -------
+    dict  {"rule_tag": str | None, "count": int, "trades": [...]}
+          실패 시: {"error": "..."}
+    """
+    import json
+
+    if rule_tag is not None:
+        rule_tag = rule_tag.upper().strip()
+        if rule_tag not in _VALID_RULE_TAGS:
+            return {
+                "error": (
+                    f"잘못된 rule_tag: '{rule_tag}'. "
+                    f"허용값: {sorted(_VALID_RULE_TAGS)}"
+                )
+            }
+
+    try:
+        with open(TRADE_LOG_PATH, "r", encoding="utf-8") as f:
+            records = json.load(f)
+        if not isinstance(records, list):
+            records = []
+    except FileNotFoundError:
+        records = []
+    except json.JSONDecodeError as exc:
+        return {"error": f"로그 파일 파싱 실패: {exc}"}
+    except Exception as exc:
+        return {"error": f"로그 파일 읽기 실패: {exc}"}
+
+    if rule_tag is not None:
+        records = [r for r in records if r.get("rule_tag") == rule_tag]
+
+    return {
+        "rule_tag": rule_tag,
+        "count":    len(records),
+        "trades":   records,
+    }
+
+
+def summarize_trades_by_rule() -> dict:
+    """
+    거래 로그를 규칙별(A / B / MANUAL)로 묶어 요약한다.
+
+    Returns
+    -------
+    dict
+        {
+            "total_trades": int,
+            "by_rule": {
+                "<rule_tag>": {
+                    "trades":      int,
+                    "buy_count":   int,
+                    "sell_count":  int,
+                    "tickers":     list[str],   # 중복 제거, 정렬
+                }
+            }
+        }
+        실패 시: {"error": "..."}
+    """
+    log = get_trade_log()
+    if "error" in log:
+        return log
+
+    summary: dict[str, dict] = {
+        tag: {"trades": 0, "buy_count": 0, "sell_count": 0, "tickers": set()}
+        for tag in _VALID_RULE_TAGS
+    }
+
+    for trade in log["trades"]:
+        tag  = trade.get("rule_tag", "")
+        side = trade.get("side", "")
+        if tag not in summary:
+            continue
+        summary[tag]["trades"] += 1
+        if side == "BUY":
+            summary[tag]["buy_count"]  += 1
+        elif side == "SELL":
+            summary[tag]["sell_count"] += 1
+        summary[tag]["tickers"].add(trade.get("ticker", ""))
+
+    # set → 정렬 리스트
+    by_rule = {
+        tag: {
+            "trades":     v["trades"],
+            "buy_count":  v["buy_count"],
+            "sell_count": v["sell_count"],
+            "tickers":    sorted(v["tickers"]),
+        }
+        for tag, v in summary.items()
+    }
+
+    return {
+        "total_trades": log["count"],
+        "by_rule":      by_rule,
+    }
+
+
+# ═══════════════════════════════════════════════
 # 직접 실행 테스트
 # ═══════════════════════════════════════════════
 
 if __name__ == "__main__":
     import json
+    import os
 
     def _pp(label: str, data: dict):
         print(f"\n{'='*55}")
         print(f"  {label}")
         print(f"{'='*55}")
         print(json.dumps(data, ensure_ascii=False, indent=2, default=str))
+
+    # ── 거래 로그 테스트 ─────────────────────────────────────────
+    print("\n" + "="*55)
+    print("  📒 거래 로그 테스트 (log_trade / get_trade_log / summarize)")
+    print("="*55)
+
+    # 깨끗한 상태에서 시작 (이전 테스트 로그 삭제)
+    if os.path.exists(TRADE_LOG_PATH):
+        os.remove(TRADE_LOG_PATH)
+        print(f"\n[초기화] 기존 {TRADE_LOG_PATH} 삭제")
+
+    # 1) 로그 기록 4건
+    _pp("log_trade A/매수 — 삼성전자",
+        log_trade("A", "005930", "BUY", 5, 75000, "Rule A: RSI 저점, 점수 8/10"))
+    _pp("log_trade A/매수 — AAPL",
+        log_trade("A", "AAPL",   "BUY", 2, 210.5, "Rule A: MACD 골든크로스"))
+    _pp("log_trade B/매수 — SK하이닉스",
+        log_trade("B", "000660", "BUY", 3, 180000, "Rule B: 반도체 섹터 비중 부족"))
+    _pp("log_trade MANUAL/매수 — MSFT",
+        log_trade("MANUAL", "MSFT", "BUY", 1, 440.0, "추천 직원 제안 — AI 섹터 보강"))
+
+    # 2) 전체 조회
+    _pp("get_trade_log() — 전체 (4건 기대)", get_trade_log())
+
+    # 3) Rule A만 필터링
+    _pp("get_trade_log('A') — Rule A만 (2건 기대)", get_trade_log("A"))
+
+    # 4) 규칙별 요약
+    _pp("summarize_trades_by_rule()", summarize_trades_by_rule())
+
+    # 5) 잘못된 rule_tag → 에러 확인
+    _pp("log_trade 잘못된 rule_tag 'C' → 에러 기대",
+        log_trade("C", "005930", "BUY", 1, 75000, "테스트"))
+    _pp("get_trade_log 잘못된 rule_tag 'X' → 에러 기대",
+        get_trade_log("X"))
+
+    print("\n" + "="*55)
+    print("  ✅ 거래 로그 테스트 완료")
+    print("="*55)
 
     # ── 가드레일 검사 테스트 ──────────────────────────────────────
     print("\n" + "="*55)
