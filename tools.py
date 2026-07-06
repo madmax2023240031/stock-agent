@@ -2735,6 +2735,198 @@ def evaluate_buy_rule_B(market: str = "ALL", universe_limit: int | None = None) 
 
 
 # ═══════════════════════════════════════════════
+# 13. check_guardrails  (자동매매 가드레일 검사)
+# ═══════════════════════════════════════════════
+
+def check_guardrails(
+    ticker: str,
+    order_amount_krw: int,
+    *,
+    market: str | None = None,
+    sector: str | None = None,
+    accumulated_krw: int = 0,
+    ticker_accumulated_krw: int = 0,
+    sector_accumulated_krw: int = 0,
+    daily_trades: int = 0,
+    daily_pnl_pct: float = 0.0,
+    cumulative_pnl_pct: float = 0.0,
+    now: datetime | None = None,
+) -> dict:
+    """
+    자동매매 주문 전 가드레일(안전장치)을 순서대로 검사한다.
+    실제 주문은 내지 않는다. "통과/차단 + 사유"만 반환한다.
+
+    Parameters
+    ----------
+    ticker                 : str   종목코드 (한국 6자리 / 미국 티커)
+    order_amount_krw       : int   이번 주문 금액 (원화 기준)
+    market                 : str   "KR" | "US" | None — None이면 ticker에서 자동 감지
+    sector                 : str   섹터명. 없으면 섹터 비중 검사를 건너뜀.
+    accumulated_krw        : int   오늘 자동매매 누적 금액 (이번 주문 제외, 원화)
+    ticker_accumulated_krw : int   이 종목의 오늘 누적 자동매매 금액 (이번 주문 제외)
+    sector_accumulated_krw : int   이 섹터의 오늘 누적 자동매매 금액 (이번 주문 제외)
+    daily_trades           : int   오늘 거래 횟수 (이번 주문 제외)
+    daily_pnl_pct          : float 오늘 자동매매 손익률 (%)
+    cumulative_pnl_pct     : float 누적 손익률 (%)
+    now                    : datetime  테스트용 시각 주입. None이면 실제 현재 시각 사용.
+
+    검사 순서 (하나라도 차단되면 즉시 반환)
+    ----------------------------------------
+    1. 거래시간   : KR 09:00~12:00 / US 22:30~01:30 (KST)
+    2. 자동매매한도: 누적 + 이번 ≤ 3,000만 원
+    3. 1종목비중  : 이 종목 누적 + 이번 ≤ 한도의 20% (600만 원)
+    4. 1섹터비중  : 이 섹터 누적 + 이번 ≤ 한도의 40% (1,200만 원)
+    5. 하루거래횟수: 오늘 거래 횟수 + 1 ≤ 5회
+    6. kill switch: 일일 손익 ≤ -5% 또는 누적 손익 ≤ -15%
+
+    Returns
+    -------
+    dict
+        {
+            "passed"     : bool,         # True = 모든 검사 통과
+            "blocked_by" : str | None,   # 차단된 검사 이름 (통과 시 None)
+            "reason"     : str | None,   # 차단 사유 (통과 시 None)
+            "checks"     : [             # 검사별 상세
+                {"name": str, "passed": bool, "detail": str}
+            ],
+        }
+        실패 시: {"error": "..."}
+    """
+    from datetime import time as _time
+
+    # ── 임계값 상수 ────────────────────────────────────────────────
+    LIMIT_KRW           = 30_000_000   # 자동매매 규칙별 총 한도 (3,000만 원)
+    TICKER_WEIGHT_PCT   = 20           # 1종목 최대 비중 (%)
+    SECTOR_WEIGHT_PCT   = 40           # 1섹터 최대 비중 (%)
+    MAX_DAILY_TRADES    = 5            # 하루 최대 거래 횟수
+    KILL_DAILY_PCT      = -5.0         # 일일 kill switch 손익률 (%)
+    KILL_CUMULATIVE_PCT = -15.0        # 누적 kill switch 손익률 (%)
+
+    # 거래 허용 시간 (한국시간 기준, 장 초반 3시간)
+    KR_OPEN  = _time(9,  0)    # 한국장 시작
+    KR_CLOSE = _time(12, 0)    # 한국장 검사 종료
+    US_OPEN  = _time(22, 30)   # 미국장 시작 (KST)
+    US_CLOSE = _time(1,  30)   # 미국장 종료 (KST, 다음날 새벽)
+
+    # ── 파생 상수 ──────────────────────────────────────────────────
+    TICKER_LIMIT_KRW = LIMIT_KRW * TICKER_WEIGHT_PCT // 100   # 6,000,000
+    SECTOR_LIMIT_KRW = LIMIT_KRW * SECTOR_WEIGHT_PCT // 100   # 12,000,000
+
+    # ── 입력 검증 ─────────────────────────────────────────────────
+    ticker = ticker.strip()
+    if not ticker:
+        return {"error": "ticker가 비어 있습니다."}
+    if not isinstance(order_amount_krw, (int, float)) or order_amount_krw <= 0:
+        return {"error": f"order_amount_krw는 양수여야 합니다. 입력: {order_amount_krw}"}
+
+    if market is None:
+        market = "KR" if _is_korean(ticker) else "US"
+    market = market.upper().strip()
+    if market not in ("KR", "US"):
+        return {"error": f"market은 'KR' 또는 'US' 이어야 합니다. 입력: '{market}'"}
+
+    # ── 현재 시각 ─────────────────────────────────────────────────
+    now_dt = now if now is not None else datetime.now()
+    now_t  = now_dt.time()
+
+    checks: list[dict] = []
+
+    def _check(name: str, passed: bool, detail: str) -> bool:
+        checks.append({"name": name, "passed": passed, "detail": detail})
+        return passed
+
+    def _block(by: str, reason: str) -> dict:
+        return {"passed": False, "blocked_by": by, "reason": reason, "checks": checks}
+
+    # ── 1. 거래 시간 ─────────────────────────────────────────────
+    if market == "KR":
+        in_hours = KR_OPEN <= now_t <= KR_CLOSE
+        detail = (
+            f"한국장 허용 시간{'내' if in_hours else '외'} "
+            f"(허용: {KR_OPEN.strftime('%H:%M')}~{KR_CLOSE.strftime('%H:%M')} KST, "
+            f"현재: {now_t.strftime('%H:%M')})"
+        )
+    else:  # US — 22:30 이후 또는 01:30 이전 (자정 경계 포함)
+        in_hours = now_t >= US_OPEN or now_t <= US_CLOSE
+        detail = (
+            f"미국장 허용 시간{'내' if in_hours else '외'} "
+            f"(허용: {US_OPEN.strftime('%H:%M')}~익일 {US_CLOSE.strftime('%H:%M')} KST, "
+            f"현재: {now_t.strftime('%H:%M')})"
+        )
+    if not _check("거래시간", in_hours, detail):
+        return _block("거래시간", detail)
+
+    # ── 2. 자동매매 한도 ─────────────────────────────────────────
+    total_after = accumulated_krw + order_amount_krw
+    within_limit = total_after <= LIMIT_KRW
+    detail = (
+        f"누적 {accumulated_krw:,}원 + 이번 {order_amount_krw:,}원 = "
+        f"{total_after:,}원 / 한도 {LIMIT_KRW:,}원"
+    )
+    if not _check("자동매매한도", within_limit, detail):
+        return _block("자동매매한도", f"자동매매 한도 초과 — {detail}")
+
+    # ── 3. 1종목 비중 ─────────────────────────────────────────────
+    ticker_after = ticker_accumulated_krw + order_amount_krw
+    within_ticker = ticker_after <= TICKER_LIMIT_KRW
+    detail = (
+        f"{ticker} 누적 {ticker_accumulated_krw:,}원 + 이번 {order_amount_krw:,}원 = "
+        f"{ticker_after:,}원 / 종목 한도 {TICKER_LIMIT_KRW:,}원 "
+        f"(전체 한도의 {TICKER_WEIGHT_PCT}%)"
+    )
+    if not _check("1종목비중", within_ticker, detail):
+        return _block("1종목비중", f"1종목 비중 {TICKER_WEIGHT_PCT}% 초과 — {detail}")
+
+    # ── 4. 1섹터 비중 ─────────────────────────────────────────────
+    if sector is not None:
+        sector_after = sector_accumulated_krw + order_amount_krw
+        within_sector = sector_after <= SECTOR_LIMIT_KRW
+        detail = (
+            f"섹터 '{sector}' 누적 {sector_accumulated_krw:,}원 + 이번 {order_amount_krw:,}원 = "
+            f"{sector_after:,}원 / 섹터 한도 {SECTOR_LIMIT_KRW:,}원 "
+            f"(전체 한도의 {SECTOR_WEIGHT_PCT}%)"
+        )
+        if not _check("1섹터비중", within_sector, detail):
+            return _block("1섹터비중", f"1섹터 비중 {SECTOR_WEIGHT_PCT}% 초과 — {detail}")
+    else:
+        _check("1섹터비중", True, "섹터 미입력 — 검사 생략")
+
+    # ── 5. 하루 거래 횟수 ─────────────────────────────────────────
+    trades_after = daily_trades + 1
+    within_trades = trades_after <= MAX_DAILY_TRADES
+    detail = (
+        f"기존 {daily_trades}회 + 이번 1회 = {trades_after}회 / "
+        f"일일 한도 {MAX_DAILY_TRADES}회"
+    )
+    if not _check("하루거래횟수", within_trades, detail):
+        return _block("하루거래횟수", f"하루 거래 횟수 초과 — {detail}")
+
+    # ── 6. Kill switch ────────────────────────────────────────────
+    kill_daily = daily_pnl_pct   <= KILL_DAILY_PCT
+    kill_cum   = cumulative_pnl_pct <= KILL_CUMULATIVE_PCT
+    kill_hit   = kill_daily or kill_cum
+
+    reasons = []
+    if kill_daily:
+        reasons.append(f"일일 손익 {daily_pnl_pct:+.2f}% ≤ {KILL_DAILY_PCT:+.1f}%")
+    if kill_cum:
+        reasons.append(f"누적 손익 {cumulative_pnl_pct:+.2f}% ≤ {KILL_CUMULATIVE_PCT:+.1f}%")
+
+    if kill_hit:
+        kill_detail = " / ".join(reasons)
+        _check("kill_switch", False, kill_detail)
+        return _block("kill_switch", f"Kill switch 발동 — {kill_detail}")
+    else:
+        kill_detail = (
+            f"일일 {daily_pnl_pct:+.2f}% (임계값 {KILL_DAILY_PCT:+.1f}%), "
+            f"누적 {cumulative_pnl_pct:+.2f}% (임계값 {KILL_CUMULATIVE_PCT:+.1f}%)"
+        )
+        _check("kill_switch", True, kill_detail)
+
+    return {"passed": True, "blocked_by": None, "reason": None, "checks": checks}
+
+
+# ═══════════════════════════════════════════════
 # 직접 실행 테스트
 # ═══════════════════════════════════════════════
 
@@ -2746,6 +2938,77 @@ if __name__ == "__main__":
         print(f"  {label}")
         print(f"{'='*55}")
         print(json.dumps(data, ensure_ascii=False, indent=2, default=str))
+
+    # ── 가드레일 검사 테스트 ──────────────────────────────────────
+    print("\n" + "="*55)
+    print("  🛡  check_guardrails 테스트 (4가지 케이스)")
+    print("="*55)
+
+    # 시각 픽스처: 한국 장중(10:00) / 장 외(15:00)
+    _KR_INDAY  = datetime.now().replace(hour=10, minute=0, second=0, microsecond=0)
+    _KR_CLOSED = datetime.now().replace(hour=15, minute=0, second=0, microsecond=0)
+
+    # ── 케이스 1: 모든 조건 통과 → "통과"
+    _pp(
+        "케이스 1 — 거래시간 OK + 한도 OK + 비중 OK + kill switch 안 걸림 → 통과",
+        check_guardrails(
+            "005930", 3_000_000,
+            sector="반도체",
+            accumulated_krw=10_000_000,      # 누적 1000만 + 이번 300만 = 1300만 ≤ 3000만 OK
+            ticker_accumulated_krw=2_000_000, # 200만 + 300만 = 500만 ≤ 600만 OK
+            sector_accumulated_krw=5_000_000, # 500만 + 300만 = 800만 ≤ 1200만 OK
+            daily_trades=2,                   # 2 + 1 = 3회 ≤ 5회 OK
+            daily_pnl_pct=-1.0,               # -1.0% > -5.0% OK
+            cumulative_pnl_pct=-3.0,          # -3.0% > -15.0% OK
+            now=_KR_INDAY,
+        )
+    )
+
+    # ── 케이스 2: 거래 시간 밖 → "차단(시간 외)"
+    _pp(
+        "케이스 2 — 한국장 거래시간 밖(15:00) → 차단",
+        check_guardrails(
+            "005930", 1_000_000,
+            now=_KR_CLOSED,
+        )
+    )
+
+    # ── 케이스 3: 1종목 비중 20% 초과 → "차단(1종목비중)"
+    # ticker_accumulated 5,500,000 + 이번 1,000,000 = 6,500,000 > 한도 6,000,000
+    _pp(
+        "케이스 3 — 1종목 비중 초과(5,500,000 + 1,000,000 = 6,500,000 > 6,000,000) → 차단",
+        check_guardrails(
+            "005930", 1_000_000,
+            sector="반도체",
+            accumulated_krw=10_000_000,
+            ticker_accumulated_krw=5_500_000,
+            sector_accumulated_krw=5_000_000,
+            daily_trades=2,
+            daily_pnl_pct=-1.0,
+            cumulative_pnl_pct=-3.0,
+            now=_KR_INDAY,
+        )
+    )
+
+    # ── 케이스 4: kill switch 발동(일일 -5.2%) → "차단(kill_switch)"
+    _pp(
+        "케이스 4 — kill switch 발동(일일 -5.2% ≤ -5.0%) → 차단",
+        check_guardrails(
+            "005930", 1_000_000,
+            sector="반도체",
+            accumulated_krw=5_000_000,
+            ticker_accumulated_krw=1_000_000,
+            sector_accumulated_krw=2_000_000,
+            daily_trades=2,
+            daily_pnl_pct=-5.2,
+            cumulative_pnl_pct=-3.0,
+            now=_KR_INDAY,
+        )
+    )
+
+    print("\n" + "="*55)
+    print("  ⬆  가드레일 테스트 완료. 이후는 기존 테스트.")
+    print("="*55)
 
     # ── 매수 규칙 A vs B 비교 ──────────────────────────────────
     # universe_limit=50: 속도 우선 (KR 시총 상위 50개 근사)
