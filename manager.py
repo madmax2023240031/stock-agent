@@ -44,6 +44,10 @@ def manager(user_input: str, history: list = None, status_callback=None) -> str:
         "     내 포트폴리오 맥락에서 매수 후보를 제안해달라는 질문: call_advisor_employee\n"
         "     → '내 계좌'가 맥락에 있고 '추천'·'뭐 사면'·'보태면'·'보강' 같은 단어가 포함된 경우 해당.\n"
         "       단순 포트폴리오 현황·잔고 조회만이면 call_portfolio_employee 사용.\n"
+        "   - 매수·매도 규칙 판단: call_trading_rule_employee\n"
+        "     → '규칙 A', '규칙 B', '점수 집중', '분산 채우기', '규칙 비교',\n"
+        "       '손절', '익절', '매도 규칙' 키워드가 포함된 질문에 사용.\n"
+        "       이 직원은 실제 주문을 내지 않으며 판단/제안만 한다.\n"
         "   ⚠️ **call_advisor_employee를 호출하면 call_screener_employee와 call_portfolio_employee는 절대 추가로 부르지 마세요.**\n"
         "     advisor_employee가 내부적으로 포트폴리오 진단(현황·섹터 분석)과 발굴(KR 50종목 + US 100종목)을 이미 수행합니다.\n"
         "     screener/portfolio를 중복 호출하면 같은 작업이 두 번 돌아 시간이 낭비됩니다.\n"
@@ -153,6 +157,16 @@ def manager(user_input: str, history: list = None, status_callback=None) -> str:
                 "단순 잔고·포트폴리오 현황 조회만이면 call_portfolio_employee를 사용."
             ),
             "input_schema": {"type": "object", "properties": {"task": {"type": "string", "description": "추천 요청 내용"}}, "required": ["task"]}
+        },
+        {
+            "name": "call_trading_rule_employee",
+            "description": (
+                "매수 규칙 A(점수 집중)·B(분산 채우기) 판단 및 손절·익절 매도 후보 확인 직원 호출. "
+                "'규칙 A는 뭘 사라고 해', '점수 집중 방식으로 뭐 살까', '규칙 B', '분산 채우기로 뭐 살까', "
+                "'규칙 A랑 B 비교해줘', '지금 손절 대상 있어', '익절 대상 있어', '매도 규칙 확인해줘' 같은 질문에 사용. "
+                "실제 주문을 내지 않으며 판단/제안만 한다."
+            ),
+            "input_schema": {"type": "object", "properties": {"task": {"type": "string", "description": "규칙 판단 요청 내용"}}, "required": ["task"]}
         }
     ]
     
@@ -165,8 +179,9 @@ def manager(user_input: str, history: list = None, status_callback=None) -> str:
         "call_portfolio_employee": employees.portfolio_employee,
         "call_compare_employee": employees.compare_employee,
         "call_risk_review_employee": employees.risk_review_employee,
-        "call_screener_employee":    employees.screener_employee,
-        "call_advisor_employee":     employees.advisor_employee,
+        "call_screener_employee":      employees.screener_employee,
+        "call_advisor_employee":       employees.advisor_employee,
+        "call_trading_rule_employee":  employees.trading_rule_employee,
     }
     
     messages = []

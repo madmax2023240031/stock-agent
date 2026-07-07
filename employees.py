@@ -569,6 +569,100 @@ def advisor_employee(task: str) -> str:
 
 
 # ═══════════════════════════════════════════════
+# 11. 매매 규칙 직원 (trading_rule_employee)
+# ═══════════════════════════════════════════════
+def trading_rule_employee(task: str) -> str:
+    """
+    매수 규칙 A/B(점수집중/분산채우기)와 매도 규칙(손절/익절)을 판단한다.
+    실제 주문은 절대 내지 않는다 (dry_run).
+    """
+    system_prompt = (
+        "당신은 매매 규칙에 따라 매수·매도 후보를 판단하는 '매매 규칙 직원'입니다.\n"
+        "\n"
+        "## 절대 원칙\n"
+        "- 이 도구들은 '규칙에 따른 판단/제안'만 합니다. 실제 매수·매도 주문은 절대 하지 않습니다.\n"
+        "- 답변 첫 줄과 마지막에 반드시 이 문구를 포함하세요:\n"
+        "  '⚠️ 이건 규칙 판단일 뿐, 실제 주문은 나가지 않습니다. 투자 권유가 아닌 참고용입니다.'\n"
+        "- 미래 주가 예측 금지.\n"
+        "\n"
+        "## 도구 사용 기준\n"
+        "- '규칙 A', '점수 집중': evaluate_buy_rule_A\n"
+        "- '규칙 B', '분산 채우기': evaluate_buy_rule_B\n"
+        "- 'A vs B 비교', '두 규칙 비교': 두 도구를 모두 호출해 결과를 나란히 비교\n"
+        "- '손절', '익절', '매도 규칙': evaluate_sell_rules\n"
+        "\n"
+        "## 결과 정리 형식\n"
+        "- 매수 후보: 종목명(티커), 점수, 근거 수치(영업이익률·성장률 등)\n"
+        "- 매도 후보: 종목명(티커), 현재 수익률, 손절/익절 분류, 규칙 기준값\n"
+        "- A vs B 비교 시: 두 규칙의 후보를 나란히 정리하고 차이점을 설명\n"
+    )
+    tools_list = [
+        {
+            "name": "evaluate_buy_rule_A",
+            "description": (
+                "[매수 규칙 A — 점수 집중] 스크리닝 점수 상위 종목을 매수 후보로 제안한다. "
+                "실제 주문 아님, 판단만."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "market": {
+                        "type": "string",
+                        "enum": ["KR", "US", "ALL"],
+                        "description": "KR=코스피200, US=S&P500, ALL=전체. 미지정 시 ALL."
+                    },
+                    "universe_limit": {
+                        "type": ["integer", "null"],
+                        "description": "평가할 최대 종목 수. 속도 조절용. KR=50, US=100 권장."
+                    }
+                },
+                "required": []
+            }
+        },
+        {
+            "name": "evaluate_buy_rule_B",
+            "description": (
+                "[매수 규칙 B — 분산 채우기] 포트폴리오 내 비중이 낮은 섹터를 "
+                "스크리닝 점수 상위 종목으로 보강할 후보를 제안한다. 실제 주문 아님, 판단만."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "market": {
+                        "type": "string",
+                        "enum": ["KR", "US", "ALL"],
+                        "description": "KR=코스피200, US=S&P500, ALL=전체. 미지정 시 ALL."
+                    },
+                    "universe_limit": {
+                        "type": ["integer", "null"],
+                        "description": "평가할 최대 종목 수. 속도 조절용. KR=50, US=100 권장."
+                    }
+                },
+                "required": []
+            }
+        },
+        {
+            "name": "evaluate_sell_rules",
+            "description": (
+                "보유 종목을 손절·익절 규칙에 비춰 매도 후보를 분류한다. "
+                "실제 주문 아님, 판단만."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        }
+    ]
+    tool_map = {
+        "evaluate_buy_rule_A": tools.evaluate_buy_rule_A,
+        "evaluate_buy_rule_B": tools.evaluate_buy_rule_B,
+        "evaluate_sell_rules": tools.evaluate_sell_rules,
+    }
+    return _run_agent(system_prompt, tools_list, tool_map, task, max_tokens=4096)
+
+
+# ═══════════════════════════════════════════════
 # 직접 실행 테스트
 # ═══════════════════════════════════════════════
 
