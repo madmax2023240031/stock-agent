@@ -100,6 +100,52 @@ _KIS_US_EXCHANGES = [
 ]
 
 
+def _kis_maintenance_hint(now=None) -> str:
+    """
+    현재 한국 시각 기준으로 KIS 점검 시간 여부를 판단해 안내 문구를 반환한다.
+    now를 주입하면 실제 시각과 무관하게 테스트할 수 있다.
+    """
+    try:
+        from zoneinfo import ZoneInfo
+        kst = ZoneInfo("Asia/Seoul")
+    except ImportError:
+        from datetime import timezone, timedelta as _td
+        kst = timezone(_td(hours=9))
+
+    if now is None:
+        now = datetime.now(kst)
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=kst)
+
+    hour    = now.hour
+    weekday = now.weekday()   # 0=월, 6=일
+    is_weekend    = weekday >= 5
+    is_maint_hour = hour < 7  # 자정~오전 7시
+    is_market     = (
+        not is_weekend
+        and (9 <= hour < 15 or (hour == 15 and now.minute <= 30))
+    )
+
+    if is_maint_hour or is_weekend:
+        return (
+            "⏰ 지금은 KIS 서버 점검 시간(자정~오전 7시)일 수 있습니다. "
+            "특히 주말 밤에 점검이 잦습니다. "
+            "코드 문제가 아닐 가능성이 높으니, "
+            "평일 장 시간(09:00~15:30)에 다시 시도해보세요."
+        )
+    if is_market:
+        return (
+            "평일 장 시간인데도 실패했다면 키 만료·설정 오류 등 다른 원인일 수 있습니다. "
+            "KIS_APP_KEY / KIS_APP_SECRET / KIS_ACCOUNT_NO 환경변수를 확인해보세요."
+        )
+    # 평일 장외 시간 (07:00~09:00 또는 15:30 이후)
+    return (
+        "지금은 KIS 장외 시간입니다. "
+        "자정~오전 7시에는 서버 점검이 있을 수 있습니다. "
+        "환경변수를 확인하거나 잠시 후 다시 시도해보세요."
+    )
+
+
 def _fetch_usd_krw_rate() -> float | None:
     """USD/KRW 환율을 FinanceDataReader에서 가져온다. 실패 시 None."""
     try:
@@ -177,13 +223,16 @@ def get_kis_token() -> dict:
         data = resp.json()
     except requests.HTTPError as exc:
         body_text = exc.response.text if exc.response is not None else ""
-        return {"error": f"KIS 토큰 발급 HTTP 오류: {exc} — {body_text}"}
+        hint = _kis_maintenance_hint()
+        return {"error": f"{hint}\n\nKIS 토큰 발급 HTTP 오류: {exc} — {body_text}"}
     except Exception as exc:
-        return {"error": f"KIS 토큰 발급 실패: {exc}"}
+        hint = _kis_maintenance_hint()
+        return {"error": f"{hint}\n\nKIS 토큰 발급 실패: {exc}"}
 
     access_token = data.get("access_token")
     if not access_token:
-        return {"error": f"KIS 응답에 access_token 없음: {data}"}
+        hint = _kis_maintenance_hint()
+        return {"error": f"{hint}\n\nKIS 응답에 access_token 없음: {data}"}
 
     token_type = data.get("token_type", "Bearer")
 
@@ -295,7 +344,7 @@ def get_kis_balance() -> dict:
 
     tok = get_kis_token()
     if "error" in tok:
-        return {"error": f"토큰 획득 실패: {tok['error']}"}
+        return tok  # error message already has maintenance hint
 
     base_headers = {
         "content-type":  "application/json",
@@ -369,9 +418,11 @@ def get_kis_balance() -> dict:
             }
         else:
             msg = d.get("msg1") or d.get("msg") or str(d)
-            domestic = {"error": f"국내 잔고 API 오류: {msg}"}
+            hint = _kis_maintenance_hint()
+            domestic = {"error": f"{hint}\n\n국내 잔고 API 오류: {msg}"}
     except Exception as exc:
-        domestic = {"error": f"국내 잔고 조회 실패: {exc}"}
+        hint = _kis_maintenance_hint()
+        domestic = {"error": f"{hint}\n\n국내 잔고 조회 실패: {exc}"}
 
     # ── 2. 해외주식 잔고 (VTTS3012R, 거래소별 순회) ────────
     ovrs_holdings: list[dict] = []
@@ -638,7 +689,7 @@ def place_kis_order(
     # ── 실제 주문 API 호출 (dry_run=False) ────────────────────
     tok = get_kis_token()
     if "error" in tok:
-        return {"error": f"토큰 획득 실패: {tok['error']}"}
+        return tok  # error message already has maintenance hint
 
     headers = {
         "content-type":  "application/json; charset=utf-8",
@@ -657,9 +708,11 @@ def place_kis_order(
         data = resp.json()
     except requests.HTTPError as exc:
         body_text = exc.response.text if exc.response is not None else ""
-        return {"error": f"KIS 주문 HTTP 오류: {exc} — {body_text}"}
+        hint = _kis_maintenance_hint()
+        return {"error": f"{hint}\n\nKIS 주문 HTTP 오류: {exc} — {body_text}"}
     except Exception as exc:
-        return {"error": f"KIS 주문 요청 실패: {exc}"}
+        hint = _kis_maintenance_hint()
+        return {"error": f"{hint}\n\nKIS 주문 요청 실패: {exc}"}
 
     if data.get("rt_cd") != "0":
         msg = data.get("msg1") or data.get("msg") or str(data)
