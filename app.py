@@ -3,6 +3,11 @@ import manager
 
 st.set_page_config(page_title="주식 멀티 에이전트 시스템", page_icon="🤖", layout="wide")
 
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "quick_question" not in st.session_state:
+    st.session_state.quick_question = None
+
 # 사이드바 (조직도 — st.expander 방식, HTML 렌더링 오류 없음)
 with st.sidebar:
     # CSS: 한 줄 문자열 연결로 작성 → Markdown이 코드 블록으로 오인하는 4칸 들여쓰기 원천 차단
@@ -105,11 +110,22 @@ with st.sidebar:
 
     st.caption("※ 모든 의견은 투자 권유가 아니며, 미래 주가 예측을 제공하지 않습니다.")
 
+    st.divider()
+    st.markdown("**⚡ 자주 쓰는 질문**")
+    QUICK_QUESTIONS = [
+        "내 포트폴리오 어때?",
+        "내 포트폴리오 기반 종목 추천해줘",
+        "벤치마크 결과만 짧게 요약해줘",
+        "지금 손절 대상 있어?",
+        "규칙 A랑 B 비교해줘",
+        "지금 시장 거시 환경 어때?",
+    ]
+    for q in QUICK_QUESTIONS:
+        if st.button(q, use_container_width=True, key=f"qq_{q}"):
+            st.session_state.quick_question = q
+
 st.title("🤖 주식 투자 총괄 매니저")
 st.markdown("궁금한 주식 종목이나 시황을 물어보세요! (예: 삼성전자 현재가 알려줘, 애플이랑 테슬라 비교해줘)")
-
-if "messages" not in st.session_state:
-    st.session_state.messages = []
 
 # 기존 대화 표시
 for msg in st.session_state.messages:
@@ -117,6 +133,10 @@ for msg in st.session_state.messages:
         st.markdown(msg["content"])
 
 user_input = st.chat_input("메시지를 입력하세요...")
+if st.session_state.quick_question:
+    user_input = st.session_state.quick_question
+    st.session_state.quick_question = None
+
 if user_input:
     # 1. 사용자 메시지 화면에 출력
     with st.chat_message("user"):
