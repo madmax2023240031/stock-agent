@@ -1108,7 +1108,7 @@ def get_quote(ticker: str) -> dict:
 
 def get_indicators(ticker: str) -> dict:
     """
-    기술적 지표(MA20, MA60, RSI, MACD)를 반환한다.
+    기술적 지표(MA20, MA60, RSI, MACD, 거래량)를 반환한다.
 
     Parameters
     ----------
@@ -1118,7 +1118,9 @@ def get_indicators(ticker: str) -> dict:
     Returns
     -------
     dict  {ticker, date, close, ma20, ma60, rsi,
-           macd, macd_signal, macd_hist}
+           macd, macd_signal, macd_hist,
+           volume, volume_ma20, volume_ratio}
+          volume_ratio = 최근 거래량 / 20일 평균 거래량 (예: 2.5 → 평소의 2.5배)
           실패 시: {"error": "..."}
     """
     import ta
@@ -1152,16 +1154,28 @@ def get_indicators(ticker: str) -> dict:
     except Exception:
         pass
 
+    # ── 거래량 (매매정지 0값 행은 _filter_halted_rows에서 이미 제외됨)
+    volume = volume_ma20 = volume_ratio = None
+    if "volume" in df.columns:
+        volume_s = df["volume"]
+        volume = _safe_float(volume_s.iloc[-1])
+        volume_ma20 = _safe_float(volume_s.rolling(20).mean().iloc[-1])
+        if volume is not None and volume_ma20 not in (None, 0):
+            volume_ratio = round(volume / volume_ma20, 2)
+
     return {
-        "ticker":      ticker,
-        "date":        df.index[-1].strftime("%Y-%m-%d"),
-        "close":       _safe_float(close_s.iloc[-1]),
-        "ma20":        ma20,
-        "ma60":        ma60,
-        "rsi":         rsi,
-        "macd":        macd_val,
-        "macd_signal": macd_signal,
-        "macd_hist":   macd_hist,
+        "ticker":       ticker,
+        "date":         df.index[-1].strftime("%Y-%m-%d"),
+        "close":        _safe_float(close_s.iloc[-1]),
+        "ma20":         ma20,
+        "ma60":         ma60,
+        "rsi":          rsi,
+        "macd":         macd_val,
+        "macd_signal":  macd_signal,
+        "macd_hist":    macd_hist,
+        "volume":       volume,
+        "volume_ma20":  volume_ma20,
+        "volume_ratio": volume_ratio,
     }
 
 
