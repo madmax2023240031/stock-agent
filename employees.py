@@ -466,7 +466,15 @@ def advisor_employee(task: str) -> str:
         "3. 국내 필요: `screen_stocks(market='KR', universe_limit=50, top_n=20, max_per_sector=null, growth_correction=true)`\n"
         "   해외 필요: `screen_stocks(market='US', universe_limit=100, top_n=20, max_per_sector=null, growth_correction=true)`\n"
         "   (보유종목 없으면 둘 다 호출)\n"
-        "4. 발굴 결과에서 이미 보유 종목 제외, 공백 섹터 우선 선택 → 보고서 작성\n"
+        "4. 발굴 결과에서 이미 보유 종목 제외, 공백 섹터 우선으로 최종 후보(국내 2개·해외 2개) 선정\n"
+        "5. **각 최종 후보에 대해 `get_indicators(ticker)` 호출** → 아래 기준으로 타이밍 경고 결정:\n"
+        "   - close < MA20 AND close < MA60 → '⚠️ 하락 추세 — 진입 타이밍 주의'\n"
+        "   - macd_hist < 0 → '⚠️ 모멘텀 약세'\n"
+        "   - RSI < 30 → '🟠 과매도 구간 (반등 가능성도, 추가 하락 가능성도 있음)'\n"
+        "   - 복수 조건 해당 시 모두 병기. 해당 없으면 경고 생략(추세 양호).\n"
+        "   - 하락 추세여도 추천에서 제외하지 않는다. 경고만 붙인다.\n"
+        "   - '오를 것/내릴 것' 단정 금지. '현재 이런 추세'까지만.\n"
+        "6. 보고서 작성\n"
         "\n"
         "## 보고서 형식 (아래 구조 엄수, 최대한 짧게)\n"
         "\n"
@@ -475,12 +483,13 @@ def advisor_employee(task: str) -> str:
         "- 국내 X종목 | 손익: X% | 주요섹터: X(XX%)▲ / 공백: X\n"
         "- 해외 X종목 | 손익: X% | 주요섹터: X(XX%)▲ / 공백: X\n"
         "\n"
-        "**[B] 추천** (국내 최대 2개 + 해외 최대 2개, 종목당 4줄)\n"
+        "**[B] 추천** (국내 최대 2개 + 해외 최대 2개, 종목당 5줄)\n"
         "```\n"
         "N. 종목명(티커) — 섹터 [★흑자전환: is_turnaround=true만]\n"
         "영업이익률X% | 매출성장X% | 이익성장X% | 종합X\n"
         "📌 근거: 어떤 공백 섹터를 채우는지 1문장\n"
         "⚠️ 위험: 구체적 위험 1문장. 흑자전환이면 기저효과 경고 필수.\n"
+        "📊 추세: [경고 있으면 해당 이모지+문구 기재. 없으면 '추세 양호']\n"
         "```\n"
         "\n"
         "**[C] 면책** (1줄)\n"
@@ -556,6 +565,19 @@ def advisor_employee(task: str) -> str:
                 },
                 "required": ["market"]
             }
+        },
+        {
+            "name": "get_indicators",
+            "description": (
+                "종목의 기술적 지표(MA20, MA60, RSI, MACD 히스토그램)를 조회합니다. "
+                "최종 추천 후보 확정 후 각 종목에 대해 호출해 타이밍 경고를 결정하세요. "
+                "반환: close, ma20, ma60, rsi, macd_hist 등."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {"ticker": {"type": "string"}},
+                "required": ["ticker"]
+            }
         }
     ]
 
@@ -563,6 +585,7 @@ def advisor_employee(task: str) -> str:
         "get_kis_balance":        tools.get_kis_balance,
         "get_portfolio_analysis": tools.get_portfolio_analysis,
         "screen_stocks":          tools.screen_stocks,
+        "get_indicators":         tools.get_indicators,
     }
 
     return _run_agent(system_prompt, tools_list, tool_map, task, max_tokens=8192)
