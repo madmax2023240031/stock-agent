@@ -2538,6 +2538,38 @@ def evaluate_sell_rules() -> dict:
 
 
 # ═══════════════════════════════════════════════
+# 10-1. _attach_trend_warning  (매수 규칙 A/B 공용 헬퍼)
+# ═══════════════════════════════════════════════
+
+def _attach_trend_warning(candidates: list[dict]) -> None:
+    """
+    각 후보 dict에 get_indicators 기반 추세 경고를 trend_warning 필드로 붙인다.
+    (경고만 붙이고 후보에서 제외하지 않는다. 미래 예측 아님 — 현재 상태만 기술.)
+    """
+    for c in candidates:
+        ind = get_indicators(c["ticker"])
+        if "error" in ind:
+            c["trend_warning"] = None
+            continue
+
+        warnings = []
+        close, ma20, ma60 = ind.get("close"), ind.get("ma20"), ind.get("ma60")
+        if close is not None and ma20 is not None and ma60 is not None \
+                and close < ma20 and close < ma60:
+            warnings.append("⚠️ 하락 추세 — 진입 타이밍 주의")
+
+        macd_hist = ind.get("macd_hist")
+        if macd_hist is not None and macd_hist < 0:
+            warnings.append("⚠️ 모멘텀 약세")
+
+        rsi = ind.get("rsi")
+        if rsi is not None and rsi < 30:
+            warnings.append("🟠 과매도 구간 (반등 가능성도, 추가 하락 가능성도 있음)")
+
+        c["trend_warning"] = " / ".join(warnings) if warnings else None
+
+
+# ═══════════════════════════════════════════════
 # 11. evaluate_buy_rule_A  (점수 집중 방식)
 # ═══════════════════════════════════════════════
 
@@ -2575,6 +2607,7 @@ def evaluate_buy_rule_A(market: str = "ALL", universe_limit: int | None = None) 
                     "market"     : str,     # "KR" | "US"
                     "reason"     : "점수 상위",
                     "key_metrics": dict,
+                    "trend_warning": str | None,  # get_indicators 기반 현재 추세 경고 (없으면 None)
                 }
             ],
             "count"     : int,
@@ -2621,6 +2654,8 @@ def evaluate_buy_rule_A(market: str = "ALL", universe_limit: int | None = None) 
         })
         if len(candidates) >= MAX_CANDIDATES:
             break
+
+    _attach_trend_warning(candidates)
 
     return {
         "rule":  "A — 점수 집중",
@@ -2687,6 +2722,7 @@ def evaluate_buy_rule_B(market: str = "ALL", universe_limit: int | None = None) 
                     "market"     : str,
                     "reason"     : "부족섹터 OO 보강",
                     "key_metrics": dict,
+                    "trend_warning": str | None,  # get_indicators 기반 현재 추세 경고 (없으면 None)
                 }
             ],
             "count"    : int,
@@ -2803,6 +2839,8 @@ def evaluate_buy_rule_B(market: str = "ALL", universe_limit: int | None = None) 
         })
         if len(candidates) >= MAX_CANDIDATES:
             break
+
+    _attach_trend_warning(candidates)
 
     return {
         "rule":  "B — 분산 채우기",
