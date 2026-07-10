@@ -56,8 +56,23 @@ def _yf_ticker(ticker: str) -> str:
     return ticker + ".KS" if _is_korean(ticker) else ticker
 
 
+def _filter_halted_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """매매정지 구간의 '거래 없음' 행을 제외한다.
+
+    한국 종목은 액면분할 등으로 2~3주 매매정지가 걸리면 FinanceDataReader가
+    open/high/low=0, volume=0(또는 결측)인 행을 채워 넣는다. close는 정지 중에도
+    직전 종가로 채워지므로 close만으로는 정지 여부를 판별할 수 없다.
+    """
+    required = {"open", "high", "low", "volume"}
+    if not required.issubset(df.columns):
+        return df
+    no_volume = df["volume"].isna() | (df["volume"] == 0)
+    zero_ohl  = (df["open"] == 0) | (df["high"] == 0) | (df["low"] == 0)
+    return df[~(no_volume | zero_ohl)]
+
+
 def _fetch_ohlcv(ticker: str, days: int = 200) -> pd.DataFrame | None:
-    """OHLCV DataFrame 반환. 실패 시 None."""
+    """OHLCV DataFrame 반환. 매매정지 구간의 0값 행은 제외한다. 실패 시 None."""
     end_dt = datetime.today()
     start_dt = end_dt - timedelta(days=days + 30)  # 주말·공휴일 여유
     try:
@@ -69,6 +84,9 @@ def _fetch_ohlcv(ticker: str, days: int = 200) -> pd.DataFrame | None:
         df.columns = [c.lower() for c in df.columns]
         df.index = pd.to_datetime(df.index)
         df.sort_index(inplace=True)
+        df = _filter_halted_rows(df)
+        if df is None or df.empty:
+            return None
         return df
     except Exception:
         return None
