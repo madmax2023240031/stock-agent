@@ -2360,6 +2360,36 @@ def screen_stocks(
 
 
 # ═══════════════════════════════════════════════
+# 9-1. _attach_sell_trend_note  (매도 규칙 공용 헬퍼)
+# ═══════════════════════════════════════════════
+
+def _attach_sell_trend_note(candidates: list[dict]) -> None:
+    """
+    각 후보 dict에 get_indicators 기반 추세 정보를 trend_note 필드로 붙인다.
+    (판단은 사람이 — 추세가 좋다고 후보에서 빼지 않는다. 정보만 추가한다.
+     미래 예측 아님 — "반등할 것"이 아니라 "반등 신호가 보인다"까지만 기술.)
+    """
+    for c in candidates:
+        ind = get_indicators(c["ticker"])
+        if "error" in ind:
+            c["trend_note"] = None
+            continue
+
+        close, ma20 = ind.get("close"), ind.get("ma20")
+        rsi = ind.get("rsi")
+        macd_hist = ind.get("macd_hist")
+
+        if macd_hist is not None and macd_hist > 0:
+            c["trend_note"] = "🟢 반등 신호 — 손절 보류 검토"
+        elif rsi is not None and rsi < 30:
+            c["trend_note"] = "🟠 과매도 구간 — 반등 가능성도 있음"
+        elif close is not None and ma20 is not None and close > ma20:
+            c["trend_note"] = "🟢 단기 추세 개선 중"
+        else:
+            c["trend_note"] = "🔴 하락 지속"
+
+
+# ═══════════════════════════════════════════════
 # 10. evaluate_sell_rules
 # ═══════════════════════════════════════════════
 
@@ -2393,9 +2423,10 @@ def evaluate_sell_rules() -> dict:
                     "action":          str,
                     "market":          str,   # "KR" | "US"
                     "currency":        str,   # "KRW" | "USD"
+                    "trend_note":      str | None,  # get_indicators 기반 추세 정보 (참고용, 후보 제외 사유 아님)
                 }
             ],
-            "take_profit": [...],   # 같은 구조, 수익률 높은 순 정렬
+            "take_profit": [...],   # 같은 구조 (trend_note 포함), 수익률 높은 순 정렬
             "hold": {
                 "count":    int,
                 "domestic": int,
@@ -2470,6 +2501,10 @@ def evaluate_sell_rules() -> dict:
     # ── 3. 정렬 (손절: 수익률 낮은 순, 익절: 수익률 높은 순) ──
     stop_loss.sort(key=lambda x: x["profit_loss_pct"])
     take_profit.sort(key=lambda x: x["profit_loss_pct"], reverse=True)
+
+    # ── 3-1. 추세 정보 부착 (후보 제외 아님, 참고 정보만 추가) ──
+    _attach_sell_trend_note(stop_loss)
+    _attach_sell_trend_note(take_profit)
 
     # ── 4. 보유 유지 국내/해외 집계 ─────────────────────────────
     hold_kr = sum(1 for h in hold if h["market"] == "KR")
