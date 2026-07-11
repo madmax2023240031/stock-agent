@@ -6,6 +6,7 @@ employees.py
 
 import os
 import json
+from datetime import datetime
 from dotenv import load_dotenv
 from anthropic import Anthropic
 
@@ -157,16 +158,34 @@ def news_employee(task: str) -> str:
 # 4. 펀더멘털 직원 (fundamental_employee)
 # ═══════════════════════════════════════════════
 def fundamental_employee(task: str) -> str:
+    today_str = datetime.now().strftime("%Y-%m-%d")
     system_prompt = (
         "당신은 기업의 재무 상태와 가치를 분석하는 '펀더멘털 직원'입니다.\n"
+        f"오늘 날짜는 {today_str}입니다. next_earnings_date까지의 남은 일수는 "
+        "반드시 이 날짜를 기준으로 직접 계산하세요 (임의로 추측 금지).\n"
         "- 주어진 도구(get_fundamentals)를 사용하여 PER, PBR, EPS, 영업이익, 부채비율 등을 확인하세요.\n"
         "- 수치를 바탕으로 기업의 고평가/저평가 여부, 중장기적 재무 건전성을 분석하세요.\n"
         "- 누락된 지표(null)가 있다면 해당 사실을 명시하세요.\n"
+        "\n"
+        "## 실적 발표 일정 (next_earnings_date)\n"
+        "- 미국 종목이고 오늘로부터 7일 이내 예정이면: "
+        "'⚠️ N일 후 실적 발표 예정 — 발표 전후 변동성 주의'라고 안내하세요. "
+        "(날짜에 '(추정치)'가 붙어 있으면 그 사실도 함께 언급)\n"
+        "- 미국 종목이고 임박하지 않았거나 '확인 불가'면 굳이 강조하지 말고, "
+        "필요 시 예정일만 짧게 언급하세요.\n"
+        "- 한국 종목은 next_earnings_date가 항상 '확인 불가'입니다. "
+        "과하게 강조하지 말고 '실적 발표 예정일은 사전 확인 불가(DART 특성)'라고 담백하게 한 번만 언급하세요.\n"
+        "- 절대 날짜를 추정하거나 지어내지 마세요. 도구가 준 값 그대로만 사용하세요.\n"
+        "\n"
         "- 답변에 항상 '재무 분석은 중장기적 참고용이며 투자 권유가 아닙니다'라고 명시하세요."
     )
     tools_list = [{
         "name": "get_fundamentals",
-        "description": "기업의 재무 지표(PER, PBR, EPS, 매출, 이익, 부채비율 등)를 조회합니다.",
+        "description": (
+            "기업의 재무 지표(PER, PBR, EPS, 매출, 이익, 부채비율 등)와 "
+            "다음 실적 발표 예정일(next_earnings_date)을 조회합니다. "
+            "미국은 예정일 또는 '확인 불가', 한국은 항상 '확인 불가'."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {"ticker": {"type": "string"}},

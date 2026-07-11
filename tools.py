@@ -56,6 +56,48 @@ def _yf_ticker(ticker: str) -> str:
     return ticker + ".KS" if _is_korean(ticker) else ticker
 
 
+def _next_us_earnings_date(ticker_obj, info: dict) -> str:
+    """미국 종목의 다음 실적 발표 예정일 문자열을 반환한다.
+
+    yf.Ticker.calendar["Earnings Date"](미래 날짜 목록)를 우선 사용하고,
+    없으면 Ticker.earnings_dates(과거+미래 혼재 테이블)에서 오늘 이후 가장
+    가까운 날짜를 찾는다. 둘 다 실패하면 지어내지 않고 "확인 불가"를 반환한다.
+    """
+    today = datetime.now().date()
+    next_date = None
+
+    try:
+        cal = ticker_obj.calendar
+        raw = cal.get("Earnings Date") if isinstance(cal, dict) else None
+        if raw:
+            dates = raw if isinstance(raw, (list, tuple)) else [raw]
+            future = [pd.Timestamp(d).date() for d in dates]
+            future = [d for d in future if d >= today]
+            if future:
+                next_date = min(future)
+    except Exception:
+        pass
+
+    if next_date is None:
+        try:
+            ed = ticker_obj.earnings_dates
+            if ed is not None and not ed.empty:
+                future_idx = [pd.Timestamp(d).date() for d in ed.index
+                              if pd.Timestamp(d).date() >= today]
+                if future_idx:
+                    next_date = min(future_idx)
+        except Exception:
+            pass
+
+    if next_date is None:
+        return "확인 불가"
+
+    date_str = next_date.strftime("%Y-%m-%d")
+    if info.get("isEarningsDateEstimate"):
+        date_str += " (추정치)"
+    return date_str
+
+
 def _filter_halted_rows(df: pd.DataFrame) -> pd.DataFrame:
     """매매정지 구간의 '거래 없음' 행을 제외한다.
 
@@ -1198,7 +1240,9 @@ def get_fundamentals(ticker: str) -> dict:
     -------
     dict  {ticker, market, per, pbr, eps, revenue,
            operating_income, net_income, debt_ratio,
-           market_cap, currency}
+           market_cap, currency, next_earnings_date}
+          next_earnings_date : 미국은 "YYYY-MM-DD"(추정치면 "(추정치)" 접미),
+                                한국은 "확인 불가 (DART는 사전 예정일 미제공)" 고정.
           실패 시: {"error": "..."}
     """
     import yfinance as yf
@@ -1208,7 +1252,8 @@ def get_fundamentals(ticker: str) -> dict:
     yf_sym = _yf_ticker(ticker)
 
     try:
-        info = yf.Ticker(yf_sym).info
+        yf_ticker_obj = yf.Ticker(yf_sym)
+        info = yf_ticker_obj.info
     except Exception as exc:
         return {"error": f"yfinance 조회 실패 ({yf_sym}): {exc}"}
 
@@ -1217,7 +1262,8 @@ def get_fundamentals(ticker: str) -> dict:
         if market == "KR":
             try:
                 yf_sym = ticker + ".KQ"
-                info   = yf.Ticker(yf_sym).info
+                yf_ticker_obj = yf.Ticker(yf_sym)
+                info   = yf_ticker_obj.info
             except Exception:
                 pass
         if not info:
@@ -1260,18 +1306,29 @@ def get_fundamentals(ticker: str) -> dict:
     def _val(x):
         return x if x is not None else "확인 불가"
 
+    # 다음 실적 발표 예정일 — 한국은 DART가 사전 예정일을 제공하지 않으므로 고정 문구,
+    # 미국은 yfinance에서 확인. 못 가져오면 지어내지 않고 "확인 불가".
+    if market == "KR":
+        next_earnings_date = "확인 불가 (DART는 사전 예정일 미제공)"
+    else:
+        try:
+            next_earnings_date = _next_us_earnings_date(yf_ticker_obj, info)
+        except Exception:
+            next_earnings_date = "확인 불가"
+
     return {
-        "ticker":           ticker,
-        "market":           market,
-        "currency":         currency,
-        "per":              _val(per),
-        "pbr":              _val(pbr),
-        "eps":              _val(eps),
-        "revenue":          _val(revenue),
-        "operating_income": _val(op_income),
-        "net_income":       _val(net_income),
-        "debt_ratio":       _val(debt_ratio),      # %
-        "market_cap":       _val(market_cap),
+        "ticker":             ticker,
+        "market":             market,
+        "currency":           currency,
+        "per":                _val(per),
+        "pbr":                _val(pbr),
+        "eps":                _val(eps),
+        "revenue":            _val(revenue),
+        "operating_income":   _val(op_income),
+        "net_income":         _val(net_income),
+        "debt_ratio":         _val(debt_ratio),      # %
+        "market_cap":         _val(market_cap),
+        "next_earnings_date": next_earnings_date,
     }
 
 
