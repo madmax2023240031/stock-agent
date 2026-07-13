@@ -1,0 +1,9 @@
+anthropic
+finance-datareader
+ta
+pandas
+yfinance
+python-dotenv
+feedparser
+streamlit
+requests

@@ -80,8 +80,8 @@ venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-> requirements.txt가 없다면:
-> `pip install anthropic finance-datareader ta pandas yfinance python-dotenv feedparser streamlit`
+> 설치가 잘 안 되면 직접 설치할 수도 있습니다:
+> `pip install anthropic finance-datareader ta pandas yfinance python-dotenv feedparser streamlit requests`
 
 ### 3. API 키 설정
 
@@ -108,7 +108,8 @@ KIS_HTS_ID=your_hts_id
 - **KIS_HTS_ID**: 한국투자증권 HTS 로그인 아이디
 
 > ⚠️ `.env` 파일과 `.kis_token_cache.json`(토큰 캐시)은 절대 GitHub에 올리지 마세요.
-> 두 파일 모두 `.gitignore`에 등록되어 있습니다.
+> 이 두 파일 외에도 `.dart_corp_codes.json`(DART 기업코드 캐시)과
+> `trade_log.json`·`trade_log_TEST.json`(거래 로그)이 `.gitignore`에 등록되어 있습니다.
 
 ### 4. 실행
 
@@ -151,12 +152,21 @@ stock-agent/
 ├── employees.py          # 직원(에이전트) 정의
 ├── manager.py            # 총괄 매니저 + 실행 로직
 ├── app.py                # Streamlit 웹 UI
-├── trade_log.json        # A/B 매매 실험 거래 로그 (규칙별 딱지 기록)
+├── test_manager.py       # 매니저 동작 테스트
+├── scripts/
+│   └── export_transcripts.py  # 대화 기록 내보내기 (Claude Code JSONL → 마크다운)
+├── requirements.txt      # 필수 라이브러리 목록
+├── trade_log.json        # A/B 매매 실험 거래 로그 (규칙별 딱지 기록, git 제외)
 ├── CLAUDE.md             # 프로젝트 지침 (개발용)
+├── stock-agent-개발보고서.md  # 개발 과정 보고서
 ├── .env                  # API 키 (git 제외)
 ├── .kis_token_cache.json # KIS 접근토큰 캐시 (자동 생성, git 제외)
+├── .dart_corp_codes.json # DART 기업코드 캐시 (자동 생성, git 제외)
 └── .gitignore
 ```
+
+> ⚠️ `trade_log.json`은 git 제외 대상이라 GitHub에 올라가지 않습니다.
+> A/B 매매 실험 기록을 잃지 않으려면 별도로 백업해 두세요.
 
 ---
 
