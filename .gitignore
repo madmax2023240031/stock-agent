@@ -33,3 +33,4 @@ build/
 
 # 거래 로그 (개인 거래기록 — 절대 커밋하지 않음)
 trade_log.json
+trade_log_TEST.json

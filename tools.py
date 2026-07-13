@@ -15,6 +15,7 @@ import time
 import threading
 import warnings
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import FinanceDataReader as fdr
 import pandas as pd
@@ -28,8 +29,12 @@ _CACHE_TTL = 600        # 초
 _PEER_RETRIES = 2       # 피어 조회 실패 시 최대 재시도 횟수
 _PEER_MIN_COUNT = 2     # 이 수 미만이면 "판별 제한"으로 표시
 
+# ── 파일 경로 기준 폴더 ───────────────────────────────────────
+# 실행 위치(cwd)와 무관하게 tools.py가 있는 폴더 기준으로 고정
+_BASE_DIR = Path(__file__).resolve().parent
+
 # ── 거래 로그 ─────────────────────────────────────────────────
-TRADE_LOG_PATH = "trade_log.json"
+TRADE_LOG_PATH = str(_BASE_DIR / "trade_log.json")
 _VALID_RULE_TAGS = {"A", "B", "MANUAL"}
 
 
@@ -139,7 +144,7 @@ def _fetch_ohlcv(ticker: str, days: int = 200) -> pd.DataFrame | None:
 # ═══════════════════════════════════════════════
 
 _KIS_DOMAIN          = "https://openapivts.koreainvestment.com:29443"
-_KIS_TOKEN_CACHE_FILE = ".kis_token_cache.json"
+_KIS_TOKEN_CACHE_FILE = str(_BASE_DIR / ".kis_token_cache.json")
 _KIS_TOKEN_BUFFER_SEC = 600   # 만료 10분 전에 갱신 트리거
 
 # ── place_kis_order 안전장치 상수 ──────────────────────────────
@@ -3347,35 +3352,44 @@ if __name__ == "__main__":
     print("  📒 거래 로그 테스트 (log_trade / get_trade_log / summarize)")
     print("="*55)
 
-    # 깨끗한 상태에서 시작 (이전 테스트 로그 삭제)
-    if os.path.exists(TRADE_LOG_PATH):
-        os.remove(TRADE_LOG_PATH)
-        print(f"\n[초기화] 기존 {TRADE_LOG_PATH} 삭제")
+    # 실제 trade_log.json을 절대 건드리지 않도록 테스트 전용 임시 파일로 교체
+    _ORIG_TRADE_LOG_PATH = TRADE_LOG_PATH
+    TRADE_LOG_PATH = str(_BASE_DIR / "trade_log_TEST.json")
+    try:
+        # 깨끗한 상태에서 시작 (이전 테스트 로그 삭제)
+        if os.path.exists(TRADE_LOG_PATH):
+            os.remove(TRADE_LOG_PATH)
+            print(f"\n[초기화] 기존 {TRADE_LOG_PATH} 삭제")
 
-    # 1) 로그 기록 4건
-    _pp("log_trade A/매수 — 삼성전자",
-        log_trade("A", "005930", "BUY", 5, 75000, "Rule A: RSI 저점, 점수 8/10"))
-    _pp("log_trade A/매수 — AAPL",
-        log_trade("A", "AAPL",   "BUY", 2, 210.5, "Rule A: MACD 골든크로스"))
-    _pp("log_trade B/매수 — SK하이닉스",
-        log_trade("B", "000660", "BUY", 3, 180000, "Rule B: 반도체 섹터 비중 부족"))
-    _pp("log_trade MANUAL/매수 — MSFT",
-        log_trade("MANUAL", "MSFT", "BUY", 1, 440.0, "추천 직원 제안 — AI 섹터 보강"))
+        # 1) 로그 기록 4건
+        _pp("log_trade A/매수 — 삼성전자",
+            log_trade("A", "005930", "BUY", 5, 75000, "Rule A: RSI 저점, 점수 8/10"))
+        _pp("log_trade A/매수 — AAPL",
+            log_trade("A", "AAPL",   "BUY", 2, 210.5, "Rule A: MACD 골든크로스"))
+        _pp("log_trade B/매수 — SK하이닉스",
+            log_trade("B", "000660", "BUY", 3, 180000, "Rule B: 반도체 섹터 비중 부족"))
+        _pp("log_trade MANUAL/매수 — MSFT",
+            log_trade("MANUAL", "MSFT", "BUY", 1, 440.0, "추천 직원 제안 — AI 섹터 보강"))
 
-    # 2) 전체 조회
-    _pp("get_trade_log() — 전체 (4건 기대)", get_trade_log())
+        # 2) 전체 조회
+        _pp("get_trade_log() — 전체 (4건 기대)", get_trade_log())
 
-    # 3) Rule A만 필터링
-    _pp("get_trade_log('A') — Rule A만 (2건 기대)", get_trade_log("A"))
+        # 3) Rule A만 필터링
+        _pp("get_trade_log('A') — Rule A만 (2건 기대)", get_trade_log("A"))
 
-    # 4) 규칙별 요약
-    _pp("summarize_trades_by_rule()", summarize_trades_by_rule())
+        # 4) 규칙별 요약
+        _pp("summarize_trades_by_rule()", summarize_trades_by_rule())
 
-    # 5) 잘못된 rule_tag → 에러 확인
-    _pp("log_trade 잘못된 rule_tag 'C' → 에러 기대",
-        log_trade("C", "005930", "BUY", 1, 75000, "테스트"))
-    _pp("get_trade_log 잘못된 rule_tag 'X' → 에러 기대",
-        get_trade_log("X"))
+        # 5) 잘못된 rule_tag → 에러 확인
+        _pp("log_trade 잘못된 rule_tag 'C' → 에러 기대",
+            log_trade("C", "005930", "BUY", 1, 75000, "테스트"))
+        _pp("get_trade_log 잘못된 rule_tag 'X' → 에러 기대",
+            get_trade_log("X"))
+    finally:
+        # 테스트가 예외로 죽어도 임시 파일 정리 + 원래 경로 복구
+        if os.path.exists(TRADE_LOG_PATH):
+            os.remove(TRADE_LOG_PATH)
+        TRADE_LOG_PATH = _ORIG_TRADE_LOG_PATH
 
     print("\n" + "="*55)
     print("  ✅ 거래 로그 테스트 완료")

@@ -88,6 +88,19 @@ with st.sidebar:
             "기저효과 보정·섹터 분산 필터 적용. '성장주 찾아줘', '실적 좋은 종목 알려줘' 등에 응답합니다. "
             "미래 주가 예측이 아닌 현재 특징 기반 참고용이며, 결과는 투자 권유가 아닙니다."
         )
+    with st.expander("💡 추천 (Advisor) — 포트폴리오 기반 매수 후보"):
+        st.caption(
+            "`get_kis_balance`·`get_portfolio_analysis`·`screen_stocks` 도구로 내 포트폴리오를 진단해 "
+            "공백 섹터를 찾고, 그 공백을 채울 매수 후보를 제안합니다. "
+            "후보마다 수치 근거와 위험을 함께 제시하고, 하락 추세·모멘텀 약세·과매도 등 "
+            "기술적 경고를 부착합니다. 판단만 하며 실제 주문은 없고, 매도 권유도 하지 않습니다."
+        )
+    with st.expander("📏 매매규칙 (Trading Rule) — 규칙 A/B · 손절/익절"):
+        st.caption(
+            "매수 규칙 A(점수 집중)·B(분산 채우기)로 매수 후보를 판단하고, "
+            "보유 종목을 손절 -10% / 익절 +20% 규칙에 비춰 매도 후보로 분류합니다. "
+            "모두 dry_run — 실제 주문은 절대 나가지 않으며, 규칙 판단 결과는 투자 권유가 아닌 참고용입니다."
+        )
 
     # ── 검토팀 ──
     st.markdown('<div class="so-grp so-r">🔎 검토팀</div>', unsafe_allow_html=True)
@@ -161,6 +174,8 @@ if user_input:
                 "call_compare_employee": "⚖️ 비교",
                 "call_risk_review_employee": "🚨 리스크검수",
                 "call_screener_employee":    "🔭 발굴",
+                "call_advisor_employee":     "💡 추천",
+                "call_trading_rule_employee": "📏 매매규칙",
             }
             EMPLOYEE_DETAIL = {
                 "call_research_employee": "🔍 조회 직원에게 정보 요청 중...",
@@ -172,6 +187,8 @@ if user_input:
                 "call_compare_employee": "⚖️ 비교 직원에게 종목 비교 요청 중...",
                 "call_risk_review_employee": "🚨 리스크 검수 직원에게 최종 검증 받는 중...",
                 "call_screener_employee": "🔭 발굴 직원에게 종목 스크리닝 요청 중...",
+                "call_advisor_employee": "💡 추천 직원이 포트폴리오 진단 후 매수 후보 발굴 중... (1~2분 정도 걸려요)",
+                "call_trading_rule_employee": "📏 매매규칙 직원에게 규칙 A/B·손절/익절 판단 요청 중...",
             }
 
             def status_cb(tool_name):
