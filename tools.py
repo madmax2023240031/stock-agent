@@ -2992,10 +2992,13 @@ def check_guardrails(
     daily_trades           : int   오늘 거래 횟수 (이번 주문 제외)
     daily_pnl_pct          : float 오늘 자동매매 손익률 (%)
     cumulative_pnl_pct     : float 누적 손익률 (%)
-    now                    : datetime  테스트용 시각 주입. None이면 실제 현재 시각 사용.
+    now                    : datetime  테스트용 시각 주입. None이면 KST 현재 시각 사용.
+                             naive datetime은 KST로 간주하고, tz가 있으면 KST로 변환한다.
 
     검사 순서 (하나라도 차단되면 즉시 반환)
     ----------------------------------------
+    0. 거래일     : 주말이면 차단. US는 새벽 구간(~01:30)이면 전날 밤에
+                    시작된 세션이므로 전날 요일 기준으로 판단.
     1. 거래시간   : KR 09:00~12:00 / US 22:30~01:30 (KST)
     2. 자동매매한도: 누적 + 이번 ≤ 3,000만 원
     3. 1종목비중  : 이 종목 누적 + 이번 ≤ 한도의 20% (600만 원)
@@ -3029,7 +3032,7 @@ def check_guardrails(
     # 거래 허용 시간 (한국시간 기준, 장 초반 3시간)
     KR_OPEN  = _time(9,  0)    # 한국장 시작
     KR_CLOSE = _time(12, 0)    # 한국장 검사 종료
-    US_OPEN  = _time(22, 30)   # 미국장 시작 (KST)
+    US_OPEN  = _time(22, 30)   # 미국장 시작 (KST) ⚠️ 서머타임 해제 기간(11~3월)에는 실제 개장이 23:30 — 조립 전 처리 필요
     US_CLOSE = _time(1,  30)   # 미국장 종료 (KST, 다음날 새벽)
 
     # ── 파생 상수 ──────────────────────────────────────────────────
@@ -3049,9 +3052,21 @@ def check_guardrails(
     if market not in ("KR", "US"):
         return {"error": f"market은 'KR' 또는 'US' 이어야 합니다. 입력: '{market}'"}
 
-    # ── 현재 시각 ─────────────────────────────────────────────────
-    now_dt = now if now is not None else datetime.now()
-    now_t  = now_dt.time()
+    # ── 현재 시각 (항상 KST 기준) ─────────────────────────────────
+    try:
+        from zoneinfo import ZoneInfo
+        kst = ZoneInfo("Asia/Seoul")
+    except ImportError:
+        from datetime import timezone as _tz, timedelta as _td
+        kst = _tz(_td(hours=9))
+
+    if now is None:
+        now_dt = datetime.now(kst)
+    elif now.tzinfo is None:
+        now_dt = now.replace(tzinfo=kst)   # naive → KST로 간주
+    else:
+        now_dt = now.astimezone(kst)       # tz 포함 → KST로 변환
+    now_t = now_dt.time()
 
     checks: list[dict] = []
 
@@ -3061,6 +3076,23 @@ def check_guardrails(
 
     def _block(by: str, reason: str) -> dict:
         return {"passed": False, "blocked_by": by, "reason": reason, "checks": checks}
+
+    # ── 0. 거래일 (주말 차단) ────────────────────────────────────
+    if market == "KR":
+        session_day = now_dt
+    else:
+        # US: 새벽 구간(now_t ≤ US_CLOSE)은 전날 밤에 시작된 세션 → 전날 요일 기준
+        session_day = now_dt - timedelta(days=1) if now_t <= US_CLOSE else now_dt
+    _WEEKDAY_KO = ["월", "화", "수", "목", "금", "토", "일"]
+    session_weekday = session_day.weekday()   # 0=월, 6=일
+    is_trading_day  = session_weekday < 5
+    detail = (
+        f"세션 기준일 {session_day.strftime('%Y-%m-%d')}"
+        f"({_WEEKDAY_KO[session_weekday]}) — "
+        f"{'거래일(월~금)' if is_trading_day else '주말'}"
+    )
+    if not _check("거래일", is_trading_day, detail):
+        return _block("거래일", f"주말은 거래일이 아닙니다 — {detail}")
 
     # ── 1. 거래 시간 ─────────────────────────────────────────────
     if market == "KR":
@@ -3161,6 +3193,7 @@ def log_trade(
     qty: int,
     price: float,
     reason: str,
+    sector: str | None = None,
 ) -> dict:
     """
     거래 1건을 TRADE_LOG_PATH(trade_log.json)에 기록한다.
@@ -3173,6 +3206,8 @@ def log_trade(
     qty      : int   수량 (1 이상)
     price    : float 체결 단가
     reason   : str   기록 사유 (자유 텍스트)
+    sector   : str | None  섹터명 (선택). get_auto_trade_stats_today의
+                           by_sector 집계에 쓰인다. 없으면 None으로 저장.
 
     Returns
     -------
@@ -3205,6 +3240,7 @@ def log_trade(
         "qty":       qty,
         "price":     price,
         "reason":    reason,
+        "sector":    sector,
     }
 
     try:
@@ -3333,6 +3369,125 @@ def summarize_trades_by_rule() -> dict:
     }
 
 
+def get_auto_trade_stats_today(rule_tag: str) -> dict:
+    """
+    오늘(KST) 자동매매 규칙별 누적치를 거래 로그에서 집계한다. (읽기 전용)
+
+    check_guardrails가 요구하는 "오늘 누적치" 입력을 조립 단계에서
+    손으로 계산하다 실수하는 것(매도 금액 합산, 어제 거래 포함 등)을
+    막기 위한 함수다. 주문 관련 코드는 일절 없다.
+
+    집계 기준
+    ---------
+    - "오늘" 판단은 KST 기준 날짜다 (timestamp가 오늘 날짜로 시작하는 기록만).
+    - daily_trades    : 오늘 이 규칙의 거래 횟수 (BUY + SELL 모두).
+    - accumulated_krw : 오늘 이 규칙의 매수(BUY)만 qty × price 합산.
+                        한도는 "산 금액" 기준이므로 매도는 제외한다.
+    - 미국 종목(6자리 코드가 아닌 티커)의 price는 USD이므로
+      _fetch_usd_krw_rate()로 KRW 환산한다. 오늘 미국 매수가 있는데
+      환율 조회가 실패하면 근사치를 쓰지 않고 {"error": "..."}를 반환한다
+      (가드레일 입력이 부정확하면 안 되므로).
+
+    Parameters
+    ----------
+    rule_tag : str  "A" | "B" 만 허용 (규칙별 한도가 각각이므로)
+
+    Returns
+    -------
+    dict
+        {
+            "date":            "YYYY-MM-DD" (KST),
+            "rule_tag":        str,
+            "daily_trades":    int,
+            "accumulated_krw": int,
+            "by_ticker":       {ticker: 누적 KRW},
+            "by_sector":       {sector: 누적 KRW},  # sector 미기록은 "기타/미분류"
+            "usd_krw":         float | None,        # 환산에 쓴 환율 (미국 매수 없으면 None)
+        }
+        실패 시: {"error": "..."}
+
+    check_guardrails 연결 예시
+    --------------------------
+        stats = get_auto_trade_stats_today("A")
+        if "error" in stats:
+            ...  # 집계 실패 시 주문 진행 금지
+        result = check_guardrails(
+            ticker, order_amount_krw,
+            sector=sector,
+            accumulated_krw=stats["accumulated_krw"],
+            ticker_accumulated_krw=stats["by_ticker"].get(ticker, 0),
+            sector_accumulated_krw=stats["by_sector"].get(sector, 0),
+            daily_trades=stats["daily_trades"],
+        )
+    """
+    rule_tag = rule_tag.upper().strip()
+    if rule_tag not in ("A", "B"):
+        return {
+            "error": (
+                f"잘못된 rule_tag: '{rule_tag}'. "
+                "get_auto_trade_stats_today는 'A' 또는 'B'만 허용합니다."
+            )
+        }
+
+    # 오늘 날짜 (KST 기준) — check_guardrails와 같은 ZoneInfo 패턴
+    try:
+        from zoneinfo import ZoneInfo
+        kst = ZoneInfo("Asia/Seoul")
+    except ImportError:
+        from datetime import timezone as _tz, timedelta as _td
+        kst = _tz(_td(hours=9))
+    today_str = datetime.now(kst).strftime("%Y-%m-%d")
+
+    log = get_trade_log(rule_tag)
+    if "error" in log:
+        return log
+
+    todays = [
+        t for t in log["trades"]
+        if str(t.get("timestamp", "")).startswith(today_str)
+    ]
+    buys = [t for t in todays if t.get("side") == "BUY"]
+
+    # 미국 매수가 있으면 환율 필요 — 실패 시 근사치 대신 에러
+    usd_krw = None
+    if any(not _is_korean(str(t.get("ticker", ""))) for t in buys):
+        usd_krw = _fetch_usd_krw_rate()
+        if usd_krw is None:
+            return {
+                "error": (
+                    "오늘 미국 종목 매수 기록이 있는데 USD/KRW 환율 조회에 "
+                    "실패했습니다. 누적 금액을 정확히 계산할 수 없어 집계를 "
+                    "중단합니다. (가드레일 입력이 부정확하면 안 됨)"
+                )
+            }
+
+    accumulated_krw = 0
+    by_ticker: dict[str, int] = {}
+    by_sector: dict[str, int] = {}
+
+    for t in buys:
+        ticker = str(t.get("ticker", ""))
+        amount = t.get("qty", 0) * t.get("price", 0)
+        if not _is_korean(ticker):
+            amount *= usd_krw
+        amount = int(round(amount))
+
+        accumulated_krw += amount
+        by_ticker[ticker] = by_ticker.get(ticker, 0) + amount
+        sector = t.get("sector") or "기타/미분류"
+        by_sector[sector] = by_sector.get(sector, 0) + amount
+
+    return {
+        "date":            today_str,
+        "rule_tag":        rule_tag,
+        "daily_trades":    len(todays),
+        "accumulated_krw": accumulated_krw,
+        "by_ticker":       by_ticker,
+        "by_sector":       by_sector,
+        "usd_krw":         usd_krw,
+    }
+
+
 # ═══════════════════════════════════════════════
 # 직접 실행 테스트
 # ═══════════════════════════════════════════════
@@ -3401,8 +3556,9 @@ if __name__ == "__main__":
     print("="*55)
 
     # 시각 픽스처: 한국 장중(10:00) / 장 외(15:00)
-    _KR_INDAY  = datetime.now().replace(hour=10, minute=0, second=0, microsecond=0)
-    _KR_CLOSED = datetime.now().replace(hour=15, minute=0, second=0, microsecond=0)
+    # 날짜를 평일(월요일)로 고정 — 주말에 테스트를 돌려도 거래일 검사에 걸리지 않도록
+    _KR_INDAY  = datetime(2026, 7, 13, 10, 0)   # 2026-07-13(월) 10:00
+    _KR_CLOSED = datetime(2026, 7, 13, 15, 0)   # 2026-07-13(월) 15:00
 
     # ── 케이스 1: 모든 조건 통과 → "통과"
     _pp(

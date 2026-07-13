@@ -4,6 +4,7 @@ manager.py
 총괄 매니저 로직 및 실행 진입점(대화형 루프).
 """
 
+import json
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -17,6 +18,50 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 MODEL_NAME = "claude-sonnet-4-6"
 
 client = Anthropic(api_key=ANTHROPIC_API_KEY)
+
+# advisor가 내부에서 포트폴리오 진단·발굴을 이미 수행하므로 동시 호출 시 제거
+_ADVISOR_CONFLICTS = {"call_screener_employee", "call_portfolio_employee"}
+
+
+def _block_signature(block) -> tuple:
+    """직원 호출 블록의 중복 판단 키: (직원 이름, 지시 내용 직렬화)."""
+    return (block.name, json.dumps(block.input, sort_keys=True, ensure_ascii=False))
+
+
+def _dedupe_tool_blocks(tool_blocks, called_signatures: set) -> tuple[list, list]:
+    """
+    직원 호출 블록에서 중복·충돌을 제거한다. (순수 함수 — API 호출 없음)
+
+    - 중복 기준은 "이름 + 지시 내용(input)" 시그니처다. 같은 직원이라도
+      지시가 다르면 허용한다 (예: 삼성전자 뉴스 + SK하이닉스 뉴스).
+    - called_signatures: 이전 라운드에서 이미 실행된 시그니처 집합.
+      같은 라운드 내 중복과 라운드 간 중복을 모두 걸러낸다.
+    - advisor 충돌: call_advisor_employee가 있으면 screener/portfolio는
+      advisor가 내부에서 같은 작업을 수행하므로 제거한다.
+
+    Returns
+    -------
+    (active_blocks, skipped_blocks)
+    """
+    active_blocks: list = []
+    skipped_blocks: list = []
+    seen_this_round: set = set()
+
+    for b in tool_blocks:
+        sig = _block_signature(b)
+        if sig in seen_this_round or sig in called_signatures:
+            skipped_blocks.append(b)
+        else:
+            seen_this_round.add(sig)
+            active_blocks.append(b)
+
+    if any(b.name == "call_advisor_employee" for b in active_blocks):
+        conflicting = [b for b in active_blocks if b.name in _ADVISOR_CONFLICTS]
+        if conflicting:
+            active_blocks = [b for b in active_blocks if b.name not in _ADVISOR_CONFLICTS]
+            skipped_blocks.extend(conflicting)
+
+    return active_blocks, skipped_blocks
 
 
 def manager(user_input: str, history: list = None, status_callback=None) -> str:
@@ -51,7 +96,8 @@ def manager(user_input: str, history: list = None, status_callback=None) -> str:
         "   ⚠️ **call_advisor_employee를 호출하면 call_screener_employee와 call_portfolio_employee는 절대 추가로 부르지 마세요.**\n"
         "     advisor_employee가 내부적으로 포트폴리오 진단(현황·섹터 분석)과 발굴(KR 50종목 + US 100종목)을 이미 수행합니다.\n"
         "     screener/portfolio를 중복 호출하면 같은 작업이 두 번 돌아 시간이 낭비됩니다.\n"
-        "   ⚠️ **같은 직원을 한 번의 답변에서 두 번 이상 호출하지 마세요.** (중복 호출 금지)\n"
+        "   ⚠️ **같은 직원을 완전히 같은 지시로 두 번 이상 호출하지 마세요.** (중복 호출 금지 — "
+        "단, 다른 종목·다른 지시라면 같은 직원을 다시 호출해도 됩니다. 예: 삼성전자 뉴스 후 SK하이닉스 뉴스)\n"
         "3. **리스크 검수**: 분석, 비교, 매수 판단 등이 포함된 복합 질문의 경우 여러 분석 직원을 부르게 됩니다. "
         "분석 직원의 결과를 받은 후에는 반드시 그 결과들을 모아 `call_risk_review_employee`를 마지막에 호출하여 "
         "환각이나 숫자 충돌이 없는지, 위험한 주장이 없는지 검증받으세요. 단순 시세 조회라면 생략해도 무방합니다.\n"
@@ -189,7 +235,9 @@ def manager(user_input: str, history: list = None, status_callback=None) -> str:
         messages.extend(history)
     messages.append({"role": "user", "content": user_input})
 
-    called_employees: set = set()  # 이 대화 전체에서 실행된 직원 (라운드 간 중복 방지)
+    # 이 대화 전체에서 실행된 (직원 이름, 지시 내용) 시그니처 — 라운드 간 중복 방지
+    # 이름만이 아니라 지시 내용까지 봐야 "같은 직원, 다른 종목" 호출이 허용된다.
+    called_signatures: set = set()
 
     while True:
         response = client.messages.create(
@@ -206,32 +254,18 @@ def manager(user_input: str, history: list = None, status_callback=None) -> str:
             tool_blocks = [b for b in response.content if b.type == "tool_use"]
 
             # ── 중복·충돌 제거 ──────────────────────────────────────────
-            # 1. 같은 직원을 이번 라운드에서 두 번 부르거나 이전 라운드에서 이미 실행된 경우 → skip
-            seen_this_round: set = set()
-            active_blocks = []
-            skipped_blocks = []
-            for b in tool_blocks:
-                if b.name not in seen_this_round and b.name not in called_employees:
-                    seen_this_round.add(b.name)
-                    active_blocks.append(b)
-                else:
-                    skipped_blocks.append(b)
-                    if b.name in called_employees:
-                        print(f"\n[Manager] ⚠️ 라운드 간 중복 제거: {b.name} (이전 라운드에서 이미 실행됨)")
-                    else:
-                        print(f"\n[Manager] ⚠️ 라운드 내 중복 제거: {b.name} (이 라운드에서 이미 호출됨)")
+            # 판단 기준: (직원 이름 + 지시 내용) 시그니처. 지시가 다르면 같은
+            # 직원도 허용. advisor 충돌(screener/portfolio) 제거 포함.
+            active_blocks, skipped_blocks = _dedupe_tool_blocks(tool_blocks, called_signatures)
 
-            # 2. advisor_employee가 있으면 screener_employee + portfolio_employee 제거
-            #    (advisor가 내부에서 포트폴리오 진단 + KR50+US100 발굴을 이미 수행)
-            if "call_advisor_employee" in seen_this_round:
-                ADVISOR_CONFLICTS = {"call_screener_employee", "call_portfolio_employee"}
-                conflicting = [b for b in active_blocks if b.name in ADVISOR_CONFLICTS]
-                if conflicting:
-                    active_blocks = [b for b in active_blocks if b.name not in ADVISOR_CONFLICTS]
-                    skipped_blocks.extend(conflicting)
-                    for c in conflicting:
-                        print(f"\n[Manager] ⚠️ advisor 중복 제거: {c.name} 건너뜀 "
-                              f"(advisor가 내부에서 포트폴리오 진단·발굴 수행)")
+            advisor_called = any(b.name == "call_advisor_employee" for b in active_blocks)
+            for b in skipped_blocks:
+                if advisor_called and b.name in _ADVISOR_CONFLICTS:
+                    print(f"\n[Manager] ⚠️ advisor 중복 제거: {b.name} 건너뜀 "
+                          f"(advisor가 내부에서 포트폴리오 진단·발굴 수행)")
+                else:
+                    print(f"\n[Manager] ⚠️ 중복 호출 제거: {b.name} 건너뜀 "
+                          f"(같은 지시로 이미 호출됨)")
 
             # skip된 block에 더미 결과 반환 (API는 모든 tool_use_id에 결과를 요구함)
             tool_results = [
@@ -287,9 +321,9 @@ def manager(user_input: str, history: list = None, status_callback=None) -> str:
             for block in risk_blocks:
                 tool_results.append(execute_block(block, notify=True))
 
-            # 이번 라운드에서 실제 실행된 직원을 전체 추적 집합에 등록
-            called_employees.update(b.name for b in active_blocks)
-            called_employees.update(b.name for b in risk_blocks)
+            # 이번 라운드에서 실제 실행된 호출 시그니처를 전체 추적 집합에 등록
+            # (risk_blocks는 active_blocks의 부분집합이므로 한 번에 처리)
+            called_signatures.update(_block_signature(b) for b in active_blocks)
 
             messages.append({"role": "user", "content": tool_results})
             
