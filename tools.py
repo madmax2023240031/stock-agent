@@ -2998,9 +2998,8 @@ def check_guardrails(
 
     검사 순서 (하나라도 차단되면 즉시 반환)
     ----------------------------------------
-    0. 거래일     : 주말이면 차단. US는 새벽 구간(~01:30)이면 전날 밤에
-                    시작된 세션이므로 전날 요일 기준으로 판단.
-    1. 거래시간   : KR 09:00~12:00 / US 22:30~01:30 (KST)
+    0. 거래일     : 주말이면 차단. US는 뉴욕 현지 날짜 기준으로 판단.
+    1. 거래시간   : KR 09:00~12:00 (KST) / US 09:30~12:30 (뉴욕 현지시간 — 서머타임 자동 반영)
     2. 자동매매한도: 누적 + 이번 ≤ 3,000만 원
     3. 1종목비중  : 이 종목 누적 + 이번 ≤ 한도의 20% (600만 원)
     4. 1섹터비중  : 이 섹터 누적 + 이번 ≤ 한도의 40% (1,200만 원)
@@ -3033,8 +3032,10 @@ def check_guardrails(
     # 거래 허용 시간 (한국시간 기준, 장 초반 3시간)
     KR_OPEN  = _time(9,  0)    # 한국장 시작
     KR_CLOSE = _time(12, 0)    # 한국장 검사 종료
-    US_OPEN  = _time(22, 30)   # 미국장 시작 (KST) ⚠️ 서머타임 해제 기간(11~3월)에는 실제 개장이 23:30 — 조립 전 처리 필요
-    US_CLOSE = _time(1,  30)   # 미국장 종료 (KST, 다음날 새벽)
+    # 미국장은 뉴욕 현지시간으로 직접 판정한다 — 서머타임 자동 반영.
+    # KST 환산: 서머타임 기간 22:30~01:30 / 해제 기간 23:30~02:30
+    US_OPEN_NY  = _time(9, 30)    # 미국장 시작 (뉴욕 현지시간)
+    US_CLOSE_NY = _time(12, 30)   # 미국장 검사 종료 (뉴욕 현지시간, 장 초반 3시간)
 
     # ── 파생 상수 ──────────────────────────────────────────────────
     TICKER_LIMIT_KRW = LIMIT_KRW * TICKER_WEIGHT_PCT // 100   # 6,000,000
@@ -3069,6 +3070,21 @@ def check_guardrails(
         now_dt = now.astimezone(kst)       # tz 포함 → KST로 변환
     now_t = now_dt.time()
 
+    # US: 뉴욕 현지시간으로 변환 (서머타임 자동 반영).
+    # 시간대 로드에 실패하면 근사치로 판정하지 않고 중단한다 (fail-safe).
+    now_ny = None
+    if market == "US":
+        try:
+            from zoneinfo import ZoneInfo
+            now_ny = now_dt.astimezone(ZoneInfo("America/New_York"))
+        except Exception as e:
+            return {
+                "error": (
+                    "미국 동부 시간대(America/New_York) 로드에 실패했습니다. "
+                    f"근사치로 거래시간을 판정할 수 없어 중단합니다: {e}"
+                )
+            }
+
     checks: list[dict] = []
 
     def _check(name: str, passed: bool, detail: str) -> bool:
@@ -3079,17 +3095,14 @@ def check_guardrails(
         return {"passed": False, "blocked_by": by, "reason": reason, "checks": checks}
 
     # ── 0. 거래일 (주말 차단) ────────────────────────────────────
-    if market == "KR":
-        session_day = now_dt
-    else:
-        # US: 새벽 구간(now_t ≤ US_CLOSE)은 전날 밤에 시작된 세션 → 전날 요일 기준
-        session_day = now_dt - timedelta(days=1) if now_t <= US_CLOSE else now_dt
+    # US는 뉴욕 현지 날짜 기준으로 판단 (KST 새벽이라도 뉴욕은 전날 낮)
+    session_day = now_dt if market == "KR" else now_ny
     _WEEKDAY_KO = ["월", "화", "수", "목", "금", "토", "일"]
     session_weekday = session_day.weekday()   # 0=월, 6=일
     is_trading_day  = session_weekday < 5
     detail = (
         f"세션 기준일 {session_day.strftime('%Y-%m-%d')}"
-        f"({_WEEKDAY_KO[session_weekday]}) — "
+        f"({_WEEKDAY_KO[session_weekday]}{', 뉴욕 현지' if market == 'US' else ''}) — "
         f"{'거래일(월~금)' if is_trading_day else '주말'}"
     )
     if not _check("거래일", is_trading_day, detail):
@@ -3103,12 +3116,13 @@ def check_guardrails(
             f"(허용: {KR_OPEN.strftime('%H:%M')}~{KR_CLOSE.strftime('%H:%M')} KST, "
             f"현재: {now_t.strftime('%H:%M')})"
         )
-    else:  # US — 22:30 이후 또는 01:30 이전 (자정 경계 포함)
-        in_hours = now_t >= US_OPEN or now_t <= US_CLOSE
+    else:  # US — 뉴욕 현지시간 기준 (서머타임 자동 반영)
+        ny_t = now_ny.time()
+        in_hours = US_OPEN_NY <= ny_t <= US_CLOSE_NY
         detail = (
             f"미국장 허용 시간{'내' if in_hours else '외'} "
-            f"(허용: {US_OPEN.strftime('%H:%M')}~익일 {US_CLOSE.strftime('%H:%M')} KST, "
-            f"현재: {now_t.strftime('%H:%M')})"
+            f"(허용: {US_OPEN_NY.strftime('%H:%M')}~{US_CLOSE_NY.strftime('%H:%M')} 뉴욕 현지시간, "
+            f"현재: 뉴욕 {ny_t.strftime('%H:%M')} / KST {now_t.strftime('%H:%M')})"
         )
     if not _check("거래시간", in_hours, detail):
         return _block("거래시간", detail)
@@ -3556,7 +3570,7 @@ if __name__ == "__main__":
 
     # ── 가드레일 검사 테스트 ──────────────────────────────────────
     print("\n" + "="*55)
-    print("  🛡  check_guardrails 테스트 (4가지 케이스)")
+    print("  🛡  check_guardrails 테스트 (8가지 케이스)")
     print("="*55)
 
     # 시각 픽스처: 한국 장중(10:00) / 장 외(15:00)
@@ -3619,6 +3633,44 @@ if __name__ == "__main__":
             daily_pnl_pct=-5.2,
             cumulative_pnl_pct=-3.0,
             now=_KR_INDAY,
+        )
+    )
+
+    # ── 케이스 5: 미국장 서머타임 기간 — KST 23:00 = 뉴욕 월 10:00 → 통과
+    _pp(
+        "케이스 5 — US 서머타임(KST 2026-07-13 23:00 = 뉴욕 월 10:00) → 통과",
+        check_guardrails(
+            "AAPL", 1_000_000,
+            now=datetime(2026, 7, 13, 23, 0),
+        )
+    )
+
+    # ── 케이스 6: 서머타임 해제 기간 — KST 22:50 = 뉴욕 08:50 (개장 전) → 차단
+    # 구 코드(KST 22:30 고정)였다면 통과됐을 시각
+    _pp(
+        "케이스 6 — US 서머타임 해제(KST 2026-01-12 22:50 = 뉴욕 08:50 개장 전) → 차단",
+        check_guardrails(
+            "AAPL", 1_000_000,
+            now=datetime(2026, 1, 12, 22, 50),
+        )
+    )
+
+    # ── 케이스 7: 서머타임 해제 기간 — KST 23:40 = 뉴욕 09:40 → 통과
+    _pp(
+        "케이스 7 — US 서머타임 해제(KST 2026-01-12 23:40 = 뉴욕 09:40) → 통과",
+        check_guardrails(
+            "AAPL", 1_000_000,
+            now=datetime(2026, 1, 12, 23, 40),
+        )
+    )
+
+    # ── 케이스 8: KST 토요일 새벽이지만 뉴욕은 금 11:30 → 통과
+    # 세션 기준일이 2026-07-17(금, 뉴욕 현지)로 표시돼야 함
+    _pp(
+        "케이스 8 — KST 토 00:30 = 뉴욕 금 11:30 (세션 기준일 금요일) → 통과",
+        check_guardrails(
+            "AAPL", 1_000_000,
+            now=datetime(2026, 7, 18, 0, 30),
         )
     )
 
