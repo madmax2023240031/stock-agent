@@ -35,7 +35,8 @@ _BASE_DIR = Path(__file__).resolve().parent
 
 # ── 거래 로그 ─────────────────────────────────────────────────
 TRADE_LOG_PATH = str(_BASE_DIR / "trade_log.json")
-_VALID_RULE_TAGS = {"A", "B", "MANUAL"}
+# A=매수규칙A(점수집중) / B=매수규칙B(분산채우기) / MANUAL=사람 직접 / SELL=매도규칙 자동매도(손절/익절)
+_VALID_RULE_TAGS = {"A", "B", "MANUAL", "SELL"}
 
 
 # ═══════════════════════════════════════════════
@@ -3200,7 +3201,8 @@ def log_trade(
 
     Parameters
     ----------
-    rule_tag : str   "A" | "B" | "MANUAL"
+    rule_tag : str   "A" | "B" | "MANUAL" | "SELL"
+                     (SELL = 매도 규칙의 자동 매도 기록 전용)
     ticker   : str   종목코드 (한국 6자리 / 미국 티커)
     side     : str   "BUY" | "SELL"
     qty      : int   수량 (1 이상)
@@ -3270,7 +3272,7 @@ def get_trade_log(rule_tag: str | None = None) -> dict:
     ----------
     rule_tag : str | None
         None이면 전체, 지정하면 해당 규칙 것만 필터링.
-        허용값: "A" | "B" | "MANUAL"
+        허용값: "A" | "B" | "MANUAL" | "SELL"
 
     Returns
     -------
@@ -3516,7 +3518,7 @@ if __name__ == "__main__":
             os.remove(TRADE_LOG_PATH)
             print(f"\n[초기화] 기존 {TRADE_LOG_PATH} 삭제")
 
-        # 1) 로그 기록 4건
+        # 1) 로그 기록 5건
         _pp("log_trade A/매수 — 삼성전자",
             log_trade("A", "005930", "BUY", 5, 75000, "Rule A: RSI 저점, 점수 8/10"))
         _pp("log_trade A/매수 — AAPL",
@@ -3525,9 +3527,11 @@ if __name__ == "__main__":
             log_trade("B", "000660", "BUY", 3, 180000, "Rule B: 반도체 섹터 비중 부족"))
         _pp("log_trade MANUAL/매수 — MSFT",
             log_trade("MANUAL", "MSFT", "BUY", 1, 440.0, "추천 직원 제안 — AI 섹터 보강"))
+        _pp("log_trade SELL/매도 — 삼성전자 (손절 시나리오)",
+            log_trade("SELL", "005930", "SELL", 5, 67500, "매도 규칙: 손절 -10% 도달"))
 
         # 2) 전체 조회
-        _pp("get_trade_log() — 전체 (4건 기대)", get_trade_log())
+        _pp("get_trade_log() — 전체 (5건 기대)", get_trade_log())
 
         # 3) Rule A만 필터링
         _pp("get_trade_log('A') — Rule A만 (2건 기대)", get_trade_log("A"))
