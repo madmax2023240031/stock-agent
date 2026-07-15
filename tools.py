@@ -150,7 +150,7 @@ _KIS_TOKEN_BUFFER_SEC = 600   # 만료 10분 전에 갱신 트리거
 
 # ── place_kis_order 안전장치 상수 ──────────────────────────────
 _KIS_MOCK_ACCOUNT   = "50193730-01"   # 허용된 모의투자 계좌 (하드코딩)
-_KIS_ORDER_LIMIT_KRW = 1_000_000      # 1회 주문 금액 상한 (100만 원)
+_KIS_ORDER_LIMIT_KRW = 1_000_000      # 1회 매수 주문 금액 상한 (100만 원) — 매도는 제외 (결정 2)
 
 # 모의투자 tr_id (국내주식 주문)
 # ⚠️ 실전: TTTC0802U(매수) / TTTC0801U(매도) — 이 코드에서 절대 사용 금지
@@ -619,10 +619,11 @@ def place_kis_order(
     --------------------------------
     1. 허용 계좌: _KIS_MOCK_ACCOUNT(50193730-01)만 허용.
        환경변수 계좌가 다르면 즉시 거부.
-    2. 주문 금액 상한: 1회 ≤ 100만 원.
+    2. 주문 금액 상한: 매수(BUY) 1회 ≤ 100만 원. 매도(SELL)는 상한 제외
+       (결정 2 — 매도는 리스크 축소 행위). 금액 계산·기록은 매도도 수행.
        - 지정가: price × qty
        - 시장가: get_quote() 현재가 × qty (근사)
-       초과 시 즉시 거부.
+       매수 상한 초과 시 즉시 거부.
 
     Returns
     -------
@@ -695,10 +696,10 @@ def place_kis_order(
         estimated_amount = int(current_price) * qty
         price_source     = f"현재가 근사({int(current_price):,}원)"
 
-    if estimated_amount > _KIS_ORDER_LIMIT_KRW:
+    if side == "BUY" and estimated_amount > _KIS_ORDER_LIMIT_KRW:
         return {
             "error": (
-                f"주문 금액 상한 초과 — 상한: {_KIS_ORDER_LIMIT_KRW:,}원, "
+                f"주문 금액 상한 초과 — 상한: {_KIS_ORDER_LIMIT_KRW:,}원 (매수 전용 상한 — 결정 2), "
                 f"예상 주문금액: {estimated_amount:,}원 "
                 f"({price_source} × {qty}주). "
                 "수량을 줄이거나 낮은 가격 종목을 선택해 주세요."
