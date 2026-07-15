@@ -3418,8 +3418,10 @@ def get_auto_trade_stats_today(rule_tag: str) -> dict:
     ---------
     - "오늘" 판단은 KST 기준 날짜다 (timestamp가 오늘 날짜로 시작하는 기록만).
     - daily_trades    : 오늘 이 규칙의 거래 횟수 (BUY + SELL 모두).
-    - accumulated_krw : 오늘 이 규칙의 매수(BUY)만 qty × price 합산.
-                        한도는 "산 금액" 기준이므로 매도는 제외한다.
+    - accumulated_krw : rule_tag가 "A"/"B"면 매수(BUY)만 qty × price 합산
+                        (가드레일 한도는 "산 금액" 기준이므로 매도는 제외).
+                        rule_tag가 "SELL"이면 매도(SELL)만 합산
+                        (감시·기록용 — 횟수 상한에는 미사용, 로드맵 설계 결정 1 참조).
     - 미국 종목(6자리 코드가 아닌 티커)의 price는 USD이므로
       _fetch_usd_krw_rate()로 KRW 환산한다. 오늘 미국 매수가 있는데
       환율 조회가 실패하면 근사치를 쓰지 않고 {"error": "..."}를 반환한다
@@ -3427,7 +3429,7 @@ def get_auto_trade_stats_today(rule_tag: str) -> dict:
 
     Parameters
     ----------
-    rule_tag : str  "A" | "B" 만 허용 (규칙별 한도가 각각이므로)
+    rule_tag : str  "A" | "B" | "SELL" 만 허용 (규칙별 한도가 각각이므로)
 
     Returns
     -------
@@ -3458,11 +3460,11 @@ def get_auto_trade_stats_today(rule_tag: str) -> dict:
         )
     """
     rule_tag = rule_tag.upper().strip()
-    if rule_tag not in ("A", "B"):
+    if rule_tag not in ("A", "B", "SELL"):
         return {
             "error": (
                 f"잘못된 rule_tag: '{rule_tag}'. "
-                "get_auto_trade_stats_today는 'A' 또는 'B'만 허용합니다."
+                "get_auto_trade_stats_today는 'A', 'B', 'SELL'만 허용합니다."
             )
         }
 
@@ -3483,11 +3485,12 @@ def get_auto_trade_stats_today(rule_tag: str) -> dict:
         t for t in log["trades"]
         if str(t.get("timestamp", "")).startswith(today_str)
     ]
-    buys = [t for t in todays if t.get("side") == "BUY"]
+    target_side = "SELL" if rule_tag == "SELL" else "BUY"
+    trades_to_sum = [t for t in todays if t.get("side") == target_side]
 
-    # 미국 매수가 있으면 환율 필요 — 실패 시 근사치 대신 에러
+    # 미국 거래가 있으면 환율 필요 — 실패 시 근사치 대신 에러
     usd_krw = None
-    if any(not _is_korean(str(t.get("ticker", ""))) for t in buys):
+    if any(not _is_korean(str(t.get("ticker", ""))) for t in trades_to_sum):
         usd_krw = _fetch_usd_krw_rate()
         if usd_krw is None:
             return {
@@ -3502,7 +3505,7 @@ def get_auto_trade_stats_today(rule_tag: str) -> dict:
     by_ticker: dict[str, int] = {}
     by_sector: dict[str, int] = {}
 
-    for t in buys:
+    for t in trades_to_sum:
         ticker = str(t.get("ticker", ""))
         amount = t.get("qty", 0) * t.get("price", 0)
         if not _is_korean(ticker):
