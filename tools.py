@@ -2987,10 +2987,11 @@ def check_guardrails(
     order_amount_krw       : int   이번 주문 금액 (원화 기준)
     market                 : str   "KR" | "US" | None — None이면 ticker에서 자동 감지
     sector                 : str   섹터명. 없으면 섹터 비중 검사를 건너뜀.
-    accumulated_krw        : int   오늘 자동매매 누적 금액 (이번 주문 제외, 원화)
-    ticker_accumulated_krw : int   이 종목의 오늘 누적 자동매매 금액 (이번 주문 제외)
-    sector_accumulated_krw : int   이 섹터의 오늘 누적 자동매매 금액 (이번 주문 제외)
-    daily_trades           : int   오늘 거래 횟수 (이번 주문 제외)
+    accumulated_krw        : int   해당 규칙의 오늘 누적 매수 금액(규칙별, 이번 주문 제외, 원화)
+                                   — 결정 3: 금액 한도는 규칙별로 각각 적용
+    ticker_accumulated_krw : int   해당 규칙의 이 종목 오늘 누적 매수 금액(규칙별, 이번 주문 제외)
+    sector_accumulated_krw : int   해당 규칙의 이 섹터 오늘 누적 매수 금액(규칙별, 이번 주문 제외)
+    daily_trades           : int   오늘 매수 주문 횟수 (A+B 합산 — 결정 1, 이번 주문 제외)
     daily_pnl_pct          : float 오늘 자동매매 손익률 (%)
     cumulative_pnl_pct     : float 누적 손익률 (%)
     now                    : datetime  테스트용 시각 주입. None이면 KST 현재 시각 사용.
@@ -3022,7 +3023,7 @@ def check_guardrails(
     from datetime import time as _time
 
     # ── 임계값 상수 ────────────────────────────────────────────────
-    LIMIT_KRW           = 30_000_000   # 자동매매 규칙별 총 한도 (3,000만 원)
+    LIMIT_KRW           = 30_000_000   # 자동매매 규칙별 한도 (3,000만 원 — 결정 3: 금액은 규칙별, 횟수만 A+B 합산)
     TICKER_WEIGHT_PCT   = 20           # 1종목 최대 비중 (%)
     SECTOR_WEIGHT_PCT   = 40           # 1섹터 최대 비중 (%)
     MAX_DAILY_TRADES    = 5            # 하루 최대 거래 횟수
@@ -3418,6 +3419,7 @@ def get_auto_trade_stats_today(rule_tag: str) -> dict:
     ---------
     - "오늘" 판단은 KST 기준 날짜다 (timestamp가 오늘 날짜로 시작하는 기록만).
     - daily_trades    : 오늘 이 규칙의 거래 횟수 (BUY + SELL 모두).
+    - daily_buy_trades: 매수 횟수만, 일 5회 상한 입력용 (설계 결정 1).
     - accumulated_krw : rule_tag가 "A"/"B"면 매수(BUY)만 qty × price 합산
                         (가드레일 한도는 "산 금액" 기준이므로 매도는 제외).
                         rule_tag가 "SELL"이면 매도(SELL)만 합산
@@ -3521,10 +3523,75 @@ def get_auto_trade_stats_today(rule_tag: str) -> dict:
         "date":            today_str,
         "rule_tag":        rule_tag,
         "daily_trades":    len(todays),
+        "daily_buy_trades": sum(1 for t in todays if t.get("side") == "BUY"),
         "accumulated_krw": accumulated_krw,
         "by_ticker":       by_ticker,
         "by_sector":       by_sector,
         "usd_krw":         usd_krw,
+    }
+
+
+def get_combined_auto_trade_stats_today() -> dict:
+    """
+    오늘(KST) 규칙 A와 B의 누적치를 합산해 반환한다. (읽기 전용)
+
+    가드레일 입력 사용 기준 (설계 결정 1·3)
+    ----------------------------------------
+    - 설계 결정 1: 하루 거래 횟수 상한(5회)은 "매수"만, A+B 합산으로 센다
+      → 가드레일 daily_trades 입력은 이 함수의 daily_buy_trades(합산)를 쓴다.
+    - 설계 결정 3: 금액 한도(총 3,000만·종목 600만·섹터 1,200만)는 규칙별로
+      각각 적용한다 (로드맵 자금 배분: 규칙별 각 3,000만, A+B 총 6,000만)
+      → 가드레일 금액 입력(accumulated_krw 등)은 per_rule[rule_tag]에서 가져온다.
+    - 최상위 합산치(accumulated_krw·by_ticker·by_sector)는 감시·기록용이다.
+      가드레일 금액 입력으로 쓰지 않는다 (쓰면 A/B가 예산 경쟁을 해 실험이 깨짐).
+
+    조립 계층(auto_trader.py)에서 A·B를 각각 집계해 손으로 더하다
+    실수하는 것을 막기 위한 함수다. 주문 코드 없음.
+
+    fail-safe: A와 B 중 한쪽이라도 집계에 실패하면 합산을 중단하고
+    {"error": "..."}를 반환한다 (부정확한 가드레일 입력 금지).
+
+    Returns
+    -------
+    dict
+        {
+            "date":             "YYYY-MM-DD" (KST),
+            "rule_tag":         "A+B",
+            "daily_buy_trades": int,                 # A+B 매수 횟수 합
+            "accumulated_krw":  int,                 # A+B 매수 금액 합
+            "by_ticker":        {ticker: 누적 KRW},  # 키별 병합 합산
+            "by_sector":        {sector: 누적 KRW},  # 키별 병합 합산
+            "usd_krw":          float | None,        # A 우선, 없으면 B
+            "per_rule":         {"A": 원본 dict, "B": 원본 dict},
+        }
+        실패 시: {"error": "..."}
+    """
+    per_rule = {}
+    for tag in ("A", "B"):
+        stats = get_auto_trade_stats_today(tag)
+        if "error" in stats:
+            return {"error": f"규칙 {tag} 집계 실패 → 합산 중단: {stats['error']}"}
+        per_rule[tag] = stats
+
+    a, b = per_rule["A"], per_rule["B"]
+
+    by_ticker: dict[str, int] = dict(a["by_ticker"])
+    for ticker, amount in b["by_ticker"].items():
+        by_ticker[ticker] = by_ticker.get(ticker, 0) + amount
+
+    by_sector: dict[str, int] = dict(a["by_sector"])
+    for sector, amount in b["by_sector"].items():
+        by_sector[sector] = by_sector.get(sector, 0) + amount
+
+    return {
+        "date":             a["date"],
+        "rule_tag":         "A+B",
+        "daily_buy_trades": a["daily_buy_trades"] + b["daily_buy_trades"],
+        "accumulated_krw":  a["accumulated_krw"] + b["accumulated_krw"],
+        "by_ticker":        by_ticker,
+        "by_sector":        by_sector,
+        "usd_krw":          a["usd_krw"] if a["usd_krw"] is not None else b["usd_krw"],
+        "per_rule":         per_rule,
     }
 
 

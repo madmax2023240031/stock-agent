@@ -7,7 +7,7 @@ tools.py에 이미 만들어진 부품들을 **순서대로 연결만** 한다. 
 
     매수 파이프라인 (규칙 A / B):
         evaluate_buy_rule_A/B  →  get_quote(가격)  →  size_buy_order(수량 환산)
-        →  get_auto_trade_stats_today + check_guardrails(가드레일)
+        →  get_combined_auto_trade_stats_today + check_guardrails(가드레일)
         →  place_kis_order(dry_run=True, 주문서만)  →  dry-run 로그 기록
 
     매도 파이프라인 (규칙 SELL — 손절 -10% / 익절 +20%):
@@ -58,7 +58,7 @@ from tools import (
     evaluate_buy_rule_A,
     evaluate_buy_rule_B,
     evaluate_sell_rules,
-    get_auto_trade_stats_today,
+    get_combined_auto_trade_stats_today,
     get_kis_balance,
     get_quote,
     place_kis_order,
@@ -274,7 +274,9 @@ def run_buy_rule(
         return {"run_id": run_id, "drafted": 0, "records": 1, "note": "후보 없음"}
 
     # ── 2. 오늘 누적치 집계 (가드레일 입력 — 손 계산 금지) ──────
-    stats = get_auto_trade_stats_today(rule_tag)
+    # 설계 결정 1·3: 하루 거래 횟수(매수만)는 A+B 합산, 금액 한도는 규칙별.
+    # 합산 집계 함수 하나로 둘 다 얻는다 (합산 횟수 + per_rule 금액).
+    stats = get_combined_auto_trade_stats_today()
     if "error" in stats:
         # fail-safe: 가드레일 입력을 못 구하면 진행하지 않는다.
         entry = _make_entry(run_id, rule_tag, "ERROR",
@@ -282,6 +284,7 @@ def run_buy_rule(
                             test_now=test_now)
         _append_dryrun_log(entry)
         return {"run_id": run_id, "error": stats["error"]}
+    rule_stats = stats["per_rule"][rule_tag]
 
     # 이번 실행(세션) 안에서 통과한 주문서 금액도 누적에 더한다.
     # (dry-run이라 trade_log에 없으므로 — 같은 실행 내 중복 초과를 막기 위한 산수)
@@ -336,15 +339,16 @@ def run_buy_rule(
         order_amount = int(qty * price)
 
         # ── 5. 가드레일 검사 (오늘 누적 + 이번 세션 누적) ───────
+        # 결정 3 — 횟수는 A+B 합산, 금액 한도는 규칙별(자금 배분 계획)
         gr = check_guardrails(
             ticker, order_amount,
             sector=sector,
-            accumulated_krw=stats["accumulated_krw"] + session_accum,
-            ticker_accumulated_krw=stats["by_ticker"].get(ticker, 0)
+            accumulated_krw=rule_stats["accumulated_krw"] + session_accum,
+            ticker_accumulated_krw=rule_stats["by_ticker"].get(ticker, 0)
                                    + session_by_ticker.get(ticker, 0),
-            sector_accumulated_krw=stats["by_sector"].get(sector, 0)
+            sector_accumulated_krw=rule_stats["by_sector"].get(sector, 0)
                                    + session_by_sector.get(sector, 0),
-            daily_trades=stats["daily_trades"] + session_trades,
+            daily_trades=stats["daily_buy_trades"] + session_trades,
             now=now_inject,
         )
         if "error" in gr:
@@ -475,7 +479,8 @@ def run_sell_rule(test_now: str | None = None) -> dict:
             accumulated_krw=0,
             ticker_accumulated_krw=0,
             sector_accumulated_krw=0,
-            daily_trades=session_trades,
+            # 설계 결정 1: 매도는 하루 5회 상한 제외 (리스크 축소 행위)
+            daily_trades=0,
             now=now_inject,
         )
         if "error" in gr:
