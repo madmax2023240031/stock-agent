@@ -222,7 +222,13 @@ def _parse_test_now(s: str | None) -> datetime | None:
     """--test-now "YYYY-MM-DDTHH:MM" → naive datetime (check_guardrails가 KST로 간주)."""
     if not s:
         return None
-    return datetime.fromisoformat(s)
+    try:
+        return datetime.fromisoformat(s)
+    except ValueError:
+        raise SystemExit(
+            f'--test-now 형식 오류: "{s}" — "YYYY-MM-DDTHH:MM" 형식으로 입력하세요 '
+            f'(예: --test-now "2026-07-15T10:00")'
+        )
 
 
 # ═══════════════════════════════════════════════

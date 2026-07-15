@@ -70,6 +70,7 @@ def manager(user_input: str, history: list = None, status_callback=None) -> str:
     history: 이전 대화 내역 (role: user/assistant 형태의 딕셔너리 리스트)
     status_callback: 직원 호출 시 진행 상황을 알리기 위한 콜백 함수
     """
+    MAX_ROUNDS = 10  # 도구 호출 라운드 상한 — 비용 폭주 방지
     system_prompt = (
         "당신은 주식 멀티 에이전트 시스템의 '총괄 매니저'입니다.\n"
         "사용자의 질문을 분석하고 필요한 전담 직원(도구)들을 호출하여 답변을 작성하세요.\n\n"
@@ -239,7 +240,7 @@ def manager(user_input: str, history: list = None, status_callback=None) -> str:
     # 이름만이 아니라 지시 내용까지 봐야 "같은 직원, 다른 종목" 호출이 허용된다.
     called_signatures: set = set()
 
-    while True:
+    for _round in range(MAX_ROUNDS):
         response = client.messages.create(
             model=MODEL_NAME,
             max_tokens=4096,
@@ -247,7 +248,7 @@ def manager(user_input: str, history: list = None, status_callback=None) -> str:
             messages=messages,
             tools=tools_list
         )
-        
+
         messages.append({"role": "assistant", "content": response.content})
         
         if response.stop_reason == "tool_use":
@@ -334,6 +335,26 @@ def manager(user_input: str, history: list = None, status_callback=None) -> str:
             return final_text
         else:
             return f"예상치 못한 stop_reason: {response.stop_reason}"
+
+    # ── 라운드 상한 도달: 도구 없이 마지막 1회 호출로 최종 답변 생성 ──
+    print(f"\n[Manager] ⚠️ 도구 호출 라운드 상한({MAX_ROUNDS}회) 도달 — "
+          f"수집된 정보만으로 최종 답변을 생성합니다.")
+    messages.append({
+        "role": "user",
+        "content": (
+            "도구 호출 라운드 상한에 도달했습니다. 더 이상 직원을 호출하지 말고, "
+            "지금까지 수집된 정보만으로 최종 답변을 작성하세요."
+        ),
+    })
+    response = client.messages.create(
+        model=MODEL_NAME,
+        max_tokens=4096,
+        system=system_prompt,
+        messages=messages,
+    )
+    return "\n".join(
+        block.text for block in response.content if block.type == "text"
+    )
 
 
 if __name__ == "__main__":

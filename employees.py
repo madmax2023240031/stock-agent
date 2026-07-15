@@ -21,14 +21,15 @@ client = Anthropic(api_key=ANTHROPIC_API_KEY)
 
 
 def _run_agent(system_prompt: str, tools_list: list, tool_map: dict, task: str,
-               max_tokens: int = 2048) -> str:
+               max_tokens: int = 2048, max_rounds: int = 8) -> str:
     """
     Claude API의 Tool Use(Function Calling) 루프를 처리하는 공통 함수.
     stop_reason이 'tool_use'인 경우 도구를 실행하고 결과를 다시 전달한다.
+    max_rounds: 도구 호출 라운드 상한 — 비용 폭주 방지.
     """
     messages = [{"role": "user", "content": task}]
 
-    while True:
+    for _round in range(max_rounds):
         response = client.messages.create(
             model=MODEL_NAME,
             max_tokens=max_tokens,
@@ -72,6 +73,27 @@ def _run_agent(system_prompt: str, tools_list: list, tool_map: dict, task: str,
             return final_text
         else:
             return f"예상치 못한 stop_reason: {response.stop_reason}"
+
+    # ── 라운드 상한 도달: 도구 없이 마지막 1회 호출로 부분 결과라도 보고 ──
+    print(f"\n[Employee] ⚠️ 도구 호출 라운드 상한({max_rounds}회) 도달 — "
+          f"수집된 정보만으로 보고서를 작성합니다.")
+    messages.append({
+        "role": "user",
+        "content": (
+            "도구 호출 라운드 상한에 도달했습니다. 더 이상 도구를 호출하지 말고, "
+            "지금까지 수집된 정보만으로 최종 답변을 작성하세요."
+        ),
+    })
+    response = client.messages.create(
+        model=MODEL_NAME,
+        max_tokens=max_tokens,
+        system=system_prompt,
+        messages=messages,
+    )
+    final_text = "\n".join(
+        block.text for block in response.content if block.type == "text"
+    )
+    return "[⚠️ 도구 호출 상한 도달 — 부분 결과일 수 있음] " + final_text
 
 
 # ═══════════════════════════════════════════════
