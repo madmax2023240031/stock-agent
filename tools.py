@@ -3231,6 +3231,7 @@ def log_trade(
           실패 시: {"error": "..."}
     """
     import json
+    import os
 
     rule_tag = rule_tag.upper().strip()
     if rule_tag not in _VALID_RULE_TAGS:
@@ -3248,8 +3249,18 @@ def log_trade(
     if not isinstance(qty, int) or qty < 1:
         return {"error": f"qty는 1 이상 정수여야 합니다. 입력: {qty}"}
 
+    # 타임스탬프 KST 명시 — check_guardrails·get_auto_trade_stats_today와 같은 ZoneInfo 패턴
+    try:
+        from zoneinfo import ZoneInfo
+        kst = ZoneInfo("Asia/Seoul")
+    except ImportError:
+        from datetime import timezone as _tz, timedelta as _td
+        kst = _tz(_td(hours=9))
+
     entry = {
-        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        # tz 포함 isoformat은 "+09:00" 접미사가 붙지만
+        # get_auto_trade_stats_today의 startswith(날짜) 필터에는 영향 없다.
+        "timestamp": datetime.now(kst).isoformat(timespec="seconds"),
         "rule_tag":  rule_tag,
         "ticker":    ticker.strip(),
         "side":      side,
@@ -3259,20 +3270,30 @@ def log_trade(
         "sector":    sector,
     }
 
+    # 기존 장부 읽기 — 손상된 장부는 절대 덮어쓰지 않는다 (fail-safe)
     try:
-        try:
-            with open(TRADE_LOG_PATH, "r", encoding="utf-8") as f:
-                records = json.load(f)
-            if not isinstance(records, list):
-                records = []
-        except (FileNotFoundError, json.JSONDecodeError):
-            records = []
+        with open(TRADE_LOG_PATH, "r", encoding="utf-8") as f:
+            records = json.load(f)
+    except FileNotFoundError:
+        records = []  # 첫 기록이므로 정상
+    except json.JSONDecodeError as exc:
+        return {"error": f"trade_log.json 파싱 실패 — 장부가 손상됐을 수 있어 기록을 중단합니다. "
+                         f"파일을 직접 확인·복구한 뒤 다시 시도하세요: {exc}"}
+    if not isinstance(records, list):
+        return {"error": f"trade_log.json 파싱 실패 — 장부가 손상됐을 수 있어 기록을 중단합니다. "
+                         f"파일을 직접 확인·복구한 뒤 다시 시도하세요: 최상위가 list가 아님 ({type(records).__name__})"}
 
-        records.append(entry)
+    records.append(entry)
 
-        with open(TRADE_LOG_PATH, "w", encoding="utf-8") as f:
+    # 원자적 쓰기: 임시 파일에 먼저 쓰고 os.replace로 교체 (쓰다가 죽어도 기존 파일 보존)
+    tmp_path = TRADE_LOG_PATH + ".tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(records, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, TRADE_LOG_PATH)
     except Exception as exc:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
         return {"error": f"로그 파일 쓰기 실패: {exc}"}
 
     return {"logged": True, "entry": entry}
