@@ -35,6 +35,8 @@ build/
 trade_log.json
 trade_log_TEST.json
 auto_trader_dryrun_log.json
+kill_switch_state.json
+kill_switch_state_TEST.json
 
 # 노션이 원본인 문서 (저장소 미포함 원칙)
 stock-agent-사용설명서.md

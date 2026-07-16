@@ -38,6 +38,10 @@ TRADE_LOG_PATH = str(_BASE_DIR / "trade_log.json")
 # A=매수규칙A(점수집중) / B=매수규칙B(분산채우기) / MANUAL=사람 직접 / SELL=매도규칙 자동매도(손절/익절)
 _VALID_RULE_TAGS = {"A", "B", "MANUAL", "SELL"}
 
+# ── 킬 스위치 상태 파일 ──────────────────────────────────────
+# 테스트에서 TRADE_LOG_PATH와 같은 패턴으로 TEST 경로로 바꿔치기할 수 있게 모듈 상수로 둔다.
+KILL_SWITCH_STATE_PATH = str(_BASE_DIR / "kill_switch_state.json")
+
 
 # ═══════════════════════════════════════════════
 # 내부 헬퍼
@@ -3238,6 +3242,7 @@ def log_trade(
     price: float,
     reason: str,
     sector: str | None = None,
+    source_rule: str | None = None,
 ) -> dict:
     """
     거래 1건을 TRADE_LOG_PATH(trade_log.json)에 기록한다.
@@ -3253,6 +3258,11 @@ def log_trade(
     reason   : str   기록 사유 (자유 텍스트)
     sector   : str | None  섹터명 (선택). get_auto_trade_stats_today의
                            by_sector 집계에 쓰인다. 없으면 None으로 저장.
+    source_rule : str | None
+                  SELL 태그 매도가 어느 규칙(A/B)의 보유분을 판 것인지
+                  귀속시키는 필드. 매도 기록 시 반드시 전달할 것
+                  (A/B 손익 비교와 kill switch 규칙별 기록에 필요).
+                  허용값: None 또는 "A"/"B".
 
     Returns
     -------
@@ -3274,6 +3284,16 @@ def log_trade(
     side = side.upper().strip()
     if side not in ("BUY", "SELL"):
         return {"error": f"side는 'BUY' 또는 'SELL' 이어야 합니다. 입력: '{side}'"}
+
+    if source_rule is not None:
+        source_rule = source_rule.upper().strip()
+        if source_rule not in ("A", "B"):
+            return {
+                "error": (
+                    f"잘못된 source_rule: '{source_rule}'. "
+                    "None 또는 'A'/'B'만 허용합니다."
+                )
+            }
 
     if not isinstance(qty, int) or qty < 1:
         return {"error": f"qty는 1 이상 정수여야 합니다. 입력: {qty}"}
@@ -3297,6 +3317,9 @@ def log_trade(
         "price":     price,
         "reason":    reason,
         "sector":    sector,
+        # SELL 태그 매도가 어느 규칙(A/B)의 보유분을 판 것인지 귀속시키는 필드.
+        # 매도 기록 시 반드시 전달할 것 (A/B 손익 비교와 kill switch 규칙별 기록에 필요).
+        "source_rule": source_rule,
     }
 
     # 기존 장부 읽기 — 손상된 장부는 절대 덮어쓰지 않는다 (fail-safe)
@@ -3625,12 +3648,539 @@ def get_combined_auto_trade_stats_today() -> dict:
 
 
 # ═══════════════════════════════════════════════
+# 킬 스위치 부품 (0단계 — 계산·상태 기록 전용, 주문 코드 없음)
+# ═══════════════════════════════════════════════
+
+# 킬 스위치 손익률 분모 (확정 설계 — 변경 금지)
+# 차단 판정은 A+B 합산 1개 (분모 6,000만 원 고정).
+# 규칙별(A/B) 손익률은 기록·모니터링용이며 차단 판정에는 쓰지 않는다 (분모 각 3,000만 원).
+_KS_TOTAL_BASE_KRW = 60_000_000
+_KS_RULE_BASE_KRW = 30_000_000
+_KS_DAILY_LIMIT_PCT = -5.0        # check_guardrails KILL_DAILY_PCT와 동일 값
+_KS_CUMULATIVE_LIMIT_PCT = -15.0  # check_guardrails KILL_CUMULATIVE_PCT와 동일 값
+_KS_RESET_CONFIRM_PHRASE = "누적 킬스위치를 해제합니다"
+# 킬 스위치 집계 대상 태그 — MANUAL은 사람 직접 거래라 자동매매 손익에서 제외
+_KS_AUTO_TAGS = ("A", "B", "SELL")
+
+
+def _resolve_kst_now(now: datetime | None) -> datetime:
+    """now 인자를 KST 기준 aware datetime으로 정규화한다.
+    naive는 KST로 간주, tz가 있으면 KST로 변환 (check_guardrails와 동일 규약)."""
+    try:
+        from zoneinfo import ZoneInfo
+        kst = ZoneInfo("Asia/Seoul")
+    except ImportError:
+        from datetime import timezone as _tz, timedelta as _td
+        kst = _tz(_td(hours=9))
+    if now is None:
+        return datetime.now(kst)
+    if now.tzinfo is None:
+        return now.replace(tzinfo=kst)
+    return now.astimezone(kst)
+
+
+def get_auto_trade_positions() -> dict:
+    """
+    거래 로그를 처음부터 재생해 자동매매분(rule_tag A/B/SELL)의
+    순보유 포지션과 실현손익을 계산한다. (읽기 전용 — 주문 코드 없음)
+
+    계산 방식
+    ---------
+    - 이동평균법: BUY 시 평단 = (기존 평단×기존수량 + 체결가×수량) ÷ 합계수량.
+      SELL 시 실현손익 += (체결가 − 평단) × 수량, 수량만 차감 (평단 유지).
+    - 귀속: BUY는 rule_tag("A"/"B")의 포지션에 더하고,
+      rule_tag="SELL"인 매도는 entry의 source_rule("A"/"B") 포지션에서 차감한다.
+    - source_rule이 없거나 None인 SELL은 규칙별(by_rule) 계산에서 제외하고
+      warnings에 기록하되, 합산(combined) 계산에는 포함한다
+      (합산 포지션은 규칙 구분 없이 전체 BUY/SELL 재생).
+    - MANUAL 거래는 자동매매분이 아니므로 전부 제외한다.
+    - 통화: 한국 종목 실현손익은 realized_pnl_krw(KRW), 미국 종목은
+      realized_pnl_usd(USD)로 따로 누적한다. 각 SELL 시점의 환율을 알 수 없으므로
+      KRW 일괄 환산은 calc_auto_trade_pnl()이 현재 환율로 수행한다.
+
+    fail-safe: 매도 수량이 보유 수량을 초과(oversell)하면 로그 데이터 불일치로
+    보고 {"error": "..."}를 반환한다 — 킬 스위치 입력이 부정확해지면 안 되므로
+    부분 결과로 계속 진행하지 않는다.
+
+    Returns
+    -------
+    dict
+        {
+            "combined": {"positions": {ticker: {"qty": int, "avg_price": float,
+                                                "market": "KR"|"US"}},
+                         "realized_pnl_krw": float, "realized_pnl_usd": float},
+            "by_rule":  {"A": {...같은 구조...}, "B": {...}},
+            "warnings": [str, ...],
+        }
+        실패 시: {"error": "..."}
+        로그 파일이 없으면 정상 (빈 포지션, 실현손익 0).
+    """
+    log = get_trade_log()
+    if "error" in log:
+        return log
+
+    def _new_book() -> dict:
+        return {"positions": {}, "realized_pnl_krw": 0.0, "realized_pnl_usd": 0.0}
+
+    books = {"combined": _new_book(), "A": _new_book(), "B": _new_book()}
+    warnings_list: list[str] = []
+
+    def _apply(book: dict, entry: dict, label: str) -> str | None:
+        """entry 1건을 book에 반영한다. oversell이면 에러 메시지 문자열 반환."""
+        ticker = str(entry.get("ticker", "")).strip()
+        side = str(entry.get("side", "")).upper()
+        qty = entry.get("qty", 0)
+        price = entry.get("price", 0)
+        market = "KR" if _is_korean(ticker) else "US"
+        pos = book["positions"].get(ticker)
+        if side == "BUY":
+            if pos is None:
+                pos = {"qty": 0, "avg_price": 0.0, "market": market}
+                book["positions"][ticker] = pos
+            total_qty = pos["qty"] + qty
+            pos["avg_price"] = (pos["avg_price"] * pos["qty"] + price * qty) / total_qty
+            pos["qty"] = total_qty
+        else:  # SELL
+            held = pos["qty"] if pos else 0
+            if qty > held:
+                return (f"oversell: [{label}] {ticker} 매도 {qty}주 > 보유 {held}주 "
+                        f"(timestamp={entry.get('timestamp')})")
+            pnl = (price - pos["avg_price"]) * qty
+            if market == "KR":
+                book["realized_pnl_krw"] += pnl
+            else:
+                book["realized_pnl_usd"] += pnl
+            pos["qty"] -= qty
+            if pos["qty"] == 0:
+                del book["positions"][ticker]
+        return None
+
+    for entry in log["trades"]:
+        tag = str(entry.get("rule_tag", "")).upper()
+        if tag not in _KS_AUTO_TAGS:
+            continue  # MANUAL 등 — 자동매매분이 아니므로 제외
+        side = str(entry.get("side", "")).upper()
+        ticker = str(entry.get("ticker", "")).strip()
+        if side not in ("BUY", "SELL"):
+            warnings_list.append(
+                f"알 수 없는 side='{entry.get('side')}' 기록 제외: "
+                f"{ticker} (timestamp={entry.get('timestamp')})"
+            )
+            continue
+
+        # 합산(combined): 규칙 구분 없이 전체 BUY/SELL 재생
+        err = _apply(books["combined"], entry, "합산")
+        if err:
+            return {"error": f"거래 로그 불일치({err}) — 킬 스위치 입력이 "
+                             "부정확해지므로 전체 계산을 중단합니다."}
+
+        # 규칙별(by_rule) 귀속
+        if side == "BUY":
+            rule = tag if tag in ("A", "B") else None
+            if rule is None:
+                warnings_list.append(
+                    f"rule_tag='SELL'인 BUY 기록 — 규칙별 계산에서 제외 (합산에는 포함): "
+                    f"{ticker} (timestamp={entry.get('timestamp')})"
+                )
+        else:
+            if tag in ("A", "B"):
+                rule = tag
+            else:  # tag == "SELL" → source_rule로 귀속
+                src = entry.get("source_rule")
+                rule = src.upper().strip() if isinstance(src, str) else None
+                if rule not in ("A", "B"):
+                    rule = None
+                    warnings_list.append(
+                        f"source_rule이 없거나 잘못된 SELL(source_rule={src!r}) — "
+                        f"규칙별 계산에서 제외 (합산에는 포함): "
+                        f"{ticker} (timestamp={entry.get('timestamp')})"
+                    )
+        if rule is not None:
+            err = _apply(books[rule], entry, f"규칙 {rule}")
+            if err:
+                return {"error": f"거래 로그 불일치({err}) — 킬 스위치 입력이 "
+                                 "부정확해지므로 전체 계산을 중단합니다."}
+
+    # float 노이즈 제거
+    for book in books.values():
+        for pos in book["positions"].values():
+            pos["avg_price"] = round(pos["avg_price"], 4)
+        book["realized_pnl_krw"] = round(book["realized_pnl_krw"], 4)
+        book["realized_pnl_usd"] = round(book["realized_pnl_usd"], 4)
+
+    return {
+        "combined": books["combined"],
+        "by_rule": {"A": books["A"], "B": books["B"]},
+        "warnings": warnings_list,
+    }
+
+
+def calc_auto_trade_pnl(*, now: datetime | None = None,
+                        price_overrides: dict[str, float] | None = None) -> dict:
+    """
+    자동매매분(rule_tag A/B/SELL)의 현재 손익을 계산한다. (읽기 전용 — 주문 코드 없음)
+
+    킬 스위치 판정(update_kill_switch_state)의 입력을 만드는 함수다.
+    분모는 확정 설계값을 쓴다:
+    - 합산(combined) 손익률 분모: 60,000,000원 (A+B 합산 — 차단 판정용)
+    - 규칙별(A/B) 손익률 분모:   30,000,000원 (기록·모니터링용, 차단 판정 미사용)
+
+    Parameters
+    ----------
+    now             : datetime | None
+                      테스트용 시각 주입. None이면 KST 현재 시각.
+                      naive는 KST로 간주 (check_guardrails와 동일 규약).
+    price_overrides : dict[str, float] | None
+                      테스트 전용. 지정된 티커는 get_quote 대신 이 값을
+                      현재가로 사용한다 (미국 종목은 USD 단위).
+
+    fail-safe
+    ---------
+    - 보유 종목 현재가를 하나라도 못 구하면 {"error": "..."} — 근사치 금지.
+    - 미국 종목 보유/실현손익/당일 거래가 있는데 환율 조회에 실패하면
+      {"error": "..."} (get_auto_trade_stats_today와 같은 철학).
+
+    Returns
+    -------
+    dict
+        {
+            "as_of":               str,    # KST isoformat
+            "eval_krw":            float,  # 현재 평가액 합계 (합산)
+            "realized_pnl_krw":    float,  # 실현손익 (USD분은 현재 환율로 환산 포함)
+            "unrealized_pnl_krw":  float,  # 평가손익 = Σ (현재가 − 평단) × 수량
+            "cumulative_pnl_krw":  float,  # 누적손익 = 실현 + 평가
+            "cumulative_pnl_pct":  float,  # 누적손익 ÷ 60,000,000 × 100
+            "today_buy_krw":       float,  # 오늘(KST) 매수금액 합 (A/B/SELL 태그만)
+            "today_sell_krw":      float,  # 오늘(KST) 매도금액 합 (A/B/SELL 태그만)
+            "by_rule": {"A": {"cumulative_pnl_krw", "cumulative_pnl_pct"}, "B": {...}},
+            "warnings": [str, ...],
+        }
+        실패 시: {"error": "..."}
+    """
+    now_dt = _resolve_kst_now(now)
+    today_str = now_dt.strftime("%Y-%m-%d")
+
+    positions = get_auto_trade_positions()
+    if "error" in positions:
+        return positions
+    combined = positions["combined"]
+    by_rule = positions["by_rule"]
+
+    # 현재가 조회 (price_overrides 우선) — 하나라도 실패하면 전체 중단
+    tickers = set(combined["positions"])
+    for book in by_rule.values():
+        tickers |= set(book["positions"])
+    prices: dict[str, float] = {}
+    for ticker in sorted(tickers):
+        if price_overrides is not None and ticker in price_overrides:
+            prices[ticker] = float(price_overrides[ticker])
+            continue
+        quote = get_quote(ticker)
+        if "error" in quote:
+            return {"error": f"현재가 조회 실패({ticker}): {quote['error']} — "
+                             "킬 스위치 입력이 부정확하면 안 되므로 계산을 중단합니다."}
+        if quote.get("close") is None:
+            return {"error": f"현재가 조회 실패({ticker}): close 없음 — "
+                             "킬 스위치 입력이 부정확하면 안 되므로 계산을 중단합니다."}
+        prices[ticker] = float(quote["close"])
+
+    # 오늘(KST, now 기준) 자동매매분 거래
+    log = get_trade_log()
+    if "error" in log:
+        return log
+    todays = [
+        t for t in log["trades"]
+        if str(t.get("rule_tag", "")).upper() in _KS_AUTO_TAGS
+        and str(t.get("timestamp", "")).startswith(today_str)
+        and str(t.get("side", "")).upper() in ("BUY", "SELL")
+    ]
+
+    # 환율 필요 여부 — 미국 보유/실현손익/당일 거래가 하나라도 있으면 필요
+    def _needs_fx(book: dict) -> bool:
+        return (book["realized_pnl_usd"] != 0
+                or any(p["market"] == "US" for p in book["positions"].values()))
+
+    needs_fx = (_needs_fx(combined)
+                or any(_needs_fx(b) for b in by_rule.values())
+                or any(not _is_korean(str(t.get("ticker", ""))) for t in todays))
+    usd_krw = None
+    if needs_fx:
+        usd_krw = _fetch_usd_krw_rate()
+        if usd_krw is None:
+            return {
+                "error": (
+                    "미국 종목 보유/실현손익/당일 거래가 있는데 USD/KRW 환율 조회에 "
+                    "실패했습니다. 근사치 없이 계산을 중단합니다 "
+                    "(킬 스위치 입력이 부정확하면 안 됨)."
+                )
+            }
+
+    def _book_pnl_krw(book: dict) -> tuple[float, float, float]:
+        """(평가액, 실현손익, 평가손익) — 전부 KRW."""
+        eval_krw = 0.0
+        unrealized = 0.0
+        for ticker, pos in book["positions"].items():
+            fx = usd_krw if pos["market"] == "US" else 1.0
+            eval_krw += prices[ticker] * pos["qty"] * fx
+            unrealized += (prices[ticker] - pos["avg_price"]) * pos["qty"] * fx
+        realized = book["realized_pnl_krw"]
+        if book["realized_pnl_usd"]:
+            realized += book["realized_pnl_usd"] * usd_krw
+        return eval_krw, realized, unrealized
+
+    eval_krw, realized_krw, unrealized_krw = _book_pnl_krw(combined)
+    cumulative_krw = realized_krw + unrealized_krw
+
+    today_buy = 0.0
+    today_sell = 0.0
+    for t in todays:
+        amount = t.get("qty", 0) * t.get("price", 0)
+        if not _is_korean(str(t.get("ticker", ""))):
+            amount *= usd_krw
+        if str(t.get("side", "")).upper() == "BUY":
+            today_buy += amount
+        else:
+            today_sell += amount
+
+    rule_out = {}
+    for tag in ("A", "B"):
+        _, r_realized, r_unrealized = _book_pnl_krw(by_rule[tag])
+        r_cum = r_realized + r_unrealized
+        rule_out[tag] = {
+            "cumulative_pnl_krw": round(r_cum, 2),
+            "cumulative_pnl_pct": round(r_cum / _KS_RULE_BASE_KRW * 100, 4),
+        }
+
+    return {
+        "as_of":              now_dt.isoformat(timespec="seconds"),
+        "eval_krw":           round(eval_krw, 2),
+        "realized_pnl_krw":   round(realized_krw, 2),
+        "unrealized_pnl_krw": round(unrealized_krw, 2),
+        "cumulative_pnl_krw": round(cumulative_krw, 2),
+        "cumulative_pnl_pct": round(cumulative_krw / _KS_TOTAL_BASE_KRW * 100, 4),
+        "today_buy_krw":      round(today_buy, 2),
+        "today_sell_krw":     round(today_sell, 2),
+        "by_rule":            rule_out,
+        "warnings":           positions["warnings"],
+    }
+
+
+def _load_kill_switch_state() -> dict:
+    """
+    킬 스위치 상태 파일을 로드한다. 파일이 없으면 기본 구조 반환 (첫 사용 — 정상).
+    파싱 실패면 {"error": ...} — 손상된 상태를 기본값으로 덮어쓰면 누적 발동
+    기록이 사라질 수 있으므로 절대 새로 만들지 않는다 (fail-safe).
+    """
+    import json
+
+    try:
+        with open(KILL_SWITCH_STATE_PATH, "r", encoding="utf-8") as f:
+            state = json.load(f)
+    except FileNotFoundError:
+        return {
+            "daily": {"date": None, "snapshot_eval_krw": 0.0,
+                      "snapshot_today_buy_krw": 0.0, "snapshot_today_sell_krw": 0.0,
+                      "triggered": False, "pnl_pct_at_trigger": None,
+                      "triggered_at": None},
+            "cumulative": {"triggered": False, "pnl_pct_at_trigger": None,
+                           "triggered_at": None, "resets": []},
+            "last_check": None,
+        }
+    except json.JSONDecodeError as exc:
+        return {"error": f"킬 스위치 상태 파일 파싱 실패 — 상태가 손상됐을 수 있어 "
+                         f"중단합니다. 파일을 직접 확인·복구하세요: {exc}"}
+    if not isinstance(state, dict) or "daily" not in state or "cumulative" not in state:
+        return {"error": "킬 스위치 상태 파일 구조 이상 — 상태가 손상됐을 수 있어 "
+                         "중단합니다. 파일을 직접 확인·복구하세요."}
+    return state
+
+
+def _save_kill_switch_state(state: dict) -> str | None:
+    """원자적 저장 (log_trade와 같은 tmp+replace 패턴). 실패 시 에러 메시지 반환."""
+    import json
+    import os
+
+    tmp_path = KILL_SWITCH_STATE_PATH + ".tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, KILL_SWITCH_STATE_PATH)
+    except Exception as exc:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        return f"킬 스위치 상태 파일 쓰기 실패: {exc}"
+    return None
+
+
+def update_kill_switch_state(*, now: datetime | None = None,
+                             price_overrides: dict[str, float] | None = None) -> dict:
+    """
+    킬 스위치 상태를 갱신하고 check_guardrails 입력값을 반환한다. (주문 코드 없음)
+
+    동작: calc_auto_trade_pnl()로 손익 계산 → 발동 판정(래칫) →
+    KILL_SWITCH_STATE_PATH에 영속화 → 판정용 손익률 반환.
+
+    래칫(ratchet) 방식 — 확정 설계
+    ------------------------------
+    - 차단 판정은 A+B 합산 1개: 일일 -5.0% / 누적 -15.0% (분모 6,000만 원 고정).
+    - 한번 발동하면 손익이 회복돼도 발동 당시 값을 계속 반환한다.
+      일일 발동은 KST 날짜가 바뀌면 자동 리셋되고,
+      누적 발동은 reset_kill_switch()로만 해제된다.
+    - 반환되는 daily_pnl_pct/cumulative_pnl_pct는 래칫 적용 후 값이다 —
+      check_guardrails에 그대로 넣으면 발동 상태에서 자연히 차단된다.
+    - 규칙별(A/B) 손익률은 기록·모니터링용으로만 반환하며 차단 판정에 쓰지 않는다.
+
+    일일 손익 산식 (스냅샷 방식)
+    ----------------------------
+    KST 날짜가 바뀐 첫 호출에서 평가액과 당일 매수/매도 누계를 스냅샷하고,
+    일일 손익 = (평가액 + 당일 매도 증가분) − (스냅샷 평가액 + 당일 매수 증가분).
+    (스냅샷 시점 이전의 당일 거래 효과를 일일 손익에서 제외하기 위함)
+
+    ⚠ 반환값에 "error"가 있으면 호출자는 주문을 전부 중단해야 한다.
+      손익을 계산할 수 없으면 킬 스위치가 발동 상태인지 알 수 없으므로
+      보수적으로 전면 중단이 맞다.
+
+    Returns
+    -------
+    dict
+        {
+            "daily_pnl_pct":        float,  # 래칫 적용 후 값
+            "cumulative_pnl_pct":   float,  # 래칫 적용 후 값
+            "daily_triggered":      bool,
+            "cumulative_triggered": bool,
+            "by_rule":              {"A": pct, "B": pct},  # 기록·모니터링용
+            "as_of":                str,
+        }
+        실패 시: {"error": "..."}
+    """
+    pnl = calc_auto_trade_pnl(now=now, price_overrides=price_overrides)
+    if "error" in pnl:
+        return pnl
+
+    state = _load_kill_switch_state()
+    if "error" in state:
+        return state
+
+    now_dt = _resolve_kst_now(now)
+    today_str = now_dt.strftime("%Y-%m-%d")
+    as_of = pnl["as_of"]
+
+    # KST 날짜가 바뀌면 일일 섹션 자동 리셋 (파일 첫 생성 포함)
+    daily = state["daily"]
+    if daily.get("date") != today_str:
+        daily = {
+            "date":                    today_str,
+            "snapshot_eval_krw":       pnl["eval_krw"],
+            "snapshot_today_buy_krw":  pnl["today_buy_krw"],
+            "snapshot_today_sell_krw": pnl["today_sell_krw"],
+            "triggered":               False,
+            "pnl_pct_at_trigger":      None,
+            "triggered_at":            None,
+        }
+        state["daily"] = daily
+
+    # 일일 손익 — 스냅샷 이후의 순변화만 반영
+    daily_pnl_krw = (
+        (pnl["eval_krw"] + (pnl["today_sell_krw"] - daily["snapshot_today_sell_krw"]))
+        - (daily["snapshot_eval_krw"] + (pnl["today_buy_krw"] - daily["snapshot_today_buy_krw"]))
+    )
+    daily_pnl_pct = round(daily_pnl_krw / _KS_TOTAL_BASE_KRW * 100, 4)
+    cumulative_pnl_pct = pnl["cumulative_pnl_pct"]
+
+    # 래칫 판정 — 이미 발동돼 있으면 발동 당시 값으로 대체
+    if daily["triggered"]:
+        daily_pnl_pct = daily["pnl_pct_at_trigger"]
+    elif daily_pnl_pct <= _KS_DAILY_LIMIT_PCT:
+        daily["triggered"] = True
+        daily["pnl_pct_at_trigger"] = daily_pnl_pct
+        daily["triggered_at"] = as_of
+
+    cumulative = state["cumulative"]
+    if cumulative["triggered"]:
+        cumulative_pnl_pct = cumulative["pnl_pct_at_trigger"]
+    elif cumulative_pnl_pct <= _KS_CUMULATIVE_LIMIT_PCT:
+        cumulative["triggered"] = True
+        cumulative["pnl_pct_at_trigger"] = cumulative_pnl_pct
+        cumulative["triggered_at"] = as_of
+
+    by_rule_pct = {tag: pnl["by_rule"][tag]["cumulative_pnl_pct"] for tag in ("A", "B")}
+    state["last_check"] = {
+        "at":                 as_of,
+        "daily_pnl_pct":      daily_pnl_pct,       # 래칫 적용 후 값 (반환값과 동일)
+        "cumulative_pnl_pct": cumulative_pnl_pct,  # 래칫 적용 후 값 (반환값과 동일)
+        "by_rule":            by_rule_pct,
+    }
+
+    err = _save_kill_switch_state(state)
+    if err:
+        return {"error": err}
+
+    return {
+        "daily_pnl_pct":        daily_pnl_pct,
+        "cumulative_pnl_pct":   cumulative_pnl_pct,
+        "daily_triggered":      daily["triggered"],
+        "cumulative_triggered": cumulative["triggered"],
+        "by_rule":              by_rule_pct,
+        "as_of":                as_of,
+    }
+
+
+def reset_kill_switch(confirm: str) -> dict:
+    """
+    누적 킬 스위치 발동을 수동으로 해제한다.
+
+    - confirm이 정확히 "누적 킬스위치를 해제합니다" 여야만 해제한다 (오조작 방지).
+    - **일일 발동은 이 함수로 해제할 수 없다.** 일일 발동은 KST 날짜가 바뀌면
+      update_kill_switch_state()가 자동 리셋하는 것이 유일한 해제 경로다.
+    - 해제 이력은 cumulative.resets에 발동 당시 손익률과 함께 남긴다.
+
+    Returns
+    -------
+    dict  {"reset": True, "cumulative": {...해제 후 상태...}}
+          실패 시: {"error": "..."}
+    """
+    import os
+
+    if confirm != _KS_RESET_CONFIRM_PHRASE:
+        return {"error": "확인 문구 불일치 — 해제하지 않음"}
+
+    if not os.path.exists(KILL_SWITCH_STATE_PATH):
+        return {"error": "킬 스위치 상태 파일이 없습니다 — 해제할 발동이 없습니다."}
+    state = _load_kill_switch_state()
+    if "error" in state:
+        return state
+
+    cumulative = state["cumulative"]
+    if not cumulative.get("triggered"):
+        return {"error": "누적 킬 스위치가 발동 상태가 아닙니다 — 해제할 것이 없습니다."}
+
+    now_dt = _resolve_kst_now(None)
+    cumulative.setdefault("resets", []).append({
+        "at":                   now_dt.isoformat(timespec="seconds"),
+        "pnl_pct_before_reset": cumulative.get("pnl_pct_at_trigger"),
+    })
+    cumulative["triggered"] = False
+    cumulative["pnl_pct_at_trigger"] = None
+    cumulative["triggered_at"] = None
+
+    err = _save_kill_switch_state(state)
+    if err:
+        return {"error": err}
+    return {"reset": True, "cumulative": cumulative}
+
+
+# ═══════════════════════════════════════════════
 # 직접 실행 테스트
 # ═══════════════════════════════════════════════
 
 if __name__ == "__main__":
     import json
     import os
+    import sys
+
+    # "./venv/bin/python tools.py killswitch" → 오프라인 테스트(거래 로그 + 킬 스위치
+    # T1~T6)까지만 실행하고 종료한다. 이후 테스트는 네트워크·대화형 입력이 필요하다.
+    _KS_ONLY = "killswitch" in sys.argv[1:]
 
     def _pp(label: str, data: dict):
         print(f"\n{'='*55}")
@@ -3687,6 +4237,180 @@ if __name__ == "__main__":
     print("\n" + "="*55)
     print("  ✅ 거래 로그 테스트 완료")
     print("="*55)
+
+    # ── 킬 스위치 부품 테스트 (T1~T6) ─────────────────────────────
+    print("\n" + "="*55)
+    print("  🔴 킬 스위치 부품 테스트 (T1~T6)")
+    print("="*55)
+
+    # 실제 trade_log.json / kill_switch_state.json을 절대 건드리지 않도록
+    # 테스트 전용 임시 파일로 교체하고 try/finally로 원복+삭제한다.
+    # 네트워크 무관: 현재가는 전부 price_overrides, 시각은 전부 now 주입.
+    _ORIG_TRADE_LOG_PATH2 = TRADE_LOG_PATH
+    _ORIG_KS_STATE_PATH = KILL_SWITCH_STATE_PATH
+    TRADE_LOG_PATH = str(_BASE_DIR / "trade_log_TEST.json")
+    KILL_SWITCH_STATE_PATH = str(_BASE_DIR / "kill_switch_state_TEST.json")
+
+    _ks_failed: list[str] = []
+
+    def _check(label: str, cond: bool):
+        print(f"  {'✅' if cond else '❌'} {label}")
+        if not cond:
+            _ks_failed.append(label)
+
+    def _rm_test_files():
+        for _p in (TRADE_LOG_PATH, KILL_SWITCH_STATE_PATH):
+            if os.path.exists(_p):
+                os.remove(_p)
+
+    def _write_test_log(entries: list[dict]):
+        """타임스탬프를 고정하기 위해 log_trade를 거치지 않고 직접 기록 (테스트 전용)."""
+        with open(TRADE_LOG_PATH, "w", encoding="utf-8") as f:
+            json.dump(entries, f, ensure_ascii=False, indent=2)
+
+    def _test_entry(ts, tag, ticker, side, qty, price, source_rule=None):
+        return {"timestamp": ts, "rule_tag": tag, "ticker": ticker, "side": side,
+                "qty": qty, "price": price, "reason": "킬 스위치 테스트",
+                "sector": None, "source_rule": source_rule}
+
+    try:
+        # ── T1: 로그 없음 → 빈 포지션, 손익 0, 발동 없음
+        print("\n[T1] 로그 없음 → 빈 포지션·손익 0·발동 없음")
+        _rm_test_files()
+        _t1_pos = get_auto_trade_positions()
+        _pp("T1 get_auto_trade_positions()", _t1_pos)
+        _check("T1 합산 포지션 빈 값", _t1_pos.get("combined", {}).get("positions") == {})
+        _check("T1 실현손익 0", _t1_pos.get("combined", {}).get("realized_pnl_krw") == 0)
+        _t1_ks = update_kill_switch_state(now=datetime(2026, 7, 15, 10, 0),
+                                          price_overrides={})
+        _pp("T1 update_kill_switch_state()", _t1_ks)
+        _check("T1 손익 0",
+               _t1_ks.get("daily_pnl_pct") == 0 and _t1_ks.get("cumulative_pnl_pct") == 0)
+        _check("T1 발동 없음",
+               _t1_ks.get("daily_triggered") is False
+               and _t1_ks.get("cumulative_triggered") is False)
+
+        # ── T2: A 2회 매수(이동평균 평단) 후 source_rule="A" 매도
+        print("\n[T2] A 2회 매수(이동평균) 후 source_rule='A' 매도")
+        _rm_test_files()
+        log_trade("A", "005930", "BUY", 10, 70000, "T2 매수1")
+        log_trade("A", "005930", "BUY", 10, 80000, "T2 매수2")
+        log_trade("SELL", "005930", "SELL", 5, 90000, "T2 익절 매도", source_rule="A")
+        _t2_bad = log_trade("SELL", "005930", "SELL", 1, 90000,
+                            "T2 잘못된 source_rule", source_rule="C")
+        _check("T2 source_rule='C' → error", "error" in _t2_bad)
+        _t2_pos = get_auto_trade_positions()
+        _pp("T2 get_auto_trade_positions()", _t2_pos)
+        _t2_a = _t2_pos["by_rule"]["A"]
+        _check("T2 이동평균 평단 75,000 (=(70,000×10+80,000×10)÷20)",
+               _t2_a["positions"].get("005930", {}).get("avg_price") == 75000)
+        _check("T2 잔여 수량 15주", _t2_a["positions"].get("005930", {}).get("qty") == 15)
+        _check("T2 실현손익 +75,000 (=(90,000−75,000)×5)",
+               _t2_a["realized_pnl_krw"] == 75000)
+        _check("T2 합산도 동일 (15주·+75,000)",
+               _t2_pos["combined"]["positions"].get("005930", {}).get("qty") == 15
+               and _t2_pos["combined"]["realized_pnl_krw"] == 75000)
+        _check("T2 warnings 없음", _t2_pos["warnings"] == [])
+
+        # ── T3: 일일 -5% 초과 손실 → 발동 + 래칫
+        print("\n[T3] 일일 -5% 초과 손실 → 발동, 가격 회복해도 래칫 유지")
+        _rm_test_files()
+        _write_test_log([_test_entry("2026-07-10T10:00:00+09:00",
+                                     "A", "005930", "BUY", 100, 600000)])
+        _t3_1 = update_kill_switch_state(now=datetime(2026, 7, 15, 10, 0),
+                                         price_overrides={"005930": 600000})
+        _check("T3 스냅샷 직후 발동 없음", _t3_1.get("daily_triggered") is False)
+        _t3_2 = update_kill_switch_state(now=datetime(2026, 7, 15, 10, 30),
+                                         price_overrides={"005930": 560000})
+        _pp("T3 폭락(평가 −400만 = −6.67%) 후", _t3_2)
+        _check("T3 daily_triggered=True", _t3_2.get("daily_triggered") is True)
+        _check("T3 daily_pnl_pct = -6.6667", _t3_2.get("daily_pnl_pct") == -6.6667)
+        _t3_3 = update_kill_switch_state(now=datetime(2026, 7, 15, 11, 0),
+                                         price_overrides={"005930": 600000})
+        _pp("T3 가격 완전 회복 후 재호출 (래칫 확인)", _t3_3)
+        _check("T3 래칫: 회복해도 발동 유지", _t3_3.get("daily_triggered") is True)
+        _check("T3 래칫: 발동 당시 값(-6.6667) 반환", _t3_3.get("daily_pnl_pct") == -6.6667)
+
+        # ── T4: 누적 -15% → 발동, reset_kill_switch 검증 (T3 상태에서 계속)
+        print("\n[T4] 누적 -15% → 발동, reset_kill_switch 문구 검증")
+        _t4_1 = update_kill_switch_state(now=datetime(2026, 7, 15, 11, 30),
+                                         price_overrides={"005930": 500000})
+        _pp("T4 폭락(누적 −1,000만 = −16.67%) 후", _t4_1)
+        _check("T4 cumulative_triggered=True", _t4_1.get("cumulative_triggered") is True)
+        _check("T4 cumulative_pnl_pct = -16.6667",
+               _t4_1.get("cumulative_pnl_pct") == -16.6667)
+        _t4_bad = reset_kill_switch("아무말")
+        _pp("T4 reset_kill_switch('아무말') → error 기대", _t4_bad)
+        _check("T4 잘못된 문구 → 해제 안 됨", "error" in _t4_bad)
+        _t4_ok = reset_kill_switch("누적 킬스위치를 해제합니다")
+        _pp("T4 정확한 문구 → 해제", _t4_ok)
+        _check("T4 해제됨", _t4_ok.get("reset") is True)
+        with open(KILL_SWITCH_STATE_PATH, "r", encoding="utf-8") as f:
+            _t4_state = json.load(f)
+        _check("T4 cumulative.triggered=False 저장 확인",
+               _t4_state["cumulative"]["triggered"] is False)
+        _check("T4 resets 이력 1건 (발동 당시 값 -16.6667 보존)",
+               len(_t4_state["cumulative"]["resets"]) == 1
+               and _t4_state["cumulative"]["resets"][0]["pnl_pct_before_reset"] == -16.6667)
+
+        # ── T5: source_rule 없는 SELL → 경고+규칙별 제외+합산 포함 / oversell → error
+        print("\n[T5] source_rule 없는 SELL / oversell")
+        _write_test_log([
+            _test_entry("2026-07-10T10:00:00+09:00", "A", "005930", "BUY", 10, 10000),
+            # source_rule 없음 → 규칙별 제외, 합산 포함
+            _test_entry("2026-07-11T10:00:00+09:00", "SELL", "005930", "SELL", 4, 12000),
+        ])
+        _t5_pos = get_auto_trade_positions()
+        _pp("T5 get_auto_trade_positions()", _t5_pos)
+        _check("T5 warnings 1건", len(_t5_pos.get("warnings", [])) == 1)
+        _check("T5 규칙별 제외: A는 10주·실현 0 그대로",
+               _t5_pos["by_rule"]["A"]["positions"].get("005930", {}).get("qty") == 10
+               and _t5_pos["by_rule"]["A"]["realized_pnl_krw"] == 0)
+        _check("T5 합산 포함: 6주 + 실현 +8,000",
+               _t5_pos["combined"]["positions"].get("005930", {}).get("qty") == 6
+               and _t5_pos["combined"]["realized_pnl_krw"] == 8000)
+        _write_test_log([
+            _test_entry("2026-07-10T10:00:00+09:00", "A", "005930", "BUY", 10, 10000),
+            _test_entry("2026-07-11T10:00:00+09:00", "SELL", "005930", "SELL",
+                        100, 12000, source_rule="A"),  # 보유 10주 초과 매도
+        ])
+        _t5_over = get_auto_trade_positions()
+        _pp("T5 oversell → error 기대", _t5_over)
+        _check("T5 oversell → error", "error" in _t5_over)
+
+        # ── T6: 다음 날 → 일일 섹션 자동 리셋 (상태 파일은 T4 이후 그대로)
+        print("\n[T6] 다음 날(now+1일) → 일일 섹션 자동 리셋")
+        _write_test_log([_test_entry("2026-07-10T10:00:00+09:00",
+                                     "A", "005930", "BUY", 100, 600000)])  # T3 로그 복원
+        _t6 = update_kill_switch_state(now=datetime(2026, 7, 16, 10, 0),
+                                       price_overrides={"005930": 600000})
+        _pp("T6 update_kill_switch_state(다음 날)", _t6)
+        _check("T6 일일 발동 자동 리셋 (triggered=False)",
+               _t6.get("daily_triggered") is False)
+        _check("T6 일일 손익 0 (새 스냅샷 기준)", _t6.get("daily_pnl_pct") == 0)
+        with open(KILL_SWITCH_STATE_PATH, "r", encoding="utf-8") as f:
+            _t6_state = json.load(f)
+        _check("T6 새 스냅샷 날짜 2026-07-16", _t6_state["daily"]["date"] == "2026-07-16")
+        _check("T6 새 스냅샷 평가액 6,000만",
+               _t6_state["daily"]["snapshot_eval_krw"] == 60000000)
+    finally:
+        # 테스트가 예외로 죽어도 임시 파일 정리 + 원래 경로 복구
+        _rm_test_files()
+        TRADE_LOG_PATH = _ORIG_TRADE_LOG_PATH2
+        KILL_SWITCH_STATE_PATH = _ORIG_KS_STATE_PATH
+
+    print("\n" + "="*55)
+    if _ks_failed:
+        print(f"  ❌ 킬 스위치 부품 테스트 실패 {len(_ks_failed)}건:")
+        for _f in _ks_failed:
+            print(f"     - {_f}")
+    else:
+        print("  ✅ 킬 스위치 부품 테스트 (T1~T6) 전부 통과")
+    print("="*55)
+
+    if _KS_ONLY:
+        print("\n(인자 'killswitch' — 이후 네트워크·대화형 테스트는 건너뜁니다)")
+        raise SystemExit(1 if _ks_failed else 0)
 
     # ── 가드레일 검사 테스트 ──────────────────────────────────────
     print("\n" + "="*55)
