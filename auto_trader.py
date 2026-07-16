@@ -165,8 +165,9 @@ def _make_entry(
     order_draft: dict | None = None,
     note: str = "",
     test_now: str | None = None,
+    eval_summary: dict | None = None,
 ) -> dict:
-    """dry-run 로그 1건 양식. decision: ORDER_DRAFTED | BLOCKED | SKIPPED | ERROR"""
+    """dry-run 로그 1건 양식. decision: ORDER_DRAFTED | BLOCKED | SKIPPED | ERROR | EVAL_SUMMARY"""
     return {
         "timestamp": _now_kst().isoformat(timespec="seconds"),
         "run_id": run_id,
@@ -185,6 +186,7 @@ def _make_entry(
         "order_draft": order_draft,
         "note": note,
         "test_now": test_now,          # --test-now 사용 시 그대로 기록 (실험 투명성)
+        "eval_summary": eval_summary,  # EVAL_SUMMARY 기록 전용 — excluded/stop_loss_deferred 관찰 데이터
     }
 
 
@@ -280,11 +282,31 @@ def run_buy_rule(
         return {"run_id": run_id, "error": result["error"]}
 
     candidates = result.get("candidates", [])
+    excluded = result.get("excluded", [])
+    records = 0
+
+    # ── 1-1. 평가 요약 기록 (Phase 0 관찰 데이터) ───────────────
+    # 후보가 0개여도 excluded는 있을 수 있으므로 후보 없음 판정보다 먼저 기록한다.
+    _append_dryrun_log(_make_entry(
+        run_id, rule_tag, "EVAL_SUMMARY", side="BUY",
+        eval_summary={
+            "candidates_count": len(candidates),
+            "excluded_count": result.get("excluded_count", len(excluded)),
+            "excluded": [
+                {"ticker": x.get("ticker"), "name": x.get("name"),
+                 "reason": x.get("reason")}
+                for x in excluded
+            ],
+        },
+        note="규칙 평가 요약 (excluded 포함 — Phase 0 관찰 데이터)",
+        test_now=test_now))
+    records += 1
+
     if not candidates:
         entry = _make_entry(run_id, rule_tag, "SKIPPED",
                             note="후보 없음 (규칙 기준 미달)", test_now=test_now)
         _append_dryrun_log(entry)
-        return {"run_id": run_id, "drafted": 0, "records": 1, "note": "후보 없음"}
+        return {"run_id": run_id, "drafted": 0, "records": records + 1, "note": "후보 없음"}
 
     # ── 2. 오늘 누적치 집계 (가드레일 입력 — 손 계산 금지) ──────
     # 설계 결정 1·3: 하루 거래 횟수(매수만)는 A+B 합산, 금액 한도는 규칙별.
@@ -307,7 +329,6 @@ def run_buy_rule(
     session_trades = 0
 
     drafted = 0
-    records = 0
 
     for cand in candidates:
         if drafted >= max_orders:
@@ -448,11 +469,34 @@ def run_sell_rule(test_now: str | None = None) -> dict:
         return {"run_id": run_id, "error": result["error"]}
 
     sell_candidates = list(result.get("stop_loss", [])) + list(result.get("take_profit", []))
+    summary = result.get("summary", {})
+    deferred = result.get("stop_loss_deferred", [])
+    records = 0
+
+    # ── 1-1. 평가 요약 기록 (Phase 0 관찰 데이터) ───────────────
+    # 후보가 0개여도 stop_loss_deferred는 있을 수 있으므로 후보 없음 판정보다 먼저 기록한다.
+    _append_dryrun_log(_make_entry(
+        run_id, "SELL", "EVAL_SUMMARY", side="SELL",
+        eval_summary={
+            "stop_loss_count":          summary.get("stop_loss_count"),
+            "take_profit_count":        summary.get("take_profit_count"),
+            "stop_loss_deferred_count": summary.get("stop_loss_deferred_count"),
+            "stop_loss_deferred": [
+                {"ticker": d.get("ticker"), "name": d.get("name"),
+                 "profit_loss_pct": d.get("profit_loss_pct"),
+                 "trend_note": d.get("trend_note")}
+                for d in deferred
+            ],
+        },
+        note="매도 규칙 평가 요약 (stop_loss_deferred 포함 — Phase 0 관찰 데이터)",
+        test_now=test_now))
+    records += 1
+
     if not sell_candidates:
         entry = _make_entry(run_id, "SELL", "SKIPPED",
                             note="손절/익절 후보 없음", test_now=test_now)
         _append_dryrun_log(entry)
-        return {"run_id": run_id, "drafted": 0, "records": 1, "note": "후보 없음"}
+        return {"run_id": run_id, "drafted": 0, "records": records + 1, "note": "후보 없음"}
 
     # ── 2. 보유 수량·현재가 확보 (후보에는 수량이 없다) ─────────
     balance = get_kis_balance()
@@ -466,7 +510,6 @@ def run_sell_rule(test_now: str | None = None) -> dict:
     holdings_by_ticker = {h.get("ticker"): h for h in balance.get("holdings", [])}
 
     drafted = 0
-    records = 0
     session_trades = 0
 
     for cand in sell_candidates:
