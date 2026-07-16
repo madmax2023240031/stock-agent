@@ -624,6 +624,8 @@ def place_kis_order(
        - 지정가: price × qty
        - 시장가: get_quote() 현재가 × qty (근사)
        매수 상한 초과 시 즉시 거부.
+       재검토 ①: 매도+시장가에서 현재가 조회 실패 시 거부하지 않고 금액 미상
+       (estimated_amount_krw=None, safety.quote_failed=True)으로 진행한다.
 
     Returns
     -------
@@ -683,18 +685,27 @@ def place_kis_order(
         }
 
     # ── 안전장치 2: 주문 금액 상한 ─────────────────────────────
+    quote_failed = False
     if order_type == "LIMIT":
         estimated_amount = price * qty
         price_source     = f"지정가({price:,}원)"
     else:
         quote = get_quote(ticker)
-        if "error" in quote:
-            return {"error": f"시장가 금액 확인을 위한 현재가 조회 실패: {quote['error']}"}
-        current_price = quote.get("close")
+        current_price = None if "error" in quote else quote.get("close")
         if current_price is None:
-            return {"error": "현재가 조회 결과에 종가(close)가 없습니다."}
-        estimated_amount = int(current_price) * qty
-        price_source     = f"현재가 근사({int(current_price):,}원)"
+            # 재검토 ①: 매도는 상한 검사가 없어 금액 미상으로 진행 가능.
+            # 매수는 100만 원 상한 검사에 금액이 필수이므로 기존대로 거부.
+            if side == "SELL":
+                quote_failed     = True
+                estimated_amount = None
+                price_source     = "현재가 조회 실패 — 금액 미상으로 진행 (재검토 ①)"
+            elif "error" in quote:
+                return {"error": f"시장가 금액 확인을 위한 현재가 조회 실패: {quote['error']}"}
+            else:
+                return {"error": "현재가 조회 결과에 종가(close)가 없습니다."}
+        else:
+            estimated_amount = int(current_price) * qty
+            price_source     = f"현재가 근사({int(current_price):,}원)"
 
     if side == "BUY" and estimated_amount > _KIS_ORDER_LIMIT_KRW:
         return {
@@ -739,6 +750,7 @@ def place_kis_order(
         "amount_ok":     True,
         "limit_krw":     _KIS_ORDER_LIMIT_KRW,
         "estimated_krw": estimated_amount,
+        "quote_failed":  quote_failed,   # 재검토 ① — True면 매도 금액 미상 진행
         "mock_account":  _KIS_MOCK_ACCOUNT,
     }
 
@@ -2970,6 +2982,7 @@ def check_guardrails(
     ticker: str,
     order_amount_krw: int,
     *,
+    side: str = "BUY",
     market: str | None = None,
     sector: str | None = None,
     accumulated_krw: int = 0,
@@ -2988,6 +3001,8 @@ def check_guardrails(
     ----------
     ticker                 : str   종목코드 (한국 6자리 / 미국 티커)
     order_amount_krw       : int   이번 주문 금액 (원화 기준)
+    side                   : str   "BUY"(기본) | "SELL".
+                                   결정 2: 매도는 금액 한도 면제 (거래시간/kill switch만 검사)
     market                 : str   "KR" | "US" | None — None이면 ticker에서 자동 감지
     sector                 : str   섹터명. 없으면 섹터 비중 검사를 건너뜀.
     accumulated_krw        : int   해당 규칙의 오늘 누적 매수 금액(규칙별, 이번 주문 제외, 원화)
@@ -3051,6 +3066,10 @@ def check_guardrails(
         return {"error": "ticker가 비어 있습니다."}
     if not isinstance(order_amount_krw, (int, float)) or order_amount_krw <= 0:
         return {"error": f"order_amount_krw는 양수여야 합니다. 입력: {order_amount_krw}"}
+
+    side = side.upper().strip()
+    if side not in ("BUY", "SELL"):
+        return {"error": f"side는 'BUY' 또는 'SELL' 이어야 합니다. 입력: '{side}'"}
 
     if market is None:
         market = "KR" if _is_korean(ticker) else "US"
@@ -3131,40 +3150,46 @@ def check_guardrails(
     if not _check("거래시간", in_hours, detail):
         return _block("거래시간", detail)
 
-    # ── 2. 자동매매 한도 ─────────────────────────────────────────
-    total_after = accumulated_krw + order_amount_krw
-    within_limit = total_after <= LIMIT_KRW
-    detail = (
-        f"누적 {accumulated_krw:,}원 + 이번 {order_amount_krw:,}원 = "
-        f"{total_after:,}원 / 한도 {LIMIT_KRW:,}원"
-    )
-    if not _check("자동매매한도", within_limit, detail):
-        return _block("자동매매한도", f"자동매매 한도 초과 — {detail}")
-
-    # ── 3. 1종목 비중 ─────────────────────────────────────────────
-    ticker_after = ticker_accumulated_krw + order_amount_krw
-    within_ticker = ticker_after <= TICKER_LIMIT_KRW
-    detail = (
-        f"{ticker} 누적 {ticker_accumulated_krw:,}원 + 이번 {order_amount_krw:,}원 = "
-        f"{ticker_after:,}원 / 종목 한도 {TICKER_LIMIT_KRW:,}원 "
-        f"(전체 한도의 {TICKER_WEIGHT_PCT}%)"
-    )
-    if not _check("1종목비중", within_ticker, detail):
-        return _block("1종목비중", f"1종목 비중 {TICKER_WEIGHT_PCT}% 초과 — {detail}")
-
-    # ── 4. 1섹터 비중 ─────────────────────────────────────────────
-    if sector is not None:
-        sector_after = sector_accumulated_krw + order_amount_krw
-        within_sector = sector_after <= SECTOR_LIMIT_KRW
-        detail = (
-            f"섹터 '{sector}' 누적 {sector_accumulated_krw:,}원 + 이번 {order_amount_krw:,}원 = "
-            f"{sector_after:,}원 / 섹터 한도 {SECTOR_LIMIT_KRW:,}원 "
-            f"(전체 한도의 {SECTOR_WEIGHT_PCT}%)"
-        )
-        if not _check("1섹터비중", within_sector, detail):
-            return _block("1섹터비중", f"1섹터 비중 {SECTOR_WEIGHT_PCT}% 초과 — {detail}")
+    # ── 2~4. 금액 검사 3종 — 매도(SELL)는 면제 (결정 2) ──────────
+    if side == "SELL":
+        _check("자동매매한도", True, "매도 주문 — 금액 한도 면제 (결정 2) — 검사 생략")
+        _check("1종목비중",   True, "매도 주문 — 금액 한도 면제 (결정 2) — 검사 생략")
+        _check("1섹터비중",   True, "매도 주문 — 금액 한도 면제 (결정 2) — 검사 생략")
     else:
-        _check("1섹터비중", True, "섹터 미입력 — 검사 생략")
+        # ── 2. 자동매매 한도 ─────────────────────────────────────
+        total_after = accumulated_krw + order_amount_krw
+        within_limit = total_after <= LIMIT_KRW
+        detail = (
+            f"누적 {accumulated_krw:,}원 + 이번 {order_amount_krw:,}원 = "
+            f"{total_after:,}원 / 한도 {LIMIT_KRW:,}원"
+        )
+        if not _check("자동매매한도", within_limit, detail):
+            return _block("자동매매한도", f"자동매매 한도 초과 — {detail}")
+
+        # ── 3. 1종목 비중 ─────────────────────────────────────────
+        ticker_after = ticker_accumulated_krw + order_amount_krw
+        within_ticker = ticker_after <= TICKER_LIMIT_KRW
+        detail = (
+            f"{ticker} 누적 {ticker_accumulated_krw:,}원 + 이번 {order_amount_krw:,}원 = "
+            f"{ticker_after:,}원 / 종목 한도 {TICKER_LIMIT_KRW:,}원 "
+            f"(전체 한도의 {TICKER_WEIGHT_PCT}%)"
+        )
+        if not _check("1종목비중", within_ticker, detail):
+            return _block("1종목비중", f"1종목 비중 {TICKER_WEIGHT_PCT}% 초과 — {detail}")
+
+        # ── 4. 1섹터 비중 ─────────────────────────────────────────
+        if sector is not None:
+            sector_after = sector_accumulated_krw + order_amount_krw
+            within_sector = sector_after <= SECTOR_LIMIT_KRW
+            detail = (
+                f"섹터 '{sector}' 누적 {sector_accumulated_krw:,}원 + 이번 {order_amount_krw:,}원 = "
+                f"{sector_after:,}원 / 섹터 한도 {SECTOR_LIMIT_KRW:,}원 "
+                f"(전체 한도의 {SECTOR_WEIGHT_PCT}%)"
+            )
+            if not _check("1섹터비중", within_sector, detail):
+                return _block("1섹터비중", f"1섹터 비중 {SECTOR_WEIGHT_PCT}% 초과 — {detail}")
+        else:
+            _check("1섹터비중", True, "섹터 미입력 — 검사 생략")
 
     # ── 5. 하루 거래 횟수 ─────────────────────────────────────────
     trades_after = daily_trades + 1

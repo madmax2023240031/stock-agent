@@ -342,6 +342,7 @@ def run_buy_rule(
         # 결정 3 — 횟수는 A+B 합산, 금액 한도는 규칙별(자금 배분 계획)
         gr = check_guardrails(
             ticker, order_amount,
+            side="BUY",
             sector=sector,
             accumulated_krw=rule_stats["accumulated_krw"] + session_accum,
             ticker_accumulated_krw=rule_stats["by_ticker"].get(ticker, 0)
@@ -470,12 +471,11 @@ def run_sell_rule(test_now: str | None = None) -> dict:
         order_amount = int(qty * price)
 
         # ── 4. 가드레일 검사 ────────────────────────────────────
-        # 매도에서 실질적으로 의미 있는 검사는 거래일·거래시간·하루 거래 횟수다.
-        # 누적 "매수" 한도 입력은 0으로 전달한다 (매도는 산 금액 누적과 무관).
-        # 단, order_amount가 커서 금액 검사에 걸리면 그대로 기록한다 — 0단계 관찰 데이터.
+        # 재검토 ② — side="SELL": 금액 검사 3종 면제, 거래일·거래시간·kill switch만 적용.
         gr = check_guardrails(
             ticker, order_amount,
-            sector=None,                 # 매도는 섹터 비중 검사 대상 아님 → 건너뜀
+            side="SELL",
+            sector=None,
             accumulated_krw=0,
             ticker_accumulated_krw=0,
             sector_accumulated_krw=0,
