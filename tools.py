@@ -2477,30 +2477,38 @@ def screen_stocks(
 # 9-1. _attach_sell_trend_note  (매도 규칙 공용 헬퍼)
 # ═══════════════════════════════════════════════
 
+def _sell_trend_note_for(ticker: str) -> str | None:
+    """
+    단일 종목의 매도용 추세 노트를 계산한다.
+    (기존 _attach_sell_trend_note 내부 로직과 동일. 지표 조회 실패 시 None.)
+    """
+    ind = get_indicators(ticker)
+    if "error" in ind:
+        return None
+
+    close, ma20 = ind.get("close"), ind.get("ma20")
+    rsi = ind.get("rsi")
+    macd_hist = ind.get("macd_hist")
+
+    if macd_hist is not None and macd_hist > 0:
+        return "🟢 반등 신호 — 손절 보류 검토"
+    elif rsi is not None and rsi < 30:
+        return "🟠 과매도 구간 — 반등 가능성도 있음"
+    elif close is not None and ma20 is not None and close > ma20:
+        return "🟢 단기 추세 개선 중"
+    else:
+        return "🔴 하락 지속"
+
+
 def _attach_sell_trend_note(candidates: list[dict]) -> None:
     """
     각 후보 dict에 get_indicators 기반 추세 정보를 trend_note 필드로 붙인다.
-    (판단은 사람이 — 추세가 좋다고 후보에서 빼지 않는다. 정보만 추가한다.
-     미래 예측 아님 — "반등할 것"이 아니라 "반등 신호가 보인다"까지만 기술.)
+    분류 단계에서 이미 trend_note가 계산된 후보는 재조회하지 않는다 (중복 API 호출 방지).
     """
     for c in candidates:
-        ind = get_indicators(c["ticker"])
-        if "error" in ind:
-            c["trend_note"] = None
+        if "trend_note" in c:
             continue
-
-        close, ma20 = ind.get("close"), ind.get("ma20")
-        rsi = ind.get("rsi")
-        macd_hist = ind.get("macd_hist")
-
-        if macd_hist is not None and macd_hist > 0:
-            c["trend_note"] = "🟢 반등 신호 — 손절 보류 검토"
-        elif rsi is not None and rsi < 30:
-            c["trend_note"] = "🟠 과매도 구간 — 반등 가능성도 있음"
-        elif close is not None and ma20 is not None and close > ma20:
-            c["trend_note"] = "🟢 단기 추세 개선 중"
-        else:
-            c["trend_note"] = "🔴 하락 지속"
+        c["trend_note"] = _sell_trend_note_for(c["ticker"])
 
 
 # ═══════════════════════════════════════════════
@@ -2517,6 +2525,7 @@ def evaluate_sell_rules() -> dict:
     임계값 상수 (함수 상단에서 수정 가능)
     ----------------------------------------
     STOP_LOSS_PCT   : 수익률 ≤ 이 값이면 손절 후보
+    HARD_FLOOR_PCT  : 수익률 ≤ 이 값이면 추세 무관 무조건 손절 후보
     TAKE_PROFIT_PCT : 수익률 ≥ 이 값이면 익절 후보
 
     Returns
@@ -2526,6 +2535,7 @@ def evaluate_sell_rules() -> dict:
             "as_of": str,
             "rules": {
                 "stop_loss_pct":   float,   # 손절 임계값 (예: -10.0)
+                "hard_floor_pct":  float,   # 하드 플로어 임계값 (예: -15.0) — 도달 시 추세 무관 무조건 손절 후보
                 "take_profit_pct": float,   # 익절 임계값 (예:  20.0)
             },
             "stop_loss": [
@@ -2537,9 +2547,10 @@ def evaluate_sell_rules() -> dict:
                     "action":          str,
                     "market":          str,   # "KR" | "US"
                     "currency":        str,   # "KRW" | "USD"
-                    "trend_note":      str | None,  # get_indicators 기반 추세 정보 (참고용, 후보 제외 사유 아님)
+                    "trend_note":      str | None,  # get_indicators 기반 추세 정보 (손절 구간에서는 보류 판단에 사용됨)
                 }
             ],
+            "stop_loss_deferred": [...],  # 같은 구조 — 손절 규칙 도달했으나 반등 신호/과매도로 그날 보류
             "take_profit": [...],   # 같은 구조 (trend_note 포함), 수익률 높은 순 정렬
             "hold": {
                 "count":    int,
@@ -2547,10 +2558,11 @@ def evaluate_sell_rules() -> dict:
                 "overseas": int,
             },
             "summary": {
-                "total_holdings":    int,
-                "stop_loss_count":   int,
-                "take_profit_count": int,
-                "hold_count":        int,
+                "total_holdings":          int,
+                "stop_loss_count":         int,
+                "stop_loss_deferred_count": int,
+                "take_profit_count":       int,
+                "hold_count":              int,
             },
             "disclaimer": str,
         }
@@ -2558,6 +2570,7 @@ def evaluate_sell_rules() -> dict:
     """
     # ── 규칙 임계값 ─────────────────────────────────────────────
     STOP_LOSS_PCT   = -10.0   # 수익률 <= 이 값 → 손절 후보
+    HARD_FLOOR_PCT  = -15.0   # 도달 시 추세 무관 무조건 손절 후보 (2단계 확정 수치)
     TAKE_PROFIT_PCT =  20.0   # 수익률 >= 이 값 → 익절 후보
 
     # ── 1. 잔고 조회 ─────────────────────────────────────────────
@@ -2570,9 +2583,10 @@ def evaluate_sell_rules() -> dict:
         return {"error": "보유 종목이 없습니다."}
 
     # ── 2. 규칙 분류 ─────────────────────────────────────────────
-    stop_loss:   list[dict] = []
-    take_profit: list[dict] = []
-    hold:        list[dict] = []
+    stop_loss:          list[dict] = []
+    stop_loss_deferred: list[dict] = []
+    take_profit:        list[dict] = []
+    hold:               list[dict] = []
 
     for h in holdings:
         pct      = h.get("profit_loss_pct")
@@ -2592,12 +2606,33 @@ def evaluate_sell_rules() -> dict:
             "currency":        currency,
         }
 
-        if pct <= STOP_LOSS_PCT:
+        if pct <= HARD_FLOOR_PCT:
+            # 하드 플로어: 추세와 무관하게 무조건 손절 후보 (2단계 확정 수치)
             entry["reason"] = (
-                f"손절 규칙: 수익률 {pct:+.2f}% ≤ {STOP_LOSS_PCT:+.1f}%"
+                f"하드 플로어: 수익률 {pct:+.2f}% ≤ {HARD_FLOOR_PCT:+.1f}% — 추세 무관 무조건 매도 후보"
             )
-            entry["action"] = "손절 후보"
+            entry["action"] = "손절 후보 (하드 플로어)"
             stop_loss.append(entry)
+        elif pct <= STOP_LOSS_PCT:
+            # 손절 구간(-15% 초과 ~ -10% 이하): 추세를 먼저 보고 보류 여부 결정
+            note = _sell_trend_note_for(ticker)
+            entry["trend_note"] = note
+            if note is not None and ("반등 신호" in note or "과매도" in note):
+                # 그날 손절 보류 — 상태 저장 없음. 매 실행마다 최신 지표로 재판단되므로
+                # 다음 실행에서 신호가 사라지면 자연히 손절 후보로 복귀한다.
+                entry["reason"] = (
+                    f"손절 규칙 도달(수익률 {pct:+.2f}% ≤ {STOP_LOSS_PCT:+.1f}%)이지만 "
+                    f"추세({note}) 기준으로 오늘은 손절 보류 (2단계 확정 수치)"
+                )
+                entry["action"] = "손절 보류"
+                stop_loss_deferred.append(entry)
+            else:
+                # 지표 조회 실패(None) 포함 — 근거 없이 보류하지 않고 규칙대로 손절 후보 유지
+                entry["reason"] = (
+                    f"손절 규칙: 수익률 {pct:+.2f}% ≤ {STOP_LOSS_PCT:+.1f}%"
+                )
+                entry["action"] = "손절 후보"
+                stop_loss.append(entry)
         elif pct >= TAKE_PROFIT_PCT:
             entry["reason"] = (
                 f"익절 규칙: 수익률 {pct:+.2f}% ≥ +{TAKE_PROFIT_PCT:.1f}%"
@@ -2614,6 +2649,7 @@ def evaluate_sell_rules() -> dict:
 
     # ── 3. 정렬 (손절: 수익률 낮은 순, 익절: 수익률 높은 순) ──
     stop_loss.sort(key=lambda x: x["profit_loss_pct"])
+    stop_loss_deferred.sort(key=lambda x: x["profit_loss_pct"])
     take_profit.sort(key=lambda x: x["profit_loss_pct"], reverse=True)
 
     # ── 3-1. 추세 정보 부착 (후보 제외 아님, 참고 정보만 추가) ──
@@ -2628,20 +2664,23 @@ def evaluate_sell_rules() -> dict:
         "as_of": datetime.now().isoformat(timespec="seconds"),
         "rules": {
             "stop_loss_pct":   STOP_LOSS_PCT,
+            "hard_floor_pct":  HARD_FLOOR_PCT,
             "take_profit_pct": TAKE_PROFIT_PCT,
         },
-        "stop_loss":   stop_loss,
-        "take_profit": take_profit,
+        "stop_loss":          stop_loss,
+        "stop_loss_deferred": stop_loss_deferred,
+        "take_profit":        take_profit,
         "hold": {
             "count":    len(hold),
             "domestic": hold_kr,
             "overseas": hold_us,
         },
         "summary": {
-            "total_holdings":    len(holdings),
-            "stop_loss_count":   len(stop_loss),
-            "take_profit_count": len(take_profit),
-            "hold_count":        len(hold),
+            "total_holdings":          len(holdings),
+            "stop_loss_count":         len(stop_loss),
+            "stop_loss_deferred_count": len(stop_loss_deferred),
+            "take_profit_count":       len(take_profit),
+            "hold_count":              len(hold),
         },
         "disclaimer": (
             "이 분류는 규칙 기반 참고 정보이며 투자 권유가 아닙니다. "
@@ -2721,10 +2760,12 @@ def evaluate_buy_rule_A(market: str = "ALL", universe_limit: int | None = None) 
                     "market"     : str,     # "KR" | "US"
                     "reason"     : "점수 상위",
                     "key_metrics": dict,
-                    "trend_warning": str | None,  # get_indicators 기반 현재 추세 경고 (없으면 None)
+                    "trend_warning": str | None,  # get_indicators 기반 현재 추세 경고 (하락 추세는 보류 판단에 사용됨)
                 }
             ],
             "count"     : int,
+            "excluded"  : list,   # 규칙상 제외/보류된 후보와 사유 (흑자전환★ 제외, 하락 추세 보류)
+            "excluded_count": int,
             "disclaimer": str,
         }
         실패 시: {"error": "..."}
@@ -2751,11 +2792,24 @@ def evaluate_buy_rule_A(market: str = "ALL", universe_limit: int | None = None) 
         return {"error": f"스크리닝 실패: {screened['error']}"}
 
     # ── 3. 필터: 점수 기준 + 미보유 ─────────────────────────────
+    excluded: list[dict] = []   # 규칙상 제외/보류된 후보 (사유 기록 — Phase 0 관찰 데이터)
     candidates: list[dict] = []
     for item in screened.get("results", []):
         if item["total_score"] < BUY_SCORE_MIN:
             break   # results는 점수 내림차순 — 이후는 모두 기준 미달
         if item["ticker"] in held_tickers:
+            continue
+        if item.get("is_turnaround"):
+            # 흑자전환★ 종목 매수 제외 (2단계 확정 수치 — SK스퀘어 점수 왜곡 사례의 코드화)
+            # 루프 안에서 걸러지므로 빈 자리는 다음 순위 종목이 자동으로 채운다.
+            excluded.append({
+                "ticker": item["ticker"],
+                "name":   item["name"],
+                "score":  item["total_score"],
+                "sector": item["sector"],
+                "market": "KR" if _is_korean(item["ticker"]) else "US",
+                "reason": "흑자전환★ 제외 — 성장률 기저효과로 점수 왜곡 가능",
+            })
             continue
         candidates.append({
             "ticker":      item["ticker"],
@@ -2771,6 +2825,18 @@ def evaluate_buy_rule_A(market: str = "ALL", universe_limit: int | None = None) 
 
     _attach_trend_warning(candidates)
 
+    # 하락 추세 후보 매수 보류 (2단계 확정 수치)
+    # 빈 자리를 다음 순위로 채우지 않는다 — 하락장에는 후보가 적은 것이 자연스럽다 (설계 결정).
+    _kept: list[dict] = []
+    for c in candidates:
+        tw = c.get("trend_warning")
+        if tw and "하락 추세" in tw:
+            c["reason"] = "하락 추세 — 매수 보류"
+            excluded.append(c)
+        else:
+            _kept.append(c)
+    candidates = _kept
+
     return {
         "rule":  "A — 점수 집중",
         "as_of": datetime.now().isoformat(timespec="seconds"),
@@ -2780,9 +2846,11 @@ def evaluate_buy_rule_A(market: str = "ALL", universe_limit: int | None = None) 
             "market":         market,
             "universe_limit": universe_limit,
         },
-        "held_tickers": sorted(held_tickers),
-        "candidates":   candidates,
-        "count":        len(candidates),
+        "held_tickers":   sorted(held_tickers),
+        "candidates":     candidates,
+        "count":          len(candidates),
+        "excluded":       excluded,
+        "excluded_count": len(excluded),
         "disclaimer": (
             "이 목록은 규칙 기반 참고 정보이며 투자 권유가 아닙니다. "
             "실제 매수 여부는 본인이 판단·결정하세요. 미래 가격을 예측하지 않습니다."
@@ -2836,10 +2904,12 @@ def evaluate_buy_rule_B(market: str = "ALL", universe_limit: int | None = None) 
                     "market"     : str,
                     "reason"     : "부족섹터 OO 보강",
                     "key_metrics": dict,
-                    "trend_warning": str | None,  # get_indicators 기반 현재 추세 경고 (없으면 None)
+                    "trend_warning": str | None,  # get_indicators 기반 현재 추세 경고 (하락 추세는 보류 판단에 사용됨)
                 }
             ],
             "count"    : int,
+            "excluded" : list,   # 규칙상 제외/보류된 후보와 사유 (흑자전환★ 제외, 하락 추세 보류)
+            "excluded_count": int,
             "disclaimer": str,
         }
         실패 시: {"error": "..."}
@@ -2923,6 +2993,8 @@ def evaluate_buy_rule_B(market: str = "ALL", universe_limit: int | None = None) 
             "held_tickers":      sorted(held_tickers),
             "candidates":        [],
             "count":             0,
+            "excluded":          [],
+            "excluded_count":    0,
             "message": (
                 f"유니버스 내 모든 섹터의 포트폴리오 비중이 "
                 f"{SECTOR_UNDERWEIGHT_PCT}% 이상입니다. 현재 분산 상태가 양호합니다."
@@ -2934,6 +3006,7 @@ def evaluate_buy_rule_B(market: str = "ALL", universe_limit: int | None = None) 
         }
 
     # ── 5. 후보 필터: 부족 섹터 + 점수 기준 + 미보유 ─────────────
+    excluded: list[dict] = []   # 규칙상 제외/보류된 후보 (사유 기록 — Phase 0 관찰 데이터)
     candidates: list[dict] = []
     for item in screened.get("results", []):
         if item["total_score"] < BUY_SCORE_MIN:
@@ -2941,6 +3014,18 @@ def evaluate_buy_rule_B(market: str = "ALL", universe_limit: int | None = None) 
         if item["ticker"] in held_tickers:
             continue
         if item["sector"] not in deficit_sectors:
+            continue
+        if item.get("is_turnaround"):
+            # 흑자전환★ 종목 매수 제외 (2단계 확정 수치 — SK스퀘어 점수 왜곡 사례의 코드화)
+            # 루프 안에서 걸러지므로 빈 자리는 다음 순위 종목이 자동으로 채운다.
+            excluded.append({
+                "ticker": item["ticker"],
+                "name":   item["name"],
+                "score":  item["total_score"],
+                "sector": item["sector"],
+                "market": "KR" if _is_korean(item["ticker"]) else "US",
+                "reason": "흑자전환★ 제외 — 성장률 기저효과로 점수 왜곡 가능",
+            })
             continue
         candidates.append({
             "ticker":      item["ticker"],
@@ -2955,6 +3040,18 @@ def evaluate_buy_rule_B(market: str = "ALL", universe_limit: int | None = None) 
             break
 
     _attach_trend_warning(candidates)
+
+    # 하락 추세 후보 매수 보류 (2단계 확정 수치)
+    # 빈 자리를 다음 순위로 채우지 않는다 — 하락장에는 후보가 적은 것이 자연스럽다 (설계 결정).
+    _kept: list[dict] = []
+    for c in candidates:
+        tw = c.get("trend_warning")
+        if tw and "하락 추세" in tw:
+            c["reason"] = "하락 추세 — 매수 보류"
+            excluded.append(c)
+        else:
+            _kept.append(c)
+    candidates = _kept
 
     return {
         "rule":  "B — 분산 채우기",
@@ -2971,6 +3068,8 @@ def evaluate_buy_rule_B(market: str = "ALL", universe_limit: int | None = None) 
         "held_tickers":      sorted(held_tickers),
         "candidates":        candidates,
         "count":             len(candidates),
+        "excluded":          excluded,
+        "excluded_count":    len(excluded),
         "disclaimer": (
             "이 목록은 규칙 기반 참고 정보이며 투자 권유가 아닙니다. "
             "실제 매수 여부는 본인이 판단·결정하세요. 미래 가격을 예측하지 않습니다."
