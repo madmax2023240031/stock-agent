@@ -732,6 +732,8 @@ def place_kis_order(
         "price_source":          price_source,
     }
 
+    # amount_ok는 "금액 상한 검사를 통과했는가"의 의미.
+    # 매도(SELL)는 상한 면제(결정 2)이므로 금액과 무관하게 항상 True 처리됨.
     safety_info = {
         "account_ok":    True,
         "amount_ok":     True,
@@ -3352,7 +3354,8 @@ def get_trade_log(rule_tag: str | None = None) -> dict:
 
 def summarize_trades_by_rule() -> dict:
     """
-    거래 로그를 규칙별(A / B / MANUAL)로 묶어 요약한다.
+    거래 로그를 rule_tag별(A / B / MANUAL / SELL)로 묶어 요약한다.
+    SELL = 매도 규칙 자동매도(손절 -10% / 익절 +20%) 태그로, 집계 대상에 포함된다.
 
     Returns
     -------
