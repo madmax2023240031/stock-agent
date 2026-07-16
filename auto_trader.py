@@ -6,12 +6,14 @@ auto_trader.py — 0단계(관찰) 전용 자동매매 "조립" 프로그램  [v
 tools.py에 이미 만들어진 부품들을 **순서대로 연결만** 한다. 새 매매 로직은 없다.
 
     매수 파이프라인 (규칙 A / B):
-        evaluate_buy_rule_A/B  →  get_quote(가격)  →  size_buy_order(수량 환산)
+        update_kill_switch_state(킬 스위치)  →  evaluate_buy_rule_A/B
+        →  get_quote(가격)  →  size_buy_order(수량 환산)
         →  get_combined_auto_trade_stats_today + check_guardrails(가드레일)
         →  place_kis_order(dry_run=True, 주문서만)  →  dry-run 로그 기록
 
     매도 파이프라인 (규칙 SELL — 손절 -10% / 익절 +20%):
-        evaluate_sell_rules  →  get_kis_balance(보유 수량)  →  size_sell_order(전량)
+        update_kill_switch_state(킬 스위치)  →  evaluate_sell_rules
+        →  get_kis_balance(보유 수량)  →  size_sell_order(전량)
         →  check_guardrails(거래일·시간·횟수 확인)
         →  place_kis_order(dry_run=True, 주문서만)  →  dry-run 로그 기록
 
@@ -62,6 +64,7 @@ from tools import (
     get_kis_balance,
     get_quote,
     place_kis_order,
+    update_kill_switch_state,
 )
 
 # ═══════════════════════════════════════════════
@@ -258,6 +261,16 @@ def run_buy_rule(
 
     rule_fn = evaluate_buy_rule_A if rule_tag == "A" else evaluate_buy_rule_B
 
+    # ── 0. 킬 스위치 상태 갱신 (작업 1-b 배선 — 판단은 check_guardrails가 한다) ──
+    ks = update_kill_switch_state(now=now_inject)
+    if "error" in ks:
+        # fail-safe: 킬 스위치 입력을 못 구하면 진행하지 않는다 (누적치 집계 실패와 동일 철학)
+        entry = _make_entry(run_id, rule_tag, "ERROR",
+                            note=f"킬 스위치 상태 갱신 실패 → 진행 중단: {ks['error']}",
+                            test_now=test_now)
+        _append_dryrun_log(entry)
+        return {"run_id": run_id, "error": ks["error"]}
+
     # ── 1. 규칙 평가 (판단/제안만) ──────────────────────────────
     result = rule_fn(market=market, universe_limit=universe_limit)
     if "error" in result:
@@ -350,6 +363,8 @@ def run_buy_rule(
             sector_accumulated_krw=rule_stats["by_sector"].get(sector, 0)
                                    + session_by_sector.get(sector, 0),
             daily_trades=stats["daily_buy_trades"] + session_trades,
+            daily_pnl_pct=ks["daily_pnl_pct"],
+            cumulative_pnl_pct=ks["cumulative_pnl_pct"],
             now=now_inject,
         )
         if "error" in gr:
@@ -413,6 +428,16 @@ def run_sell_rule(test_now: str | None = None) -> dict:
     _assert_phase0()
     run_id = f"sell-{uuid.uuid4().hex[:8]}"
     now_inject = _parse_test_now(test_now)
+
+    # ── 0. 킬 스위치 상태 갱신 (작업 1-b 배선 — 판단은 check_guardrails가 한다) ──
+    ks = update_kill_switch_state(now=now_inject)
+    if "error" in ks:
+        # fail-safe: 킬 스위치 입력을 못 구하면 진행하지 않는다 (누적치 집계 실패와 동일 철학)
+        entry = _make_entry(run_id, "SELL", "ERROR",
+                            note=f"킬 스위치 상태 갱신 실패 → 진행 중단: {ks['error']}",
+                            test_now=test_now)
+        _append_dryrun_log(entry)
+        return {"run_id": run_id, "error": ks["error"]}
 
     # ── 1. 매도 규칙 평가 (판단/제안만) ─────────────────────────
     result = evaluate_sell_rules()
@@ -481,6 +506,9 @@ def run_sell_rule(test_now: str | None = None) -> dict:
             sector_accumulated_krw=0,
             # 설계 결정 1: 매도는 하루 5회 상한 제외 (리스크 축소 행위)
             daily_trades=0,
+            # 킬 스위치는 매도에도 적용 — 재검토 ② 결정. 발동 시 보유분 정리는 사람 몫
+            daily_pnl_pct=ks["daily_pnl_pct"],
+            cumulative_pnl_pct=ks["cumulative_pnl_pct"],
             now=now_inject,
         )
         if "error" in gr:
