@@ -60,6 +60,7 @@ from tools import (
     evaluate_buy_rule_A,
     evaluate_buy_rule_B,
     evaluate_sell_rules,
+    get_auto_trade_positions,
     get_combined_auto_trade_stats_today,
     get_kis_balance,
     get_quote,
@@ -166,6 +167,7 @@ def _make_entry(
     note: str = "",
     test_now: str | None = None,
     eval_summary: dict | None = None,
+    rule_split: dict | None = None,
 ) -> dict:
     """dry-run 로그 1건 양식. decision: ORDER_DRAFTED | BLOCKED | SKIPPED | ERROR | EVAL_SUMMARY"""
     return {
@@ -187,6 +189,7 @@ def _make_entry(
         "note": note,
         "test_now": test_now,          # --test-now 사용 시 그대로 기록 (실험 투명성)
         "eval_summary": eval_summary,  # EVAL_SUMMARY 기록 전용 — excluded/stop_loss_deferred 관찰 데이터
+        "rule_split": rule_split,     # C-2: 매도 주문 1건의 A/B 규칙별 수량 분할 (기록 준비용)
     }
 
 
@@ -212,6 +215,29 @@ def size_sell_order(holding_qty: int | None) -> int:
     if holding_qty is None or holding_qty < 1:
         return 0
     return int(holding_qty)
+
+
+def _split_sell_qty(sell_qty: int, book_a_qty: int, book_b_qty: int) -> dict:
+    """
+    C-2: 매도 수량을 규칙 A/B분으로 분할한다 (기록 준비용 산수 — 주문은 항상 1건).
+    - 정상: sell_qty == 장부 A+B 합 → 장부 수량 그대로.
+    - 불일치(sell_qty < 합): A:B 장부 비율로 비례 배분 (A는 내림, 나머지 B).
+      A/B 실험 공정성을 위해 한쪽 우선 차감 대신 비례 배분을 쓴다.
+    - 반환 A+B는 항상 sell_qty와 일치한다 (log_trade 2건 분할의 전제).
+    """
+    book_total = book_a_qty + book_b_qty
+    if sell_qty <= 0 or book_total <= 0:
+        return {"A": 0, "B": 0, "book_total": book_total,
+                "mismatch": sell_qty != book_total}
+    if sell_qty >= book_total:
+        return {"A": book_a_qty, "B": book_b_qty, "book_total": book_total,
+                "mismatch": sell_qty != book_total}
+    a = (sell_qty * book_a_qty) // book_total
+    b = sell_qty - a
+    if b > book_b_qty:          # 내림 보정 안전장치 (이론상 도달 불가)
+        a += b - book_b_qty
+        b = book_b_qty
+    return {"A": a, "B": b, "book_total": book_total, "mismatch": True}
 
 
 def _draft_order(ticker: str, side: str, qty: int) -> dict:
@@ -492,6 +518,20 @@ def run_sell_rule(test_now: str | None = None) -> dict:
         test_now=test_now))
     records += 1
 
+    # ── 1-2. 자동매매 장부 조회 (작업 3-b, C-1: 자동매매는 자동매매가 산 것만 판다) ──
+    # fail-safe: 장부 재생 실패(로그 불일치)는 킬 스위치 실패와 동일 — 이 사이클 매도 전부 중단.
+    book = get_auto_trade_positions()
+    if "error" in book:
+        entry = _make_entry(run_id, "SELL", "ERROR",
+                            note=f"자동매매 장부 조회 실패 → 매도 전체 중단: {book['error']}",
+                            test_now=test_now)
+        _append_dryrun_log(entry)
+        return {"run_id": run_id, "error": book["error"], "records": records}
+
+    combined_pos = book.get("combined", {}).get("positions", {})
+    rule_a_pos = book.get("by_rule", {}).get("A", {}).get("positions", {})
+    rule_b_pos = book.get("by_rule", {}).get("B", {}).get("positions", {})
+
     if not sell_candidates:
         entry = _make_entry(run_id, "SELL", "SKIPPED",
                             note="손절/익절 후보 없음", test_now=test_now)
@@ -526,8 +566,22 @@ def run_sell_rule(test_now: str | None = None) -> dict:
             records += 1
             continue
 
+        # ── 3-1. C-1 필터: 자동매매 장부에 없는 종목(수동 보유분)은 팔지 않는다 ──
+        # 조용히 버리지 않고 로그에 남긴다 (Phase 0 관찰 데이터).
+        auto_pos = combined_pos.get(ticker)
+        auto_qty = int(auto_pos["qty"]) if auto_pos else 0
+        if auto_qty < 1:
+            _append_dryrun_log(_make_entry(
+                run_id, "SELL", "SKIPPED", ticker=ticker, name=name, side="SELL",
+                note=f"자동매매 장부에 없음 — 수동 보유분은 사람이 직접 관리 ({reason})",
+                test_now=test_now))
+            records += 1
+            continue
+
         holding = holdings_by_ticker.get(ticker)
-        qty = size_sell_order(holding.get("qty") if holding else None)
+        account_qty = int(holding.get("qty") or 0) if holding else 0
+        # C-1: 매도 수량 상한 = 자동매매 장부 수량 (계좌 전량 아님)
+        qty = size_sell_order(min(account_qty, auto_qty))
         price = float(holding.get("current_price") or 0) if holding else 0.0
         if qty < 1 or price <= 0:
             _append_dryrun_log(_make_entry(
@@ -582,11 +636,19 @@ def run_sell_rule(test_now: str | None = None) -> dict:
             records += 1
             continue
 
+        # C-2: 주문은 1건, 기록은 A/B 분할 준비 (log_trade 배선은 진입 커밋 이후)
+        split = _split_sell_qty(
+            qty,
+            int(rule_a_pos.get(ticker, {}).get("qty", 0)),
+            int(rule_b_pos.get(ticker, {}).get("qty", 0)),
+        )
+
         _append_dryrun_log(_make_entry(
             run_id, "SELL", "ORDER_DRAFTED", ticker=ticker, name=name, side="SELL",
             qty=qty, price=price, order_amount_krw=order_amount,
-            guardrail=gr, order_draft=draft,
-            note=f"[DRY RUN] 매도 규칙 주문서 작성 (전량) — 실제 전송 안 됨. 근거: {reason}",
+            guardrail=gr, order_draft=draft, rule_split=split,
+            note=f"[DRY RUN] 매도 규칙 주문서 작성 (전량) — 실제 전송 안 됨. 근거: {reason}"
+                 f" / C-2 분할: A={split['A']} B={split['B']}",
             test_now=test_now))
         records += 1
         drafted += 1
