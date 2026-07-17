@@ -1,5 +1,5 @@
 """
-auto_trader.py — 0단계(관찰) 전용 자동매매 "조립" 프로그램  [v3]
+auto_trader.py — 0단계(관찰) 전용 자동매매 "조립" 프로그램  [v4]
 
 역할
 ----
@@ -27,6 +27,9 @@ tools.py에 이미 만들어진 부품들을 **순서대로 연결만** 한다. 
    실제 A/B 실험 장부(trade_log.json / log_trade)는 절대 건드리지 않는다.
    _assert_phase0()가 두 경로가 같지 않은지도 검사한다.
 4. 매도 기록의 rule_tag는 처음부터 정식 "SELL" 태그를 쓴다.
+5. 승인 모드(작업 3-c): APPROVAL_REQUIRED = True — 주문서마다 사람이 y/n 승인.
+   'y' 이외의 모든 입력(Enter·EOF 포함)은 거절 ("기본값은 거절").
+   Phase 0에서는 승인해도 실주문이 나가지 않는다 (dry_run=True 고정).
 
 사용 예 (반드시 ./venv/bin/python 사용)
 ----------------------------------------
@@ -75,6 +78,8 @@ from tools import (
 PHASE = 0
 MASTER_ENABLE = False          # 실주문 마스터 스위치 — 0단계에서는 잠금 (True 금지)
 DRY_RUN = True                 # 항상 True — 이 파일에 dry_run=False 경로는 없다
+APPROVAL_REQUIRED = True       # 작업 3-c: 승인 모드 — 주문서마다 사람이 y/n 승인.
+                               # 면제 전환은 자동 금지 — 2~3일 검증 후 별도 세션에서 명시적으로만 변경.
 
 _BASE_DIR = Path(__file__).resolve().parent
 DRYRUN_LOG_PATH = str(_BASE_DIR / "auto_trader_dryrun_log.json")
@@ -168,6 +173,7 @@ def _make_entry(
     test_now: str | None = None,
     eval_summary: dict | None = None,
     rule_split: dict | None = None,
+    approval: dict | None = None,
 ) -> dict:
     """dry-run 로그 1건 양식. decision: ORDER_DRAFTED | BLOCKED | SKIPPED | ERROR | EVAL_SUMMARY"""
     return {
@@ -190,6 +196,7 @@ def _make_entry(
         "test_now": test_now,          # --test-now 사용 시 그대로 기록 (실험 투명성)
         "eval_summary": eval_summary,  # EVAL_SUMMARY 기록 전용 — excluded/stop_loss_deferred 관찰 데이터
         "rule_split": rule_split,     # C-2: 매도 주문 1건의 A/B 규칙별 수량 분할 (기록 준비용)
+        "approval": approval,          # 작업 3-c: 승인 모드 결정 기록 (required/approved/answer/decided_at)
     }
 
 
@@ -247,6 +254,64 @@ def _draft_order(ticker: str, side: str, qty: int) -> dict:
     """
     _assert_phase0()
     return place_kis_order(ticker, side, qty, "MARKET", dry_run=True)
+
+
+def _ask_approval(
+    rule_tag: str,
+    ticker: str,
+    name: str,
+    side: str,
+    qty: int,
+    price: float,
+    order_amount: int,
+    reason: str,
+    guardrail: dict,
+    draft: dict,
+) -> dict:
+    """
+    승인 모드 (작업 3-c, 설계 확정 A): 주문서 요약을 터미널에 표시하고 y/n을 받는다.
+
+    - 'y' 이외의 모든 입력(Enter 포함)은 거절 — "기본값은 거절".
+    - 터미널 없이 실행(launchd 등)되어 input()이 EOFError를 내면 거절 처리
+      (기본값은 거절 원칙의 연장 — 비대화식 실행에서 자동 승인되는 경로는 없다).
+    - 주문 실행 코드는 없다. 사람의 결정을 dict로 돌려주기만 한다.
+    - Phase 0에서는 승인해도 실주문이 나가지 않는다 (dry_run=True 고정) —
+      여기서는 y/n 흐름과 기록만 검증한다.
+    """
+    side_kor = "매수" if side == "BUY" else "매도"
+    order = draft.get("order", {}) if isinstance(draft, dict) else {}
+    est = order.get("estimated_amount_krw")
+    est_display = f"{est:,}원" if isinstance(est, int) else "—"
+
+    print("\n" + "-" * 55)
+    print(f"  📋 [승인 요청] 규칙 {rule_tag} — {side_kor} 주문서 (DRY RUN)")
+    print("-" * 55)
+    print(f"  종목      : {name} ({ticker})")
+    print(f"  수량      : {qty:,}주")
+    print(f"  현재가    : {price:,.0f}원")
+    print(f"  주문금액  : {order_amount:,}원 (주문서 추정 {est_display})")
+    print(f"  사유      : {reason or '—'}")
+    print(f"  가드레일  : {'✅ 통과' if guardrail.get('passed') else '❌ 미통과'}")
+    print("-" * 55)
+    print("  ⚠️  Phase 0 — 승인해도 실제 주문은 전송되지 않습니다 (dry-run 기록만).")
+
+    note = ""
+    try:
+        answer = input("  이 주문서를 승인할까요? (y 이외의 모든 입력은 거절): ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        answer = ""
+        note = "입력 불가(비대화식 실행 또는 입력 중단) — 기본값 거절"
+        print("\n  입력을 받을 수 없어 거절 처리합니다 (기본값은 거절).")
+
+    approved = (answer == "y")
+    print(f"  → 결정: {'승인' if approved else '거절'} (입력값: '{answer}')")
+    return {
+        "required": True,
+        "approved": approved,
+        "answer": answer,
+        "decided_at": _now_kst().isoformat(timespec="seconds"),
+        "note": note,
+    }
 
 
 def _parse_test_now(s: str | None) -> datetime | None:
@@ -355,6 +420,8 @@ def run_buy_rule(
     session_trades = 0
 
     drafted = 0
+    approved_count = 0
+    rejected_count = 0
 
     for cand in candidates:
         if drafted >= max_orders:
@@ -443,24 +510,40 @@ def run_buy_rule(
             records += 1
             continue
 
+        # ── 6-1. 승인 모드 (작업 3-c, 설계 확정 A) — 기본값은 거절 ──
+        approval = None
+        if APPROVAL_REQUIRED:
+            approval = _ask_approval(rule_tag, ticker, name, "BUY", qty, price,
+                                     order_amount, cand.get("reason", ""), gr, draft)
+        approved = (approval is None) or approval["approved"]
+
         _append_dryrun_log(_make_entry(
             run_id, rule_tag, "ORDER_DRAFTED", ticker=ticker, name=name, side="BUY",
             qty=qty, price=price, order_amount_krw=order_amount, sector=sector,
-            guardrail=gr, order_draft=draft,
+            guardrail=gr, order_draft=draft, approval=approval,
             note=f"[DRY RUN] 규칙 {rule_tag} 매수 주문서 작성 — 실제 전송 안 됨. "
-                 f"근거: {cand.get('reason', '')}",
+                 f"근거: {cand.get('reason', '')}"
+                 + (f" / 승인 결정: {'승인' if approved else '거절'}" if approval else ""),
             test_now=test_now))
         records += 1
         drafted += 1
 
-        # 세션 누적 갱신 (통과분만)
+        if not approved:
+            rejected_count += 1
+            # 거절된 주문서는 (3단계라면) 집행되지 않으므로 세션 누적에 더하지 않는다.
+            # → 다음 후보의 가드레일 판정이 3단계 실제 동작과 같아진다 (거절도 관찰 데이터).
+            continue
+        approved_count += 1
+
+        # 세션 누적 갱신 (승인 통과분만)
         session_accum += order_amount
         session_by_ticker[ticker] = session_by_ticker.get(ticker, 0) + order_amount
         session_by_sector[sector] = session_by_sector.get(sector, 0) + order_amount
         session_trades += 1
 
     return {"run_id": run_id, "rule_tag": rule_tag,
-            "candidates": len(candidates), "records": records, "drafted": drafted}
+            "candidates": len(candidates), "records": records, "drafted": drafted,
+            "approved": approved_count, "rejected": rejected_count}
 
 
 # ═══════════════════════════════════════════════
@@ -551,6 +634,8 @@ def run_sell_rule(test_now: str | None = None) -> dict:
 
     drafted = 0
     session_trades = 0
+    approved_count = 0
+    rejected_count = 0
 
     for cand in sell_candidates:
         ticker = cand.get("ticker", "")
@@ -643,19 +728,32 @@ def run_sell_rule(test_now: str | None = None) -> dict:
             int(rule_b_pos.get(ticker, {}).get("qty", 0)),
         )
 
+        # ── 5-1. 승인 모드 (작업 3-c, 설계 확정 A) — 기본값은 거절 ──
+        approval = None
+        if APPROVAL_REQUIRED:
+            approval = _ask_approval("SELL", ticker, name, "SELL", qty, price,
+                                     order_amount, reason, gr, draft)
+        approved = (approval is None) or approval["approved"]
+
         _append_dryrun_log(_make_entry(
             run_id, "SELL", "ORDER_DRAFTED", ticker=ticker, name=name, side="SELL",
             qty=qty, price=price, order_amount_krw=order_amount,
-            guardrail=gr, order_draft=draft, rule_split=split,
+            guardrail=gr, order_draft=draft, rule_split=split, approval=approval,
             note=f"[DRY RUN] 매도 규칙 주문서 작성 (전량) — 실제 전송 안 됨. 근거: {reason}"
-                 f" / C-2 분할: A={split['A']} B={split['B']}",
+                 f" / C-2 분할: A={split['A']} B={split['B']}"
+                 + (f" / 승인 결정: {'승인' if approved else '거절'}" if approval else ""),
             test_now=test_now))
         records += 1
         drafted += 1
-        session_trades += 1
+        if approved:
+            approved_count += 1
+            session_trades += 1
+        else:
+            rejected_count += 1
 
     return {"run_id": run_id, "rule_tag": "SELL",
-            "candidates": len(sell_candidates), "records": records, "drafted": drafted}
+            "candidates": len(sell_candidates), "records": records, "drafted": drafted,
+            "approved": approved_count, "rejected": rejected_count}
 
 
 # ═══════════════════════════════════════════════
@@ -686,7 +784,7 @@ def main() -> None:
               f"({tools._KIS_ORDER_LIMIT_KRW:,}원)을 넘습니다. 주문서 작성이 거부될 수 있습니다.")
 
     print("=" * 60)
-    print(f"auto_trader v3 — 0단계 DRY RUN 전용 (실제 주문 없음)")
+    print(f"auto_trader v4 — 0단계 DRY RUN 전용 (실제 주문 없음)")
     print(f"MASTER_ENABLE={MASTER_ENABLE} / DRY_RUN={DRY_RUN}")
     print(f"기록 파일: {DRYRUN_LOG_PATH}")
     print("=" * 60)
@@ -713,7 +811,9 @@ def main() -> None:
         else:
             print(f"  [{s['run_id']}] 규칙 {s.get('rule_tag', '?')}: "
                   f"후보 {s.get('candidates', 0)}건 / 기록 {s.get('records', 0)}건 / "
-                  f"주문서 {s.get('drafted', 0)}건 (전부 dry-run)")
+                  f"주문서 {s.get('drafted', 0)}건 (전부 dry-run)"
+                  + (f" — 승인 {s.get('approved', 0)}건 · 거절 {s.get('rejected', 0)}건"
+                     if s.get('drafted', 0) else ""))
     print(f"\n상세 기록: {DRYRUN_LOG_PATH}")
     print("⚠️  이 프로그램은 0단계 관찰용입니다. 실제 주문은 단 1건도 전송되지 않았습니다.")
 
