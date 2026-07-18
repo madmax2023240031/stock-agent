@@ -76,6 +76,7 @@ from tools import (
     get_combined_auto_trade_stats_today,
     get_kis_balance,
     get_quote,
+    log_trade,
     place_kis_order,
     update_kill_switch_state,
 )
@@ -248,6 +249,7 @@ def _make_entry(
     rule_split: dict | None = None,
     approval: dict | None = None,
     execution: dict | None = None,
+    book_log: dict | None = None,
 ) -> dict:
     """dry-run 로그 1건 양식. decision: ORDER_DRAFTED | BLOCKED | SKIPPED | ERROR | EVAL_SUMMARY"""
     return {
@@ -272,6 +274,7 @@ def _make_entry(
         "rule_split": rule_split,     # C-2: 매도 주문 1건의 A/B 규칙별 수량 분할 (기록 준비용)
         "approval": approval,          # 작업 3-c: 승인 모드 결정 기록 (required/approved/answer/decided_at)
         "execution": execution,        # 진입 커밋: 실주문 게이트 실행 결과 (0단계 세트에서는 항상 None)
+        "book_log": book_log,   # 장부 기록 결과 — 실행 성공 시에만 채워짐 (0단계에서는 항상 None)
     }
 
 
@@ -640,13 +643,30 @@ def run_buy_rule(
         if approved and MASTER_ENABLE and not DRY_RUN:
             execution = _execute_order(ticker, "BUY", qty)
 
+        # 장부 기록 — 실행이 "성공"했을 때만 (주문이 안 나갔으면 장부에 적지 않는다)
+        book_log = None
+        if execution is not None and execution.get("success"):
+            r = log_trade(
+                rule_tag=rule_tag, ticker=ticker, side="BUY",
+                qty=qty, price=price,
+                reason=f"[auto_trader {run_id}] 규칙 {rule_tag} 자동매수 "
+                       f"(시장가 — 기록가는 주문시점 현재가)",
+                sector=sector, source_rule=None,
+            )
+            book_log = {"entries": [{"source_rule": None, "qty": qty, "result": r}],
+                        "all_logged": "error" not in r}
+
         _append_dryrun_log(_make_entry(
             run_id, rule_tag, "ORDER_DRAFTED", ticker=ticker, name=name, side="BUY",
             qty=qty, price=price, order_amount_krw=order_amount, sector=sector,
             guardrail=gr, order_draft=draft, approval=approval, execution=execution,
-            note=f"[DRY RUN] 규칙 {rule_tag} 매수 주문서 작성 — 실제 전송 안 됨. "
-                 f"근거: {cand.get('reason', '')}"
-                 + (f" / 승인 결정: {'승인' if approved else '거절'}" if approval else ""),
+            book_log=book_log,
+            note=(f"[DRY RUN] 규칙 {rule_tag} 매수 주문서 작성 — 실제 전송 안 됨. "
+                  if DRY_RUN else
+                  f"[LIVE] 규칙 {rule_tag} 매수 주문서 작성 — 실행 결과는 execution 필드 참조. ")
+                 + f"근거: {cand.get('reason', '')}"
+                 + (f" / 승인 결정: {'승인' if approved else '거절'}" if approval else "")
+                 + (" / ⚠️ 장부 기록 실패 — 수동 확인 필요" if book_log and not book_log["all_logged"] else ""),
             test_now=test_now))
         records += 1
         drafted += 1
@@ -863,14 +883,36 @@ def run_sell_rule(test_now: str | None = None) -> dict:
         if approved and MASTER_ENABLE and not DRY_RUN:
             execution = _execute_order(ticker, "SELL", qty)
 
+        # 장부 기록 — C-2: 주문은 1건이지만 장부는 rule_split대로 A/B 각각 기록
+        book_log = None
+        if execution is not None and execution.get("success"):
+            entries = []
+            for src in ("A", "B"):
+                part_qty = int(split.get(src, 0))
+                if part_qty < 1:
+                    continue  # 0주 분할은 기록 생략 (log_trade가 qty<1을 거절)
+                r = log_trade(
+                    rule_tag="SELL", ticker=ticker, side="SELL",
+                    qty=part_qty, price=price,
+                    reason=f"[auto_trader {run_id}] 매도 규칙 자동매도 — {reason} "
+                           f"(시장가 — 기록가는 주문시점 현재가)",
+                    sector=None, source_rule=src,
+                )
+                entries.append({"source_rule": src, "qty": part_qty, "result": r})
+            book_log = {"entries": entries,
+                        "all_logged": all("error" not in e["result"] for e in entries)}
+
         _append_dryrun_log(_make_entry(
             run_id, "SELL", "ORDER_DRAFTED", ticker=ticker, name=name, side="SELL",
             qty=qty, price=price, order_amount_krw=order_amount,
             guardrail=gr, order_draft=draft, rule_split=split, approval=approval,
-            execution=execution,
-            note=f"[DRY RUN] 매도 규칙 주문서 작성 (전량) — 실제 전송 안 됨. 근거: {reason}"
-                 f" / C-2 분할: A={split['A']} B={split['B']}"
-                 + (f" / 승인 결정: {'승인' if approved else '거절'}" if approval else ""),
+            execution=execution, book_log=book_log,
+            note=(f"[DRY RUN] 매도 규칙 주문서 작성 (전량) — 실제 전송 안 됨. 근거: {reason}"
+                  if DRY_RUN else
+                  f"[LIVE] 매도 규칙 주문서 작성 (전량) — 실행 결과는 execution 필드 참조. 근거: {reason}")
+                 + f" / C-2 분할: A={split['A']} B={split['B']}"
+                 + (f" / 승인 결정: {'승인' if approved else '거절'}" if approval else "")
+                 + (" / ⚠️ 장부 기록 실패 — 수동 확인 필요" if book_log and not book_log["all_logged"] else ""),
             test_now=test_now))
         records += 1
         drafted += 1
