@@ -89,9 +89,9 @@ from tools import (
 # 세트 전환은 사람이 별도 세션에서 네 값을 한꺼번에 바꿀 때만 가능하다.
 # ═══════════════════════════════════════════════
 
-PHASE = 0                      # 현재 단계 — 0단계 세트 유지 (진입 커밋에서는 값 변경 없음)
-MASTER_ENABLE = False          # 실주문 마스터 스위치 — 0단계에서는 잠금
-DRY_RUN = True                 # 0단계 세트에서는 True — 실주문 게이트는 dry_run=DRY_RUN으로만 전달
+PHASE = 3                      # 현재 단계 — 3단계 세트 (2026-07-20 JJG 승인 전환)
+MASTER_ENABLE = True           # 실주문 마스터 스위치 — 3단계에서 열림 (승인 필수)
+DRY_RUN = False                # 3단계 세트에서는 False — 실주문 게이트는 dry_run=DRY_RUN으로만 전달
 APPROVAL_REQUIRED = True       # 작업 3-c: 승인 모드 — 주문서마다 사람이 y/n 승인.
                                # 두 세트 모두 True — 승인 없는 실주문 조합은 존재하지 않는다.
 
