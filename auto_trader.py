@@ -497,7 +497,7 @@ def run_buy_rule(
     excluded = result.get("excluded", [])
     records = 0
 
-    # ── 1-1. 평가 요약 기록 (Phase 0 관찰 데이터) ───────────────
+    # ── 1-1. 평가 요약 기록 (관찰 데이터) ───────────────
     # 후보가 0개여도 excluded는 있을 수 있으므로 후보 없음 판정보다 먼저 기록한다.
     _append_dryrun_log(_make_entry(
         run_id, rule_tag, "EVAL_SUMMARY", side="BUY",
@@ -510,7 +510,7 @@ def run_buy_rule(
                 for x in excluded
             ],
         },
-        note="규칙 평가 요약 (excluded 포함 — Phase 0 관찰 데이터)",
+        note="규칙 평가 요약 (excluded 포함 — 관찰 데이터)",
         test_now=test_now))
     records += 1
 
@@ -518,7 +518,7 @@ def run_buy_rule(
         entry = _make_entry(run_id, rule_tag, "SKIPPED",
                             note="후보 없음 (규칙 기준 미달)", test_now=test_now)
         _append_dryrun_log(entry)
-        return {"run_id": run_id, "drafted": 0, "records": records + 1, "note": "후보 없음"}
+        return {"run_id": run_id, "rule_tag": rule_tag, "drafted": 0, "records": records + 1, "note": "후보 없음"}
 
     # ── 2. 오늘 누적치 집계 (가드레일 입력 — 손 계산 금지) ──────
     # 설계 결정 1·3: 하루 거래 횟수(매수만)는 A+B 합산, 금액 한도는 규칙별.
@@ -725,7 +725,7 @@ def run_sell_rule(test_now: str | None = None) -> dict:
     deferred = result.get("stop_loss_deferred", [])
     records = 0
 
-    # ── 1-1. 평가 요약 기록 (Phase 0 관찰 데이터) ───────────────
+    # ── 1-1. 평가 요약 기록 (관찰 데이터) ───────────────
     # 후보가 0개여도 stop_loss_deferred는 있을 수 있으므로 후보 없음 판정보다 먼저 기록한다.
     _append_dryrun_log(_make_entry(
         run_id, "SELL", "EVAL_SUMMARY", side="SELL",
@@ -740,7 +740,7 @@ def run_sell_rule(test_now: str | None = None) -> dict:
                 for d in deferred
             ],
         },
-        note="매도 규칙 평가 요약 (stop_loss_deferred 포함 — Phase 0 관찰 데이터)",
+        note="매도 규칙 평가 요약 (stop_loss_deferred 포함 — 관찰 데이터)",
         test_now=test_now))
     records += 1
 
@@ -762,7 +762,7 @@ def run_sell_rule(test_now: str | None = None) -> dict:
         entry = _make_entry(run_id, "SELL", "SKIPPED",
                             note="손절/익절 후보 없음", test_now=test_now)
         _append_dryrun_log(entry)
-        return {"run_id": run_id, "drafted": 0, "records": records + 1, "note": "후보 없음"}
+        return {"run_id": run_id, "rule_tag": "SELL", "drafted": 0, "records": records + 1, "note": "후보 없음"}
 
     # ── 2. 보유 수량·현재가 확보 (후보에는 수량이 없다) ─────────
     balance = get_kis_balance()
@@ -795,7 +795,7 @@ def run_sell_rule(test_now: str | None = None) -> dict:
             continue
 
         # ── 3-1. C-1 필터: 자동매매 장부에 없는 종목(수동 보유분)은 팔지 않는다 ──
-        # 조용히 버리지 않고 로그에 남긴다 (Phase 0 관찰 데이터).
+        # 조용히 버리지 않고 로그에 남긴다 (관찰 데이터).
         auto_pos = combined_pos.get(ticker)
         auto_qty = int(auto_pos["qty"]) if auto_pos else 0
         if auto_qty < 1:
