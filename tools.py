@@ -563,6 +563,17 @@ def get_kis_balance() -> dict:
         if err:
             ovrs_errors.append(err)
 
+    # KIS 해외잔고 API가 NASD 조회에 미국 전체를 반환해 NYSE 상장 종목이
+    # 이중 집계됨 (2026-07-22 실측) — 티커 기준 첫 행 유지
+    seen: dict = {}
+    for h in ovrs_holdings:
+        first = seen.get(h["ticker"])
+        if first is None:
+            seen[h["ticker"]] = h
+        elif h["qty"] != first["qty"] or h["avg_price"] != first["avg_price"]:
+            print(f"⚠️ get_kis_balance: {h['ticker']} 중복 행의 수량/평단 불일치 — 첫 행 유지")
+    ovrs_holdings = list(seen.values())
+
     # ── 3. 해외 합산 및 환율 환산 ──────────────────────────
     ovrs_eval_usd     = round(sum(h["eval_amount"]     for h in ovrs_holdings), 2)
     ovrs_purchase_usd = round(sum(h["purchase_amount"] for h in ovrs_holdings), 2)
