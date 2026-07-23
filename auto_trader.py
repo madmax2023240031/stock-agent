@@ -77,6 +77,7 @@ from tools import (
     get_kis_balance,
     get_quote,
     log_trade,
+    get_kis_fill_price,
     place_kis_order,
     update_kill_switch_state,
 )
@@ -646,14 +647,25 @@ def run_buy_rule(
         # 장부 기록 — 실행이 "성공"했을 때만 (주문이 안 나갔으면 장부에 적지 않는다)
         book_log = None
         if execution is not None and execution.get("success"):
+            # 안건 2: 체결평균가 조회 — 실패 시 fail-open(기존 주문시점 현재가로 기록)
+            fill = get_kis_fill_price(
+                execution.get("summary", {}).get("order_no", ""), ticker, qty)
+            prev_str = f"{price:,.0f}원" if isinstance(price, (int, float)) else "미상"
+            if fill.get("success"):
+                record_price = fill["fill_price"]
+                price_note   = f"(시장가 — 체결평균가 기록, 주문시점가 {prev_str})"
+            else:
+                record_price = price
+                price_note   = (f"(시장가 — 기록가는 주문시점 현재가 / "
+                                f"체결가 조회 실패: {fill.get('reason')})")
             r = log_trade(
                 rule_tag=rule_tag, ticker=ticker, side="BUY",
-                qty=qty, price=price,
-                reason=f"[auto_trader {run_id}] 규칙 {rule_tag} 자동매수 "
-                       f"(시장가 — 기록가는 주문시점 현재가)",
+                qty=qty, price=record_price,
+                reason=f"[auto_trader {run_id}] 규칙 {rule_tag} 자동매수 {price_note}",
                 sector=sector, source_rule=None,
             )
-            book_log = {"entries": [{"source_rule": None, "qty": qty, "result": r}],
+            book_log = {"fill": fill,
+                        "entries": [{"source_rule": None, "qty": qty, "result": r}],
                         "all_logged": "error" not in r}
 
         _append_dryrun_log(_make_entry(
@@ -886,6 +898,18 @@ def run_sell_rule(test_now: str | None = None) -> dict:
         # 장부 기록 — C-2: 주문은 1건이지만 장부는 rule_split대로 A/B 각각 기록
         book_log = None
         if execution is not None and execution.get("success"):
+            # 안건 2: 체결평균가 조회 — 실패 시 fail-open(기존 주문시점 현재가로 기록)
+            # 조회는 주문 1건당 1회(전량 qty 기준), 결과는 A/B 분할 기록에 동일 적용.
+            fill = get_kis_fill_price(
+                execution.get("summary", {}).get("order_no", ""), ticker, qty)
+            prev_str = f"{price:,.0f}원" if isinstance(price, (int, float)) else "미상"
+            if fill.get("success"):
+                record_price = fill["fill_price"]
+                price_note   = f"(시장가 — 체결평균가 기록, 주문시점가 {prev_str})"
+            else:
+                record_price = price
+                price_note   = (f"(시장가 — 기록가는 주문시점 현재가 / "
+                                f"체결가 조회 실패: {fill.get('reason')})")
             entries = []
             for src in ("A", "B"):
                 part_qty = int(split.get(src, 0))
@@ -893,13 +917,12 @@ def run_sell_rule(test_now: str | None = None) -> dict:
                     continue  # 0주 분할은 기록 생략 (log_trade가 qty<1을 거절)
                 r = log_trade(
                     rule_tag="SELL", ticker=ticker, side="SELL",
-                    qty=part_qty, price=price,
-                    reason=f"[auto_trader {run_id}] 매도 규칙 자동매도 — {reason} "
-                           f"(시장가 — 기록가는 주문시점 현재가)",
+                    qty=part_qty, price=record_price,
+                    reason=f"[auto_trader {run_id}] 매도 규칙 자동매도 — {reason} {price_note}",
                     sector=None, source_rule=src,
                 )
                 entries.append({"source_rule": src, "qty": part_qty, "result": r})
-            book_log = {"entries": entries,
+            book_log = {"fill": fill, "entries": entries,
                         "all_logged": all("error" not in e["result"] for e in entries)}
 
         _append_dryrun_log(_make_entry(

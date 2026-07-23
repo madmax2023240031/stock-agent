@@ -828,6 +828,126 @@ def place_kis_order(
 
 
 # ═══════════════════════════════════════════════
+# 0-B-1-b. get_kis_fill_price (안건 2 — 체결가 조회, 읽기 전용)
+# ═══════════════════════════════════════════════
+
+def get_kis_fill_price(
+    order_no: str,
+    ticker: str,
+    expected_qty: int,
+    order_date: str | None = None,
+) -> dict:
+    """
+    주문번호(ODNO)로 체결평균가를 조회한다 (읽기 전용 — 주문·장부 무접촉).
+
+    KIS 국내주식 주식일별주문체결조회.
+    tr_id는 모의투자 전용 VTTC0081R만 사용한다 (실전 분기 없음 — 구조적 안전장치).
+    안건 2: trade_log 기록가를 주문시점 현재가 → 실제 체결평균가로 바꾸는 부품.
+
+    동작
+    ----
+    - 호출 즉시 2.5초 대기(체결·조회 DB 반영 시간) 후 조회.
+      실패 시 3.0초 추가 대기 후 1회만 재시도 (모의계좌 호출 제한 고려).
+    - 전량 체결(총체결수량 == expected_qty)일 때만 success=True.
+      부분체결·미체결·취소·미발견·종목 불일치는 전부 실패로 돌려서
+      호출부의 fail-open(기존 주문시점가 기록)을 유도한다.
+    - order_date(YYYYMMDD)를 주면 해당 일자를 조회한다(소급 보정용).
+      기본값 None이면 오늘.
+
+    Returns
+    -------
+    dict
+      성공: {"success": True, "fill_price": float, "fill_qty": int, "fill_amount": int}
+      실패: {"success": False, "reason": "..."}
+    """
+    import os
+    import time
+    import requests
+    from dotenv import load_dotenv
+
+    load_dotenv()
+
+    order_no = str(order_no).strip()
+    if not order_no:
+        return {"success": False, "reason": "주문번호 없음"}
+
+    app_key    = os.getenv("KIS_APP_KEY",    "").strip()
+    app_secret = os.getenv("KIS_APP_SECRET", "").strip()
+    account_no = os.getenv("KIS_ACCOUNT_NO", "").strip().replace("-", "")
+    if len(account_no) != 10:
+        return {"success": False, "reason": f"KIS_ACCOUNT_NO 형식 오류: '{account_no}'"}
+
+    tok = get_kis_token()
+    if "error" in tok:
+        return {"success": False, "reason": f"토큰 실패: {tok['error']}"}
+
+    inqr_dt = (order_date or datetime.now().strftime("%Y%m%d")).strip()
+    headers = {
+        "content-type":  "application/json",
+        "authorization": f"Bearer {tok['access_token']}",
+        "appkey":        app_key,
+        "appsecret":     app_secret,
+        "tr_id":         "VTTC0081R",   # 모의투자 전용(3개월 이내) — 실전 tr_id 사용 금지
+        "custtype":      "P",
+    }
+    params = {
+        "CANO": account_no[:8], "ACNT_PRDT_CD": account_no[8:],
+        "INQR_STRT_DT": inqr_dt, "INQR_END_DT": inqr_dt,
+        "SLL_BUY_DVSN_CD": "00", "PDNO": ticker.strip(),
+        "CCLD_DVSN": "00", "INQR_DVSN": "00", "INQR_DVSN_3": "00",
+        "ORD_GNO_BRNO": "", "ODNO": order_no, "INQR_DVSN_1": "",
+        "CTX_AREA_FK100": "", "CTX_AREA_NK100": "",
+    }
+
+    def _query() -> dict:
+        try:
+            resp = requests.get(
+                f"{_KIS_DOMAIN}/uapi/domestic-stock/v1/trading/inquire-daily-ccld",
+                headers=headers, params=params, timeout=10,
+            )
+            resp.raise_for_status()
+            d = resp.json()
+        except Exception as exc:
+            return {"success": False, "reason": f"조회 API 에러: {exc}"}
+        if d.get("rt_cd") != "0":
+            return {"success": False, "reason": f"조회 API 오류: {d.get('msg1') or d}"}
+
+        # 주문번호 앞자리 0 개수가 주문 응답과 조회 응답에서 다를 수 있어 정규화 후 비교
+        target = order_no.lstrip("0")
+        for row in d.get("output1", []):
+            if str(row.get("odno", "")).lstrip("0") != target:
+                continue
+            if row.get("pdno", "").strip() != ticker.strip():
+                return {"success": False,
+                        "reason": f"종목 불일치: 조회={row.get('pdno')}, 기대={ticker}"}
+            if str(row.get("cncl_yn", "")).upper() == "Y":
+                return {"success": False, "reason": "취소된 주문"}
+            try:
+                fill_qty   = int(float(row.get("tot_ccld_qty") or 0))
+                fill_price = round(float(row.get("avg_prvs") or 0), 2)
+                fill_amt   = int(float(row.get("tot_ccld_amt") or 0))
+            except Exception as exc:
+                return {"success": False, "reason": f"응답 파싱 실패: {exc}"}
+            if fill_qty == 0:
+                return {"success": False, "reason": "미체결"}
+            if fill_qty != int(expected_qty):
+                return {"success": False,
+                        "reason": f"부분체결(체결 {fill_qty}/주문 {expected_qty})"}
+            if fill_price <= 0:
+                return {"success": False, "reason": f"체결평균가 이상값: {fill_price}"}
+            return {"success": True, "fill_price": fill_price,
+                    "fill_qty": fill_qty, "fill_amount": fill_amt}
+        return {"success": False, "reason": "주문번호 미발견"}
+
+    time.sleep(2.5)
+    result = _query()
+    if not result["success"]:
+        time.sleep(3.0)   # 재시도는 딱 1회 (모의계좌 REST 호출 제한)
+        result = _query()
+    return result
+
+
+# ═══════════════════════════════════════════════
 # 0-B-2. propose_and_confirm_order
 # ═══════════════════════════════════════════════
 
