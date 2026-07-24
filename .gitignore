@@ -41,3 +41,6 @@ kill_switch_state_TEST.json
 # 노션이 원본인 문서 (저장소 미포함 원칙)
 stock-agent-사용설명서.md
 stock-agent-자동매매로드맵.md
+
+# 유니버스 디스크 캐시 (작업 큐 ② — 로컬 상태 파일)
+universe_cache.json

@@ -2154,6 +2154,58 @@ _universe_cache: dict[str, tuple[float, list]] = {}
 _universe_lock = threading.Lock()
 _UNIVERSE_TTL = 3600
 
+# 유니버스 디스크 캐시 (작업 큐 ② — fdr 원격 404 시 폴백용)
+# gitignore 대상 로컬 상태 파일. 신선도 한도를 넘긴 캐시는 사용하지 않는다 —
+# "확실하지 않으면 안 산다" 원칙 유지 (캐시는 '과거에 확실했던 목록'일 때만 대체 허용).
+_UNIVERSE_DISK_CACHE_PATH = _BASE_DIR / "universe_cache.json"
+_UNIVERSE_DISK_MAX_AGE_DAYS = 7
+
+
+def _save_universe_disk_cache(key: str, tickers: list) -> None:
+    """유니버스 조회 성공분을 디스크 캐시에 저장한다. 저장 실패는 경고만 (본 기능을 죽이지 않음)."""
+    import json
+    try:
+        data: dict = {}
+        if _UNIVERSE_DISK_CACHE_PATH.exists():
+            with open(_UNIVERSE_DISK_CACHE_PATH, encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                data = loaded
+        data[key] = {
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+            "tickers": tickers,
+        }
+        with open(_UNIVERSE_DISK_CACHE_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+    except Exception as e:
+        print(f"⚠️ 유니버스 디스크 캐시 저장 실패 (계속 진행): {e}")
+
+
+def _load_universe_disk_cache(key: str) -> tuple[list, str] | dict:
+    """
+    디스크 캐시에서 유니버스를 읽는다.
+    성공: (tickers, saved_at) 튜플 / 실패: {"error": 사유} dict.
+    신선도 한도(_UNIVERSE_DISK_MAX_AGE_DAYS)를 넘긴 캐시는 만료로 거부한다.
+    """
+    import json
+    try:
+        if not _UNIVERSE_DISK_CACHE_PATH.exists():
+            return {"error": "디스크 캐시 파일 없음"}
+        with open(_UNIVERSE_DISK_CACHE_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        entry = data.get(key) if isinstance(data, dict) else None
+        if not entry or not entry.get("tickers"):
+            return {"error": f"디스크 캐시에 {key} 항목 없음"}
+        saved_at = str(entry.get("saved_at", ""))
+        saved_dt = datetime.fromisoformat(saved_at)
+        age_days = (datetime.now() - saved_dt).total_seconds() / 86400
+        if age_days > _UNIVERSE_DISK_MAX_AGE_DAYS:
+            return {"error": (f"디스크 캐시 만료 — {age_days:.1f}일 경과 "
+                              f"(한도 {_UNIVERSE_DISK_MAX_AGE_DAYS}일)")}
+        return (entry["tickers"], saved_at)
+    except Exception as e:
+        return {"error": f"디스크 캐시 읽기 실패: {e}"}
+
 def get_universe(market: str = "ALL") -> dict:
     """
     발굴 대상 종목 유니버스를 반환한다.
@@ -2178,6 +2230,9 @@ def get_universe(market: str = "ALL") -> dict:
     market = market.upper().strip()
     if market not in ("KR", "US", "ALL"):
         return {"error": f"지원하지 않는 market: '{market}'. 'KR'·'US'·'ALL' 중 선택하세요."}
+
+    # 작업 큐 ②: 이번 호출에서 디스크 캐시 폴백이 발동했는지 기록 (반환값 명시용)
+    fallback_notes: list[str] = []
 
     def _fetch_kr() -> list | dict:
         now = time.time()
@@ -2206,9 +2261,19 @@ def get_universe(market: str = "ALL") -> dict:
             ]
             with _universe_lock:
                 _universe_cache["KR"] = (time.time(), result)
+            _save_universe_disk_cache("KR", result)
             return result
         except Exception as e:
-            return {"error": f"KR 유니버스 조회 실패: {e}"}
+            fb = _load_universe_disk_cache("KR")
+            if isinstance(fb, tuple):
+                cached_tickers, saved_at = fb
+                print(f"⚠️ KR 유니버스 원격 조회 실패 → 디스크 캐시 폴백 사용 "
+                      f"(저장 {saved_at}) / 원인: {e}")
+                fallback_notes.append(f"KR 유니버스 디스크 캐시 폴백 사용 (저장 {saved_at})")
+                with _universe_lock:
+                    _universe_cache["KR"] = (time.time(), cached_tickers)
+                return cached_tickers
+            return {"error": f"KR 유니버스 조회 실패: {e} / 캐시 폴백 불가: {fb['error']}"}
 
     def _fetch_us() -> list | dict:
         now = time.time()
@@ -2229,21 +2294,37 @@ def get_universe(market: str = "ALL") -> dict:
             ]
             with _universe_lock:
                 _universe_cache["US"] = (time.time(), result)
+            _save_universe_disk_cache("US", result)
             return result
         except Exception as e:
-            return {"error": f"US 유니버스 조회 실패: {e}"}
+            fb = _load_universe_disk_cache("US")
+            if isinstance(fb, tuple):
+                cached_tickers, saved_at = fb
+                print(f"⚠️ US 유니버스 원격 조회 실패 → 디스크 캐시 폴백 사용 "
+                      f"(저장 {saved_at}) / 원인: {e}")
+                fallback_notes.append(f"US 유니버스 디스크 캐시 폴백 사용 (저장 {saved_at})")
+                with _universe_lock:
+                    _universe_cache["US"] = (time.time(), cached_tickers)
+                return cached_tickers
+            return {"error": f"US 유니버스 조회 실패: {e} / 캐시 폴백 불가: {fb['error']}"}
 
     if market == "KR":
         kr = _fetch_kr()
         if isinstance(kr, dict):
             return kr
-        return {"market": "KR", "count": len(kr), "tickers": kr}
+        result = {"market": "KR", "count": len(kr), "tickers": kr}
+        if fallback_notes:
+            result["universe_cache_note"] = "; ".join(fallback_notes)
+        return result
 
     if market == "US":
         us = _fetch_us()
         if isinstance(us, dict):
             return us
-        return {"market": "US", "count": len(us), "tickers": us}
+        result = {"market": "US", "count": len(us), "tickers": us}
+        if fallback_notes:
+            result["universe_cache_note"] = "; ".join(fallback_notes)
+        return result
 
     # ALL
     kr = _fetch_kr()
@@ -2267,6 +2348,8 @@ def get_universe(market: str = "ALL") -> dict:
     result: dict = {"market": "ALL", "count": len(tickers), "tickers": tickers}
     if warnings_list:
         result["warnings"] = warnings_list
+    if fallback_notes:
+        result["universe_cache_note"] = "; ".join(fallback_notes)
     return result
 
 
@@ -2404,6 +2487,7 @@ def screen_stocks(
     rkey   = (market, universe_limit or 0, growth_correction)
     scored: list[dict] | None = None
     total  = 0
+    universe_cache_note: str | None = None   # 작업 큐 ②: 유니버스 디스크 캐시 폴백 사용 기록
 
     with _scored_lock:
         if rkey in _scored_cache:
@@ -2419,6 +2503,7 @@ def screen_stocks(
         univ = get_universe(market)
         if "error" in univ:
             return univ
+        universe_cache_note = univ.get("universe_cache_note")
 
         tickers_info = univ["tickers"]
         if universe_limit:
@@ -2593,7 +2678,7 @@ def screen_stocks(
 
     print(f"[Screener] 완료 — 점수화 {len(scored)}개, 상위 {len(top)}개 반환 "
           f"(섹터제한 {max_per_sector if max_per_sector else '없음'})")
-    return {
+    result = {
         "market":            market,
         "total_evaluated":   total,
         "scored":            len(scored),
@@ -2602,6 +2687,9 @@ def screen_stocks(
         "max_per_sector":    max_per_sector,
         "results":           top,
     }
+    if universe_cache_note:
+        result["universe_cache_note"] = universe_cache_note
+    return result
 
 
 # ═══════════════════════════════════════════════
@@ -2982,6 +3070,7 @@ def evaluate_buy_rule_A(market: str = "ALL", universe_limit: int | None = None) 
         "count":          len(candidates),
         "excluded":       excluded,
         "excluded_count": len(excluded),
+        "universe_cache_note": screened.get("universe_cache_note"),
         "disclaimer": (
             "이 목록은 규칙 기반 참고 정보이며 투자 권유가 아닙니다. "
             "실제 매수 여부는 본인이 판단·결정하세요. 미래 가격을 예측하지 않습니다."
@@ -3201,6 +3290,7 @@ def evaluate_buy_rule_B(market: str = "ALL", universe_limit: int | None = None) 
         "count":             len(candidates),
         "excluded":          excluded,
         "excluded_count":    len(excluded),
+        "universe_cache_note": screened.get("universe_cache_note"),
         "disclaimer": (
             "이 목록은 규칙 기반 참고 정보이며 투자 권유가 아닙니다. "
             "실제 매수 여부는 본인이 판단·결정하세요. 미래 가격을 예측하지 않습니다."

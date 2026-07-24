@@ -505,6 +505,7 @@ def run_buy_rule(
         eval_summary={
             "candidates_count": len(candidates),
             "excluded_count": result.get("excluded_count", len(excluded)),
+            "universe_cache_note": result.get("universe_cache_note"),
             "excluded": [
                 {"ticker": x.get("ticker"), "name": x.get("name"),
                  "reason": x.get("reason")}
