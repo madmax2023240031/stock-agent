@@ -98,10 +98,10 @@ from tools import (
 # 세트 전환은 사람이 별도 세션에서 네 값을 한꺼번에 바꿀 때만 가능하다.
 # ═══════════════════════════════════════════════
 
-PHASE = 3                      # 현재 단계 — 3단계 세트 (2026-07-20 JJG 승인 전환)
-MASTER_ENABLE = True           # 실주문 마스터 스위치 — 3단계에서 열림 (승인 필수)
-DRY_RUN = False                # 3단계 세트에서는 False — 실주문 게이트는 dry_run=DRY_RUN으로만 전달
-APPROVAL_REQUIRED = True       # 작업 3-c: 승인 모드 — 주문서마다 사람이 y/n 승인.
+PHASE = 4                      # 현재 단계 — 4단계 세트 (2026-07-27 JJG "승인 면제 전환을 승인합니다" 승인 전환)
+MASTER_ENABLE = True           # 실주문 마스터 스위치 — 4단계에서 열림 (승인 면제, PHASE4_CONFIRM 핀 필수)
+DRY_RUN = False                # 4단계 세트에서는 False — 실주문 게이트는 dry_run=DRY_RUN으로만 전달
+APPROVAL_REQUIRED = False      # 4단계: 승인 면제 모드 — 주문마다 y/n 승인 없이 실행.
                                # 0·3단계 세트는 True. 승인 면제(False)는 4단계 세트뿐이며,
                                # 전환은 "승인 면제 전환을 승인합니다" 승인 + 단독 커밋으로만.
 
