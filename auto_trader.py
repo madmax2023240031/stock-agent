@@ -19,11 +19,13 @@ tools.py에 이미 만들어진 부품들을 **순서대로 연결만** 한다. 
 
 안전장치 (코드로 강제 — 관행 아님)
 ----------------------------------------
-1. 상수 세트는 모든 진입점의 _assert_phase_config()가 검사한다. 허용 조합은 정확히 두 가지 —
+1. 상수 세트는 모든 진입점의 _assert_phase_config()가 검사한다. 허용 조합은 정확히 세 가지 —
    · 0단계 세트: PHASE=0, MASTER_ENABLE=False, DRY_RUN=True,  APPROVAL_REQUIRED=True
    · 3단계 세트: PHASE=3, MASTER_ENABLE=True,  DRY_RUN=False, APPROVAL_REQUIRED=True
-   그 외 모든 조합은 즉시 예외로 중단. **현재 상수는 0단계 세트다** —
-   실주문 게이트(_execute_order)는 존재하지만 0단계 세트에서는 도달 불가능하다.
+   · 4단계 세트: PHASE=4, MASTER_ENABLE=True,  DRY_RUN=False, APPROVAL_REQUIRED=False
+   그 외 모든 조합은 즉시 예외로 중단. **현재 상수는 3단계 세트다** —
+   4단계 세트는 준비 커밋으로 허용 목록에만 등록된 상태이며, 실제 전환은
+   JJG의 "승인 면제 전환을 승인합니다" 명시 승인 + 상수 세트 단독 커밋으로만 한다.
    (진입 커밋 — JJG의 "진입 커밋을 승인합니다" 명시 승인. 절대 불변 규칙 1 공식 개정.)
 2. place_kis_order 호출은 정확히 두 곳 — 주문서 작성 _draft_order(dry_run=True 리터럴)와
    실주문 게이트 _execute_order(dry_run=DRY_RUN 전달). 이 파일 어디에도
@@ -31,7 +33,10 @@ tools.py에 이미 만들어진 부품들을 **순서대로 연결만** 한다. 
 3. 3단계 세트로 실행하려면 (a) .env의 PHASE3_CONFIRM이 확인 문구와 정확히 일치하고
    (b) 실행 시작 시 사람이 같은 확인 문구를 직접 타이핑해야 한다.
    불일치·비대화식(EOF)·빈 입력은 전부 즉시 종료(주문 0건).
-   0단계 세트에서는 두 검사 모두 호출조차 하지 않는다.
+   4단계 세트로 실행하려면 .env의 PHASE4_CONFIRM이 4단계 확인 문구와 정확히
+   일치해야 한다 — 타이핑 관문은 .env 핀으로 대체(무인 실행 지원),
+   경고 배너는 입력 요구 없이 로그로만 출력한다.
+   0단계 세트에서는 이 검사들을 호출조차 하지 않는다.
 4. 기록은 auto_trader_dryrun_log.json 에만 쓴다.
    실제 A/B 실험 장부(trade_log.json / log_trade)는 절대 건드리지 않는다.
    _assert_phase_config()가 두 경로가 같지 않은지도 검사한다.
@@ -39,6 +44,8 @@ tools.py에 이미 만들어진 부품들을 **순서대로 연결만** 한다. 
 6. 승인 모드(작업 3-c): APPROVAL_REQUIRED = True — 주문서마다 사람이 y/n 승인.
    'y' 이외의 모든 입력(Enter·EOF 포함)은 거절 ("기본값은 거절").
    Phase 0에서는 승인해도 실주문이 나가지 않는다 (dry_run=True 고정).
+   4단계 세트에서만 APPROVAL_REQUIRED = False — y/n 승인이 면제되며,
+   킬 스위치·C-1 필터·자금 한도·일일 횟수 제한이 자동 안전장치로 남는다.
 
 사용 예 (반드시 ./venv/bin/python 사용)
 ----------------------------------------
@@ -84,9 +91,10 @@ from tools import (
 
 # ═══════════════════════════════════════════════
 # 상수 세트 — 이 블록의 값을 바꾸는 코드를 작성하지 말 것
-# 허용 조합은 정확히 두 가지 (_assert_phase_config가 강제):
+# 허용 조합은 정확히 세 가지 (_assert_phase_config가 강제):
 #   0단계 세트: PHASE=0, MASTER_ENABLE=False, DRY_RUN=True,  APPROVAL_REQUIRED=True
 #   3단계 세트: PHASE=3, MASTER_ENABLE=True,  DRY_RUN=False, APPROVAL_REQUIRED=True
+#   4단계 세트: PHASE=4, MASTER_ENABLE=True,  DRY_RUN=False, APPROVAL_REQUIRED=False
 # 세트 전환은 사람이 별도 세션에서 네 값을 한꺼번에 바꿀 때만 가능하다.
 # ═══════════════════════════════════════════════
 
@@ -94,9 +102,11 @@ PHASE = 3                      # 현재 단계 — 3단계 세트 (2026-07-20 JJ
 MASTER_ENABLE = True           # 실주문 마스터 스위치 — 3단계에서 열림 (승인 필수)
 DRY_RUN = False                # 3단계 세트에서는 False — 실주문 게이트는 dry_run=DRY_RUN으로만 전달
 APPROVAL_REQUIRED = True       # 작업 3-c: 승인 모드 — 주문서마다 사람이 y/n 승인.
-                               # 두 세트 모두 True — 승인 없는 실주문 조합은 존재하지 않는다.
+                               # 0·3단계 세트는 True. 승인 면제(False)는 4단계 세트뿐이며,
+                               # 전환은 "승인 면제 전환을 승인합니다" 승인 + 단독 커밋으로만.
 
 _PHASE3_CONFIRM_PHRASE = "실주문 3단계를 승인합니다"   # .env PHASE3_CONFIRM · 시작 확인 입력 공용 문구
+_PHASE4_CONFIRM_PHRASE = "승인 면제 4단계를 승인합니다"  # .env PHASE4_CONFIRM 전용 (4단계 세트에서만 검사)
 
 _BASE_DIR = Path(__file__).resolve().parent
 DRYRUN_LOG_PATH = str(_BASE_DIR / "auto_trader_dryrun_log.json")
@@ -111,23 +121,27 @@ DEFAULT_MAX_ORDERS_PER_RULE = 3          # 규칙 1회 실행당 주문서 작�
 
 def _assert_phase_config() -> None:
     """
-    상수 세트 안전장치 검사. 허용 조합은 정확히 두 가지 —
-    0단계 세트(PHASE=0, MASTER_ENABLE=False, DRY_RUN=True, APPROVAL_REQUIRED=True)와
-    3단계 세트(PHASE=3, MASTER_ENABLE=True, DRY_RUN=False, APPROVAL_REQUIRED=True).
+    상수 세트 안전장치 검사. 허용 조합은 정확히 세 가지 —
+    0단계 세트(PHASE=0, MASTER_ENABLE=False, DRY_RUN=True, APPROVAL_REQUIRED=True),
+    3단계 세트(PHASE=3, MASTER_ENABLE=True, DRY_RUN=False, APPROVAL_REQUIRED=True),
+    4단계 세트(PHASE=4, MASTER_ENABLE=True, DRY_RUN=False, APPROVAL_REQUIRED=False).
     그 외 모든 조합(어중간한 세트)은 즉시 예외로 전체 중단.
     """
     phase0_set = (PHASE == 0 and MASTER_ENABLE is False
                   and DRY_RUN is True and APPROVAL_REQUIRED is True)
     phase3_set = (PHASE == 3 and MASTER_ENABLE is True
                   and DRY_RUN is False and APPROVAL_REQUIRED is True)
-    if not (phase0_set or phase3_set):
+    phase4_set = (PHASE == 4 and MASTER_ENABLE is True
+                  and DRY_RUN is False and APPROVAL_REQUIRED is False)
+    if not (phase0_set or phase3_set or phase4_set):
         raise RuntimeError(
             "[안전장치] 허용되지 않는 상수 조합입니다 — 실행을 중단합니다. "
             f"현재 값: PHASE={PHASE!r}, MASTER_ENABLE={MASTER_ENABLE!r}, "
             f"DRY_RUN={DRY_RUN!r}, APPROVAL_REQUIRED={APPROVAL_REQUIRED!r}. "
-            "허용 조합은 정확히 두 가지입니다 — "
-            "0단계 세트(PHASE=0, MASTER_ENABLE=False, DRY_RUN=True, APPROVAL_REQUIRED=True) "
-            "또는 3단계 세트(PHASE=3, MASTER_ENABLE=True, DRY_RUN=False, APPROVAL_REQUIRED=True). "
+            "허용 조합은 정확히 세 가지입니다 — "
+            "0단계 세트(PHASE=0, MASTER_ENABLE=False, DRY_RUN=True, APPROVAL_REQUIRED=True), "
+            "3단계 세트(PHASE=3, MASTER_ENABLE=True, DRY_RUN=False, APPROVAL_REQUIRED=True), "
+            "4단계 세트(PHASE=4, MASTER_ENABLE=True, DRY_RUN=False, APPROVAL_REQUIRED=False). "
             "네 값이 세트 단위로 함께 바뀌지 않으면 어떤 파이프라인도 실행되지 않습니다."
         )
     if os.path.abspath(DRYRUN_LOG_PATH) == os.path.abspath(tools.TRADE_LOG_PATH):
@@ -184,6 +198,38 @@ def _confirm_live_start() -> None:
             "[안전장치] 확인 문구가 일치하지 않습니다. 즉시 종료합니다 (주문 0건)."
         )
     print("  확인 문구 일치 — 3단계 실주문 모드로 진행합니다.\n")
+
+
+def _check_phase4_confirm() -> None:
+    """
+    4단계 세트 전용 검사 — .env의 PHASE4_CONFIRM이 4단계 확인 문구와 정확히 일치해야 한다.
+    0단계·3단계 세트에서는 호출조차 하지 않는다 (.env에 키가 없어도 정상 동작).
+    """
+    from dotenv import load_dotenv
+    load_dotenv()
+    value = os.environ.get("PHASE4_CONFIRM", "")
+    if value != _PHASE4_CONFIRM_PHRASE:
+        raise RuntimeError(
+            "[안전장치] .env의 PHASE4_CONFIRM이 확인 문구와 일치하지 않습니다. "
+            f'4단계 실행에는 PHASE4_CONFIRM="{_PHASE4_CONFIRM_PHRASE}" 가 필요합니다. '
+            "실행을 중단합니다 (주문 0건)."
+        )
+
+
+def _announce_phase4_start() -> None:
+    """
+    4단계 세트 전용 — 타이핑 관문을 대체하는 경고 배너 (입력을 요구하지 않는다).
+    무인 실행(launchd) 지원용 — 사람의 확인은 .env에 PHASE4_CONFIRM 핀을 넣는
+    일회성 행위로 갈음하며, 이 배너는 실행 로그에 남는다.
+    """
+    print("\n" + "🔴" * 30)
+    print("=" * 60)
+    print("  ⚠️⚠️⚠️  실 주 문 · 승 인 면 제   모 드  ⚠️⚠️⚠️")
+    print("  4단계 세트 — 주문서는 y/n 승인 없이 KIS 모의계좌로 실제 전송됩니다.")
+    print("  남은 자동 안전장치: 킬 스위치 / C-1 필터 / 자금 한도 / 일일 횟수 제한")
+    print(f"  PHASE={PHASE} / MASTER_ENABLE={MASTER_ENABLE} / DRY_RUN={DRY_RUN}")
+    print("=" * 60)
+    print("🔴" * 30 + "\n")
 
 
 def _now_kst() -> datetime:
@@ -978,13 +1024,19 @@ def main() -> None:
         print(f"⚠️  예산 {args.budget:,}원이 place_kis_order 상한"
               f"({tools._KIS_ORDER_LIMIT_KRW:,}원)을 넘습니다. 주문서 작성이 거부될 수 있습니다.")
 
-    # ── 3단계 세트 전용 시작 검사 (0단계 세트에서는 호출조차 하지 않는다) ──
+    # ── 실주문 세트 전용 시작 검사 (0단계 세트에서는 호출조차 하지 않는다) ──
     if _is_live_mode():
-        _check_phase3_confirm()   # .env PHASE3_CONFIRM 확인 문구
-        _confirm_live_start()     # 경고 배너 + 사람이 확인 문구 직접 타이핑
+        if PHASE == 4:
+            _check_phase4_confirm()     # .env PHASE4_CONFIRM 핀 검사
+            _announce_phase4_start()    # 경고 배너만 — 타이핑 관문 없음 (무인 실행 지원)
+        else:
+            _check_phase3_confirm()   # .env PHASE3_CONFIRM 확인 문구
+            _confirm_live_start()     # 경고 배너 + 사람이 확인 문구 직접 타이핑
 
     print("=" * 60)
-    if _is_live_mode():
+    if _is_live_mode() and PHASE == 4:
+        print("auto_trader v5 — 🔴 4단계 승인 면제 모드 (주문서는 y/n 없이 실제 전송됩니다)")
+    elif _is_live_mode():
         print("auto_trader v5 — 🔴 3단계 실주문 모드 (승인된 주문서는 실제 전송됩니다)")
     else:
         print("auto_trader v5 — 0단계 DRY RUN 전용 (실제 주문 없음)")
