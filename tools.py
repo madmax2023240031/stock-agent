@@ -836,6 +836,9 @@ def get_kis_fill_price(
     ticker: str,
     expected_qty: int,
     order_date: str | None = None,
+    max_attempts: int = 10,
+    retry_interval: float = 3.0,
+    initial_wait: float = 2.5,
 ) -> dict:
     """
     주문번호(ODNO)로 체결평균가를 조회한다 (읽기 전용 — 주문·장부 무접촉).
@@ -846,8 +849,10 @@ def get_kis_fill_price(
 
     동작
     ----
-    - 호출 즉시 2.5초 대기(체결·조회 DB 반영 시간) 후 조회.
-      실패 시 3.0초 추가 대기 후 1회만 재시도 (모의계좌 호출 제한 고려).
+    - 호출 즉시 initial_wait(기본 2.5초) 대기 후 조회.
+      실패 시 retry_interval(기본 3.0초) 간격으로 최대 max_attempts(기본 10)회
+      폴링한다 (분할 체결 대기 — 최악 약 30초, 3초당 1회라 호출 제한 무관).
+      취소·종목 불일치는 영구 실패로 판단해 즉시 중단.
     - 전량 체결(총체결수량 == expected_qty)일 때만 success=True.
       부분체결·미체결·취소·미발견·종목 불일치는 전부 실패로 돌려서
       호출부의 fail-open(기존 주문시점가 기록)을 유도한다.
@@ -939,11 +944,22 @@ def get_kis_fill_price(
                     "fill_qty": fill_qty, "fill_amount": fill_amt}
         return {"success": False, "reason": "주문번호 미발견"}
 
-    time.sleep(2.5)
+    # 폴링: 초기 대기 후 최대 max_attempts회까지 retry_interval 간격 재조회.
+    # 부분체결·미체결·미발견·일시 API 에러는 시간이 해결할 수 있으므로 재시도.
+    # 취소·종목 불일치는 기다려도 달라지지 않으므로 즉시 중단(영구 실패).
+    # 전량 체결 확인 실패 시 fail-open(호출부가 주문시점가 기록)은 기존과 동일.
+    _permanent = ("취소된 주문", "종목 불일치")
+    time.sleep(initial_wait)
     result = _query()
-    if not result["success"]:
-        time.sleep(3.0)   # 재시도는 딱 1회 (모의계좌 REST 호출 제한)
+    attempts = 1
+    while (not result["success"]) and attempts < max_attempts:
+        if any(p in str(result.get("reason", "")) for p in _permanent):
+            break
+        time.sleep(retry_interval)
         result = _query()
+        attempts += 1
+    if not result["success"]:
+        result["reason"] = f"{result.get('reason')} (조회 {attempts}회 시도)"
     return result
 
 
