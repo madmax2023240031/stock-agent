@@ -47,3 +47,8 @@ universe_cache.json
 
 # 거래 로그 백업 — 공개 저장소 유출 방지 (관찰 7)
 trade_log_backup_*.json
+
+# launchd 무인 실행 — 로그·plist(로컬 경로 포함)는 저장소 제외
+logs/
+launchd/
+.Rhistory
