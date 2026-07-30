@@ -33,8 +33,8 @@
 3. **모의 계좌 전용.** 실전 계좌 연동 코드는 절대 작성하지 않는다.
    (`place_kis_order`는 허용 모의계좌 하드코딩 + 1회 100만 원 상한이 이미 강제돼 있다 — 완화 금지.)
 4. **`trade_log.json`(A/B 실험 장부)은 절대 오염 금지.**
-   - 현재 파일이 없는 것이 정상이다. 첫 실제 기록 때 `log_trade()`가 자동 생성하고,
-     `get_trade_log()`는 파일이 없으면 0건으로 처리한다. **일부러 만들지 말 것. 가짜 거래로 채우지 말 것.**
+   - 파일은 첫 실제 기록(2026-07-21) 때 `log_trade()`가 자동 생성했고, 현재 실거래 기록 보유 중이다.
+     `get_trade_log()`는 파일이 없으면 0건으로 처리한다. **일부러 수정하지 말 것. 가짜 거래로 채우지 말 것.**
    - 테스트 코드는 `trade_log.json`을 절대 건드리지 않는다. 테스트는
      `trade_log_TEST.json` 임시 파일 + `try/finally` 정리 구조를 쓴다(`tools.py` 테스트 블록 참고).
    - dry-run 기록은 `auto_trader_dryrun_log.json`에만 쓴다. 두 파일을 섞지 않는다.
@@ -53,7 +53,7 @@ stock-agent/
 ├── README.md
 ├── stock-agent-개발보고서.md
 ├── requirements.txt
-├── trade_log.json                # A/B 실험 장부 (자동 생성 — 현재 미존재가 정상, 절대 오염 금지)
+├── trade_log.json                # A/B 실험 장부 (자동 생성 — 실거래 기록 보유 중, 절대 오염 금지)
 ├── auto_trader_dryrun_log.json   # dry-run 전용 별도 로그 (자동 생성)
 ├── .kis_token_cache.json         # KIS 토큰 캐시 (자동 생성)
 └── .env                          # API 키·계좌번호 (절대 커밋하지 않음)
