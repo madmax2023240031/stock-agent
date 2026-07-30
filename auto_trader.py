@@ -197,7 +197,7 @@ def _confirm_live_start() -> None:
         raise SystemExit(
             "[안전장치] 확인 문구가 일치하지 않습니다. 즉시 종료합니다 (주문 0건)."
         )
-    print("  확인 문구 일치 — 3단계 실주문 모드로 진행합니다.\n")
+    print(f"  확인 문구 일치 — {PHASE}단계 실주문 모드로 진행합니다.\n")
 
 
 def _check_phase4_confirm() -> None:
@@ -680,11 +680,12 @@ def run_buy_rule(
             continue
 
         # ── 6-1. 승인 모드 (작업 3-c, 설계 확정 A) — 기본값은 거절 ──
-        approval = None
         if APPROVAL_REQUIRED:
             approval = _ask_approval(rule_tag, ticker, name, "BUY", qty, price,
                                      order_amount, cand.get("reason", ""), gr, draft)
-        approved = (approval is None) or approval["approved"]
+        else:
+            approval = {"required": False, "note": "승인 면제 모드 — 승인 절차 없음"}
+        approved = approval.get("approved", True)
 
         # ── 6-2. 실주문 게이트 (진입 커밋) — 0단계 세트에서는 절대 진입하지 않는다 ──
         execution = None
@@ -724,7 +725,8 @@ def run_buy_rule(
                   if DRY_RUN else
                   f"[LIVE] 규칙 {rule_tag} 매수 주문서 작성 — 실행 결과는 execution 필드 참조. ")
                  + f"근거: {cand.get('reason', '')}"
-                 + (f" / 승인 결정: {'승인' if approved else '거절'}" if approval else "")
+                 + (f" / 승인 결정: {'승인' if approved else '거절'}"
+                    if approval.get("required", True) else " / 승인 면제")
                  + (" / ⚠️ 장부 기록 실패 — 수동 확인 필요" if book_log and not book_log["all_logged"] else ""),
             test_now=test_now))
         records += 1
@@ -931,11 +933,12 @@ def run_sell_rule(test_now: str | None = None) -> dict:
         )
 
         # ── 5-1. 승인 모드 (작업 3-c, 설계 확정 A) — 기본값은 거절 ──
-        approval = None
         if APPROVAL_REQUIRED:
             approval = _ask_approval("SELL", ticker, name, "SELL", qty, price,
                                      order_amount, reason, gr, draft)
-        approved = (approval is None) or approval["approved"]
+        else:
+            approval = {"required": False, "note": "승인 면제 모드 — 승인 절차 없음"}
+        approved = approval.get("approved", True)
 
         # ── 5-2. 실주문 게이트 (진입 커밋) — 0단계 세트에서는 절대 진입하지 않는다 ──
         execution = None
@@ -981,7 +984,8 @@ def run_sell_rule(test_now: str | None = None) -> dict:
                   if DRY_RUN else
                   f"[LIVE] 매도 규칙 주문서 작성 (전량) — 실행 결과는 execution 필드 참조. 근거: {reason}")
                  + f" / C-2 분할: A={split['A']} B={split['B']}"
-                 + (f" / 승인 결정: {'승인' if approved else '거절'}" if approval else "")
+                 + (f" / 승인 결정: {'승인' if approved else '거절'}"
+                    if approval.get("required", True) else " / 승인 면제")
                  + (" / ⚠️ 장부 기록 실패 — 수동 확인 필요" if book_log and not book_log["all_logged"] else ""),
             test_now=test_now))
         records += 1
@@ -1037,7 +1041,7 @@ def main() -> None:
     if _is_live_mode() and PHASE == 4:
         print("auto_trader v5 — 🔴 4단계 승인 면제 모드 (주문서는 y/n 없이 실제 전송됩니다)")
     elif _is_live_mode():
-        print("auto_trader v5 — 🔴 3단계 실주문 모드 (승인된 주문서는 실제 전송됩니다)")
+        print(f"auto_trader v5 — 🔴 {PHASE}단계 실주문 모드 (승인된 주문서는 실제 전송됩니다)")
     else:
         print("auto_trader v5 — 0단계 DRY RUN 전용 (실제 주문 없음)")
     print(f"PHASE={PHASE} / MASTER_ENABLE={MASTER_ENABLE} / DRY_RUN={DRY_RUN}")
@@ -1067,11 +1071,15 @@ def main() -> None:
             print(f"  [{s['run_id']}] 규칙 {s.get('rule_tag', '?')}: "
                   f"후보 {s.get('candidates', 0)}건 / 기록 {s.get('records', 0)}건 / "
                   f"주문서 {s.get('drafted', 0)}건 ({'전부 dry-run' if DRY_RUN else '실주문 모드'})"
-                  + (f" — 승인 {s.get('approved', 0)}건 · 거절 {s.get('rejected', 0)}건"
+                  + ((f" — 승인 {s.get('approved', 0)}건 · 거절 {s.get('rejected', 0)}건"
+                      if APPROVAL_REQUIRED else
+                      f" — 전송 {s.get('approved', 0)}건 (승인 면제)")
                      if s.get('drafted', 0) else ""))
     print(f"\n상세 기록: {DRYRUN_LOG_PATH}")
-    if _is_live_mode():
-        print("🔴 3단계 실주문 모드로 실행되었습니다. 실제 전송 결과는 각 기록의 execution 필드를 확인하세요.")
+    if _is_live_mode() and PHASE == 4:
+        print("🔴 4단계 승인 면제 모드로 실행되었습니다. 실제 전송 결과는 각 기록의 execution 필드를 확인하세요.")
+    elif _is_live_mode():
+        print(f"🔴 {PHASE}단계 실주문 모드로 실행되었습니다. 실제 전송 결과는 각 기록의 execution 필드를 확인하세요.")
     else:
         print("⚠️  이 프로그램은 0단계 관찰용입니다. 실제 주문은 단 1건도 전송되지 않았습니다.")
 
