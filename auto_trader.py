@@ -112,6 +112,7 @@ _BASE_DIR = Path(__file__).resolve().parent
 DRYRUN_LOG_PATH = str(_BASE_DIR / "auto_trader_dryrun_log.json")
 
 DEFAULT_BUDGET_PER_ORDER_KRW = 500_000   # 매수 1건당 예산 (place_kis_order 상한 100만 원의 절반)
+HIGH_PRICE_SINGLE_SHARE_CAP_KRW = 2_000_000  # 고가주 1주 예외 상한 (place_kis_order 상한과 동일)
 DEFAULT_MAX_ORDERS_PER_RULE = 3          # 규칙 1회 실행당 주문서 작성 최대 건수
 
 
@@ -333,10 +334,15 @@ def size_buy_order(budget_krw: int, price: float | None) -> int:
     """
     매수 수량 환산: 예산 ÷ 현재가 (내림). 규칙 후보에는 수량이 없어서 필요하다.
     가격이 없거나 0 이하이면 0을 반환한다 (호출부에서 SKIPPED 처리).
+    고가주 1주 예외: 예산으로 0주여도 현재가가 HIGH_PRICE_SINGLE_SHARE_CAP_KRW
+    이내면 1주를 허용한다 (2026-07-31 옵션2 승인).
     """
-    if price is None or price <= 0:
+    if not price or price <= 0:
         return 0
-    return int(budget_krw // price)
+    qty = int(budget_krw // price)
+    if qty == 0 and price <= HIGH_PRICE_SINGLE_SHARE_CAP_KRW:
+        return 1
+    return qty
 
 
 def size_sell_order(holding_qty: int | None) -> int:
@@ -627,7 +633,7 @@ def run_buy_rule(
             _append_dryrun_log(_make_entry(
                 run_id, rule_tag, "SKIPPED", ticker=ticker, name=name, side="BUY",
                 price=price, sector=sector,
-                note=f"예산 {budget_per_order_krw:,}원으로 1주도 살 수 없음 (현재가 {price:,.0f}원)",
+                note=f"고가주 1주 예외 상한 {HIGH_PRICE_SINGLE_SHARE_CAP_KRW:,}원 초과 — 매수 불가 (현재가 {price:,.0f}원)",
                 test_now=test_now))
             records += 1
             continue
