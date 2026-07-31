@@ -52,3 +52,5 @@ trade_log_backup_*.json
 logs/
 launchd/
 .Rhistory
+
+benchmark_records.json
