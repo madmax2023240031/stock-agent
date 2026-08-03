@@ -28,6 +28,8 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import unicodedata
+from pathlib import Path
 
 import tools
 
@@ -57,6 +59,37 @@ def _pct(v) -> str:
     return "-" if v is None else f"{v:+.2f}%"
 
 
+def _wlen(s) -> int:
+    """터미널 표시 폭. 한글·전각 문자는 2칸으로 센다."""
+    return sum(2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+               for ch in str(s))
+
+
+def _cut(s, width: int) -> str:
+    """표시 폭 기준으로 자르기 (한글 중간에서 깨지지 않도록)."""
+    out = ""
+    used = 0
+    for ch in str(s):
+        w = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+        if used + w > width:
+            break
+        out += ch
+        used += w
+    return out
+
+
+def _pad(s, width: int) -> str:
+    """표시 폭 기준 왼쪽 정렬."""
+    s = _cut(s, width)
+    return s + " " * max(0, width - _wlen(s))
+
+
+def _lpad(s, width: int) -> str:
+    """표시 폭 기준 오른쪽 정렬."""
+    s = _cut(s, width)
+    return " " * max(0, width - _wlen(s)) + s
+
+
 # ── 데이터 수집 ────────────────────────────────────────────
 def _name_map() -> dict:
     """trade_log.json 에서 ticker -> 종목명 매핑. 실패해도 빈 dict."""
@@ -73,6 +106,51 @@ def _name_map() -> dict:
         return out
     except Exception:
         return {}
+
+
+_BASE_DIR = Path(__file__).resolve().parent
+UNIVERSE_CACHE_FILE = str(_BASE_DIR / "universe_cache.json")
+
+
+def _collect_names(node, out: dict, depth: int = 0) -> None:
+    """JSON 트리를 훑으며 ticker/name 쌍을 모은다.
+
+    캐시 최상위가 list 이든 {"KR": {...}} 형태의 dict 이든 상관없이 동작하도록
+    경로를 고정하지 않는다 (캐시 구조가 바뀌어도 견디게 하기 위함).
+    """
+    if depth > 6:
+        return
+    if isinstance(node, dict):
+        tk = str(node.get("ticker", "") or "").strip()
+        nm = str(node.get("name", "") or "").strip()
+        if tk and nm:
+            out.setdefault(tk, nm)
+        for v in node.values():
+            if isinstance(v, (dict, list)):
+                _collect_names(v, out, depth + 1)
+    elif isinstance(node, list):
+        for v in node:
+            if isinstance(v, (dict, list)):
+                _collect_names(v, out, depth + 1)
+
+
+def _universe_name_map() -> dict:
+    """universe_cache.json 에서 ticker -> 종목명 매핑. 네트워크 조회 없음.
+
+    파일이 없거나 깨져 있어도 예외를 밖으로 내보내지 않고 빈 dict 를 돌려준다.
+    (이름 때문에 리포트 전체가 죽는 일이 없도록 하는 것이 최우선)
+    """
+    try:
+        with open(UNIVERSE_CACHE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return {}
+    out: dict = {}
+    try:
+        _collect_names(data, out)
+    except Exception:
+        return {}
+    return out
 
 
 def _prices(tickers) -> dict:
@@ -102,6 +180,8 @@ def build_report(with_account: bool = False) -> dict:
     combined = pos["combined"]
     by_rule = pos.get("by_rule", {})
     names = _name_map()
+    for _tk, _nm in _universe_name_map().items():
+        names.setdefault(_tk, _nm)   # 장부에 name 이 생기면 장부가 우선
     prices = _prices(combined["positions"].keys())
 
     rule_of = {}
@@ -195,15 +275,19 @@ def print_report(r: dict) -> None:
         print("\n보유 포지션 없음 (자동매매 장부 기준).")
     else:
         print("\n[보유 포지션]")
-        print(f"{'코드':<10}{'종목명':<14}{'규칙':<5}{'수량':>6}"
-              f"{'평단':>13}{'현재가':>13}{'평가액':>15}{'평가손익':>15}{'수익률':>10}  통화")
+        print(f"{_pad('코드', 10)}{_pad('종목명', 18)}{_pad('규칙', 5)}{_lpad('수량', 6)}"
+              f"{_lpad('평단', 13)}{_lpad('현재가', 13)}{_lpad('평가액', 15)}"
+              f"{_lpad('평가손익', 15)}{_lpad('수익률', 10)}  통화")
         print(SUB)
         for x in rows:
             d = 2 if x["currency"] == "USD" else 0
-            print(f"{x['ticker']:<10}{str(x['name'])[:12]:<14}{x['rule']:<5}{x['qty']:>6}"
-                  f"{_num(x['avg_price'], d):>13}{_num(x['current_price'], d):>13}"
-                  f"{_num(x['eval_amount'], d):>15}{_signed(x['profit_loss'], d):>15}"
-                  f"{_pct(x['profit_loss_pct']):>10}  {x['currency']}")
+            print(f"{_pad(x['ticker'], 10)}{_pad(x['name'], 18)}{_pad(x['rule'], 5)}"
+                  f"{_lpad(x['qty'], 6)}"
+                  f"{_lpad(_num(x['avg_price'], d), 13)}"
+                  f"{_lpad(_num(x['current_price'], d), 13)}"
+                  f"{_lpad(_num(x['eval_amount'], d), 15)}"
+                  f"{_lpad(_signed(x['profit_loss'], d), 15)}"
+                  f"{_lpad(_pct(x['profit_loss_pct']), 10)}  {x['currency']}")
 
     s = r["summary"]
     print("\n[누적 성적] — 분모: 합산 60,000,000원 / 규칙별 30,000,000원")
@@ -233,15 +317,18 @@ def print_report(r: dict) -> None:
         else:
             if acc.get("overseas_errors"):
                 print(f"  ⚠️ 해외 조회 오류: {acc['overseas_errors']}")
-            print(f"{'코드':<10}{'종목명':<16}{'계좌수량':>9}{'자동':>7}{'수동':>7}"
-                  f"{'평가액':>15}{'수익률':>10}  통화")
+            print(f"{_pad('코드', 10)}{_pad('종목명', 18)}{_lpad('계좌수량', 9)}"
+                  f"{_lpad('자동', 7)}{_lpad('수동', 7)}"
+                  f"{_lpad('평가액', 15)}{_lpad('수익률', 10)}  통화")
             for it in acc["items"]:
                 d = 2 if it["currency"] == "USD" else 0
                 mark = " *" if it["auto_qty"] else "  "
-                print(f"{it['ticker']:<10}{str(it['name'])[:14]:<16}"
-                      f"{_num(it['account_qty']):>9}{_num(it['auto_qty']):>7}"
-                      f"{_num(it['manual_qty']):>7}{_num(it['eval_amount'], d):>15}"
-                      f"{_pct(it['profit_loss_pct']):>10}  {it['currency']}{mark}")
+                print(f"{_pad(it['ticker'], 10)}{_pad(it['name'], 18)}"
+                      f"{_lpad(_num(it['account_qty']), 9)}"
+                      f"{_lpad(_num(it['auto_qty']), 7)}"
+                      f"{_lpad(_num(it['manual_qty']), 7)}"
+                      f"{_lpad(_num(it['eval_amount'], d), 15)}"
+                      f"{_lpad(_pct(it['profit_loss_pct']), 10)}  {it['currency']}{mark}")
             print("\n  * = 자동매매 장부에 포함된 종목")
             if acc.get("missing_in_account"):
                 print(f"  ⚠️ 장부에는 있으나 계좌에 없는 종목: {acc['missing_in_account']}")
