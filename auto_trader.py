@@ -560,6 +560,7 @@ def run_buy_rule(
             "universe_cache_note": result.get("universe_cache_note"),
             "excluded": [
                 {"ticker": x.get("ticker"), "name": x.get("name"),
+                 "score": x.get("score"), "sector": x.get("sector"),
                  "reason": x.get("reason")}
                 for x in excluded
             ],
