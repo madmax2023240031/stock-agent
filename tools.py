@@ -238,6 +238,7 @@ def get_kis_token() -> dict:
     KIS 모의투자 접근토큰을 반환한다.
 
     유효한 캐시가 있으면 재사용하고, 없거나 만료 10분 전이면 새로 발급한다.
+    앱키가 바뀌면(재발급) 지문이 달라지므로 캐시를 버리고 새로 발급한다.
     KIS는 토큰 발급 횟수 제한이 있으므로 반드시 캐시를 경유한다.
 
     환경변수: KIS_APP_KEY, KIS_APP_SECRET  (.env)
@@ -248,6 +249,7 @@ def get_kis_token() -> dict:
           source : "cache" | "new"
           실패 시: {"error": "..."}
     """
+    import hashlib
     import json
     import os
     import requests
@@ -261,6 +263,9 @@ def get_kis_token() -> dict:
     if not app_key or not app_secret:
         return {"error": "KIS_APP_KEY 또는 KIS_APP_SECRET 환경변수가 설정되지 않았습니다."}
 
+    # 앱키 지문 — 키를 재발급하면 지문이 달라져 옛 캐시를 자동으로 버린다 (관찰 10)
+    app_key_fp = hashlib.sha256(app_key.encode("utf-8")).hexdigest()[:8]
+
     now = datetime.now()
 
     # ── 캐시 확인 ──────────────────────────────────────
@@ -269,7 +274,8 @@ def get_kis_token() -> dict:
             with open(_KIS_TOKEN_CACHE_FILE, "r", encoding="utf-8") as f:
                 cached = json.load(f)
             expires_at = datetime.fromisoformat(cached["expires_at"])
-            if now < expires_at - timedelta(seconds=_KIS_TOKEN_BUFFER_SEC):
+            if (cached.get("app_key_fp") == app_key_fp
+                    and now < expires_at - timedelta(seconds=_KIS_TOKEN_BUFFER_SEC)):
                 return {
                     "access_token": cached["access_token"],
                     "token_type":   cached.get("token_type", "Bearer"),
@@ -324,6 +330,7 @@ def get_kis_token() -> dict:
                     "access_token": access_token,
                     "token_type":   token_type,
                     "expires_at":   expires_at.isoformat(),
+                    "app_key_fp":   app_key_fp,
                 },
                 f,
                 ensure_ascii=False,
