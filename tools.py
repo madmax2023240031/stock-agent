@@ -386,6 +386,8 @@ def get_kis_balance() -> dict:
                 "net_assets_krw":     int,   # 순자산금액
                 "purchase_total_krw": int,
                 "profit_loss_krw":    int,
+                "pages":              int,   # 연속조회로 읽은 페이지 수
+                "truncated":          bool,  # 상한 도달로 잘렸는지 여부
             },
             "overseas": {
                 "eval_total_usd":    float,  # 해외주식 평가금액 합계(USD)
@@ -443,27 +445,52 @@ def get_kis_balance() -> dict:
         except Exception:
             return 0.0
 
-    # ── 1. 국내주식 잔고 (VTTC8434R) ───────────────────────
+    # ── 연속조회(페이지네이션) 공통 상한 ────────────────────
+    # KIS 잔고 API는 1회 응답에 최대 20건만 준다.
+    # 응답 헤더 tr_cont 가 F/M 이면 "다음 페이지 있음", D/E 이면 마지막.
+    # 다음 페이지 요청 시: 요청 헤더 tr_cont="N" + CTX_AREA_* 에 직전 응답값.
+    _MAX_PAGES = 10   # 무한 루프 방지 상한 (최대 200종목)
+
+    # ── 1. 국내주식 잔고 (VTTC8434R, 연속조회) ─────────────
     dom_holdings: list[dict] = []
     domestic: dict = {}
+    dom_pages = 0
+    dom_truncated = False
 
     try:
-        resp = requests.get(
-            f"{_KIS_DOMAIN}/uapi/domestic-stock/v1/trading/inquire-balance",
-            headers={**base_headers, "tr_id": "VTTC8434R"},
-            params={
-                "CANO": cano, "ACNT_PRDT_CD": acnt_prdt_cd,
-                "AFHR_FLPR_YN": "N", "OFL_YN": "",
-                "INQR_DVSN": "02", "UNPR_DVSN": "01",
-                "FUND_STTL_ICLD_YN": "N", "FNCG_AMT_AUTO_RDPT_YN": "N",
-                "PRCS_DVSN": "01",
-                "CTX_AREA_FK100": "", "CTX_AREA_NK100": "",
-            },
-            timeout=10,
-        )
-        resp.raise_for_status()
-        d = resp.json()
-        if d.get("rt_cd") == "0":
+        dom_params = {
+            "CANO": cano, "ACNT_PRDT_CD": acnt_prdt_cd,
+            "AFHR_FLPR_YN": "N", "OFL_YN": "",
+            "INQR_DVSN": "02", "UNPR_DVSN": "01",
+            "FUND_STTL_ICLD_YN": "N", "FNCG_AMT_AUTO_RDPT_YN": "N",
+            "PRCS_DVSN": "01",
+            "CTX_AREA_FK100": "", "CTX_AREA_NK100": "",
+        }
+        tr_cont_req = ""            # 첫 조회는 빈 값, 2페이지부터 "N"
+        o2_last: dict = {}
+        dom_error: str | None = None
+
+        while True:
+            if dom_pages >= _MAX_PAGES:
+                dom_truncated = True
+                break
+            if dom_pages > 0:
+                time.sleep(1.1)     # KIS 초당 거래건수 초과 방지
+
+            resp = requests.get(
+                f"{_KIS_DOMAIN}/uapi/domestic-stock/v1/trading/inquire-balance",
+                headers={**base_headers, "tr_id": "VTTC8434R", "tr_cont": tr_cont_req},
+                params=dom_params,
+                timeout=10,
+            )
+            resp.raise_for_status()
+            d = resp.json()
+            dom_pages += 1
+
+            if d.get("rt_cd") != "0":
+                dom_error = d.get("msg1") or d.get("msg") or str(d)
+                break
+
             for item in d.get("output1", []):
                 qty = _i(item.get("hldg_qty", "0"))
                 if qty == 0:
@@ -482,31 +509,72 @@ def get_kis_balance() -> dict:
                     "market":          "KR",
                     "exchange":        "KRX",
                 })
+
             o2 = d.get("output2") or {}
             if isinstance(o2, list):
                 o2 = o2[0] if o2 else {}
-            domestic = {
-                "cash_krw":           _i(o2.get("dnca_tot_amt")),
-                "eval_stock_krw":     _i(o2.get("evlu_amt_smtl_amt")),
-                "total_assets_krw":   _i(o2.get("tot_evlu_amt")),
-                "net_assets_krw":     _i(o2.get("nass_amt")),
-                "purchase_total_krw": _i(o2.get("pchs_amt_smtl_amt")),
-                "profit_loss_krw":    _i(o2.get("evlu_pfls_smtl_amt")),
-            }
-        else:
-            msg = d.get("msg1") or d.get("msg") or str(d)
+            if o2:
+                o2_last = o2        # 계좌 요약은 마지막 페이지 값을 채택
+
+            # 연속조회 판정
+            tr_cont_resp = (resp.headers.get("tr_cont") or "").strip().upper()
+            nk = d.get("ctx_area_nk100") or ""
+            fk = d.get("ctx_area_fk100") or ""
+            if tr_cont_resp not in ("F", "M") or not nk.strip():
+                break               # 마지막 페이지
+            # ※ 공백 패딩이 의미를 가질 수 있어 strip 하지 않고 원값 그대로 전달
+            dom_params = {**dom_params, "CTX_AREA_FK100": fk, "CTX_AREA_NK100": nk}
+            tr_cont_req = "N"
+
+        if dom_error is not None:
+            # 부분 페이지만 반환하면 "이게 전부"라고 오인하므로 통째로 실패 처리
+            dom_holdings = []
             hint = _kis_maintenance_hint()
-            domestic = {"error": f"{hint}\n\n국내 잔고 API 오류: {msg}"}
+            domestic = {"error": f"{hint}\n\n국내 잔고 API 오류: {dom_error}"}
+        else:
+            if dom_truncated:
+                print(f"⚠️ get_kis_balance: 국내 연속조회 {_MAX_PAGES}페이지 상한 도달 — 일부 종목 누락 가능")
+
+            # 페이지 경계에서 같은 종목이 중복될 경우 첫 행 유지
+            seen_dom: dict = {}
+            for h in dom_holdings:
+                if h["ticker"] in seen_dom:
+                    print(f"⚠️ get_kis_balance: 국내 {h['ticker']} 중복 행 — 첫 행 유지")
+                    continue
+                seen_dom[h["ticker"]] = h
+            dom_holdings = list(seen_dom.values())
+
+            domestic = {
+                "cash_krw":           _i(o2_last.get("dnca_tot_amt")),
+                "eval_stock_krw":     _i(o2_last.get("evlu_amt_smtl_amt")),
+                "total_assets_krw":   _i(o2_last.get("tot_evlu_amt")),
+                "net_assets_krw":     _i(o2_last.get("nass_amt")),
+                "purchase_total_krw": _i(o2_last.get("pchs_amt_smtl_amt")),
+                "profit_loss_krw":    _i(o2_last.get("evlu_pfls_smtl_amt")),
+                "pages":              dom_pages,
+                "truncated":          dom_truncated,
+            }
+
+            # 자기검증: 종목 평가금액 합 vs 계좌 요약 합. 값은 원본 유지, 경고만.
+            eval_sum = sum(h["eval_amount"] for h in dom_holdings)
+            if domestic["eval_stock_krw"] and abs(eval_sum - domestic["eval_stock_krw"]) > 1:
+                print(
+                    "⚠️ get_kis_balance: 국내 평가금액 불일치 — "
+                    f"종목합 {eval_sum:,} vs 요약 {domestic['eval_stock_krw']:,} "
+                    f"(페이지 {dom_pages})"
+                )
     except Exception as exc:
+        dom_holdings = []
         hint = _kis_maintenance_hint()
         domestic = {"error": f"{hint}\n\n국내 잔고 조회 실패: {exc}"}
 
-    # ── 2. 해외주식 잔고 (VTTS3012R, 거래소별 순회) ────────
+    # ── 2. 해외주식 잔고 (VTTS3012R, 거래소별 순회 + 연속조회) ─
     ovrs_holdings: list[dict] = []
     ovrs_errors:   list[str]  = []
 
     def _fetch_ovrs_exchange(excg_cd: str, crcy_cd: str) -> tuple[list, str | None]:
-        """단일 거래소 해외잔고 조회. rate-limit(EGW00201) 시 1.5초 후 1회 재시도."""
+        """단일 거래소 해외잔고 조회 (연속조회 지원).
+        rate-limit(EGW00201) 시 1.5초 후 1회 재시도."""
         params = {
             "CANO": cano, "ACNT_PRDT_CD": acnt_prdt_cd,
             "OVRS_EXCG_CD":   excg_cd,
@@ -514,53 +582,85 @@ def get_kis_balance() -> dict:
             "CTX_AREA_FK200": "",
             "CTX_AREA_NK200": "",
         }
-        for attempt in range(2):
-            try:
-                r = requests.get(
-                    f"{_KIS_DOMAIN}/uapi/overseas-stock/v1/trading/inquire-balance",
-                    headers={**base_headers, "tr_id": "VTTS3012R"},
-                    params=params,
-                    timeout=10,
-                )
-                r.raise_for_status()
-                d = r.json()
-                if d.get("rt_cd") == "0":
-                    items = []
-                    for item in d.get("output1", []):
-                        qty = _i(item.get("ovrs_cblc_qty", "0"))
-                        if qty == 0:
-                            continue
-                        items.append({
-                            "ticker":          item.get("ovrs_pdno", ""),
-                            "name":            item.get("ovrs_item_name", ""),
-                            "qty":             qty,
-                            "avg_price":       _f(item.get("pchs_avg_pric")),
-                            "current_price":   _f(item.get("now_pric2")),
-                            "eval_amount":     _f(item.get("ovrs_stck_evlu_amt")),
-                            "purchase_amount": _f(item.get("frcr_pchs_amt1")),
-                            "profit_loss":     _f(item.get("frcr_evlu_pfls_amt")),
-                            "profit_loss_pct": _f(item.get("evlu_pfls_rt")),
-                            "currency":        crcy_cd,
-                            "market":          "US",
-                            "exchange":        excg_cd,
-                        })
-                    return items, None
-                # rate-limit → 재시도
-                if d.get("msg_cd") == "EGW00201" and attempt == 0:
-                    time.sleep(1.5)
-                    continue
-                msg = d.get("msg1") or d.get("msg") or str(d)
-                return [], f"{excg_cd}: {msg}"
-            except requests.HTTPError as exc:
-                body = exc.response.text if exc.response is not None else ""
-                # rate-limit HTTP 응답 → 재시도
-                if "EGW00201" in body and attempt == 0:
-                    time.sleep(1.5)
-                    continue
-                return [], f"{excg_cd} HTTP오류: {body[:120]}"
-            except Exception as exc:
-                return [], f"{excg_cd}: {exc}"
-        return [], f"{excg_cd}: 재시도 후에도 실패"
+        collected: list[dict] = []
+        tr_cont_req = ""
+        pages = 0
+
+        while True:
+            if pages >= _MAX_PAGES:
+                print(f"⚠️ get_kis_balance: {excg_cd} 연속조회 {_MAX_PAGES}페이지 상한 도달 — 일부 누락 가능")
+                break
+            if pages > 0:
+                time.sleep(1.1)
+
+            page_items: list | None = None
+            page_tr_cont = ""
+            page_fk = ""
+            page_nk = ""
+
+            for attempt in range(2):
+                try:
+                    r = requests.get(
+                        f"{_KIS_DOMAIN}/uapi/overseas-stock/v1/trading/inquire-balance",
+                        headers={**base_headers, "tr_id": "VTTS3012R", "tr_cont": tr_cont_req},
+                        params=params,
+                        timeout=10,
+                    )
+                    r.raise_for_status()
+                    d = r.json()
+                    if d.get("rt_cd") == "0":
+                        items = []
+                        for item in d.get("output1", []):
+                            qty = _i(item.get("ovrs_cblc_qty", "0"))
+                            if qty == 0:
+                                continue
+                            items.append({
+                                "ticker":          item.get("ovrs_pdno", ""),
+                                "name":            item.get("ovrs_item_name", ""),
+                                "qty":             qty,
+                                "avg_price":       _f(item.get("pchs_avg_pric")),
+                                "current_price":   _f(item.get("now_pric2")),
+                                "eval_amount":     _f(item.get("ovrs_stck_evlu_amt")),
+                                "purchase_amount": _f(item.get("frcr_pchs_amt1")),
+                                "profit_loss":     _f(item.get("frcr_evlu_pfls_amt")),
+                                "profit_loss_pct": _f(item.get("evlu_pfls_rt")),
+                                "currency":        crcy_cd,
+                                "market":          "US",
+                                "exchange":        excg_cd,
+                            })
+                        page_items   = items
+                        page_tr_cont = (r.headers.get("tr_cont") or "").strip().upper()
+                        page_fk      = d.get("ctx_area_fk200") or ""
+                        page_nk      = d.get("ctx_area_nk200") or ""
+                        break
+                    # rate-limit → 재시도
+                    if d.get("msg_cd") == "EGW00201" and attempt == 0:
+                        time.sleep(1.5)
+                        continue
+                    msg = d.get("msg1") or d.get("msg") or str(d)
+                    return [], f"{excg_cd}: {msg}"
+                except requests.HTTPError as exc:
+                    body = exc.response.text if exc.response is not None else ""
+                    # rate-limit HTTP 응답 → 재시도
+                    if "EGW00201" in body and attempt == 0:
+                        time.sleep(1.5)
+                        continue
+                    return [], f"{excg_cd} HTTP오류: {body[:120]}"
+                except Exception as exc:
+                    return [], f"{excg_cd}: {exc}"
+
+            if page_items is None:
+                return [], f"{excg_cd}: 재시도 후에도 실패"
+
+            collected.extend(page_items)
+            pages += 1
+
+            if page_tr_cont not in ("F", "M") or not page_nk.strip():
+                break
+            params = {**params, "CTX_AREA_FK200": page_fk, "CTX_AREA_NK200": page_nk}
+            tr_cont_req = "N"
+
+        return collected, None
 
     for idx, (excg_cd, crcy_cd) in enumerate(_KIS_US_EXCHANGES):
         if idx > 0:
