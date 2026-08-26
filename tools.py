@@ -3824,6 +3824,149 @@ def log_trade(
     return {"logged": True, "entry": entry}
 
 
+def reconcile_fill_prices(order_date: str, dry_run: bool = True) -> dict:
+    """
+    장 마감 후 체결가 사후 보정 (미확정 후보 ③ 방안 B, 2026-08-26 설계 확정).
+
+    주문 직후 체결가 조회에 실패해 주문 시점가로 기록된 장부 레코드
+    (price_source == "order_time")를 찾아, KIS 일별주문체결조회로 실제
+    체결평균가를 다시 조회하고 장부의 price를 교체한다. 원값은 보존한다.
+
+    Parameters
+    ----------
+    order_date : str   보정 대상 일자 "YYYYMMDD" (예: "20260827")
+    dry_run    : bool  True(기본) = 변경 예정 목록만 반환·출력, 파일 무접촉.
+                       False = 백업 후 실제로 장부를 고쳐 쓴다.
+                       (첫 2주 운용: 감자가 드라이런 → 확인 → "진행" → --write)
+
+    동작
+    ----
+    1. TRADE_LOG_PATH 읽기 (log_trade와 같은 fail-safe: 손상 시 중단).
+    2. 대상 = timestamp가 order_date로 시작 + price_source == "order_time"
+       + order_no 존재. (order_no가 없는 과거 레코드는 자동 대상이 아님 → skipped)
+    3. 같은 order_no 레코드는 한 그룹(매도 A/B 분할)으로 묶어 합산 qty로
+       get_kis_fill_price(..., order_date=order_date, max_attempts=1) 1회 조회.
+       성공 시 그룹의 모든 레코드에 같은 체결평균가를 적용.
+    4. 적용 = price_order_time에 원값 보존 → price = fill_price
+       → price_source = "fill_avg_retro" → corrected_at = KST isoformat.
+    5. dry_run=False일 때만 /tmp/trade_log_backup_YYYYMMDD_HHMMSS.json 백업
+       → 임시 파일 쓰기 → os.replace (log_trade와 같은 원자적 쓰기).
+
+    Returns
+    -------
+    dict {"date": str, "targets": [..], "corrected": [..], "skipped": [..], "dry_run": bool}
+          targets   = 조건에 맞아 조회를 시도한 레코드 요약 목록
+          corrected = 체결가로 교체(또는 교체 예정)된 레코드 요약 목록
+          skipped   = 조회 실패·order_no 없음 등으로 건너뛴 목록(사유 포함)
+          실패 시: {"error": "..."}
+    """
+    import json
+    import os
+    import shutil
+    from datetime import datetime
+
+    try:
+        from zoneinfo import ZoneInfo
+        kst = ZoneInfo("Asia/Seoul")
+    except ImportError:
+        from datetime import timezone as _tz, timedelta as _td
+        kst = _tz(_td(hours=9))
+
+    order_date = str(order_date).strip()
+    if len(order_date) != 8 or not order_date.isdigit():
+        return {"error": f"order_date는 YYYYMMDD 8자리여야 합니다: '{order_date}'"}
+    date_prefix = f"{order_date[:4]}-{order_date[4:6]}-{order_date[6:]}"
+
+    # 1) 장부 읽기 — 손상된 장부는 절대 건드리지 않는다 (fail-safe)
+    try:
+        with open(TRADE_LOG_PATH, "r", encoding="utf-8") as f:
+            records = json.load(f)
+    except FileNotFoundError:
+        return {"error": f"장부 파일 없음: {TRADE_LOG_PATH}"}
+    except json.JSONDecodeError as exc:
+        return {"error": f"trade_log.json 파싱 실패 — 장부가 손상됐을 수 있어 보정을 중단합니다: {exc}"}
+    if not isinstance(records, list):
+        return {"error": f"trade_log.json 최상위가 list가 아님 ({type(records).__name__})"}
+
+    def _brief(idx: int, r: dict) -> dict:
+        return {"index": idx, "timestamp": r.get("timestamp"), "ticker": r.get("ticker"),
+                "side": r.get("side"), "qty": r.get("qty"), "price": r.get("price"),
+                "order_no": r.get("order_no"), "source_rule": r.get("source_rule")}
+
+    # 2) 대상 선별 + order_no별 그룹핑
+    targets: list[dict] = []
+    skipped: list[dict] = []
+    groups: dict[str, list[int]] = {}
+    for idx, r in enumerate(records):
+        if not isinstance(r, dict):
+            continue
+        if not str(r.get("timestamp", "")).startswith(date_prefix):
+            continue
+        if r.get("price_source") != "order_time":
+            continue
+        order_no = str(r.get("order_no") or "").strip()
+        if not order_no:
+            skipped.append({**_brief(idx, r), "reason": "order_no 없음 — 자동 보정 대상 아님"})
+            continue
+        targets.append(_brief(idx, r))
+        groups.setdefault(order_no, []).append(idx)
+
+    # 3) 그룹별 1회 조회 → 4) 적용(메모리상)
+    corrected: list[dict] = []
+    now_iso = datetime.now(kst).isoformat(timespec="seconds")
+    for order_no, idxs in groups.items():
+        first = records[idxs[0]]
+        ticker = str(first.get("ticker", "")).strip()
+        total_qty = 0
+        for i in idxs:
+            try:
+                total_qty += int(records[i].get("qty", 0))
+            except (TypeError, ValueError):
+                pass
+        fill = get_kis_fill_price(order_no, ticker, total_qty,
+                                  order_date=order_date, max_attempts=1)
+        if not fill.get("success"):
+            for i in idxs:
+                skipped.append({**_brief(i, records[i]),
+                                "reason": f"체결가 재조회 실패: {fill.get('reason')}"})
+            continue
+        fill_price = fill["fill_price"]
+        for i in idxs:
+            r = records[i]
+            before = r.get("price")
+            r["price_order_time"] = before          # 원값 보존 (규칙 17)
+            r["price"]            = fill_price
+            r["price_source"]     = "fill_avg_retro"
+            r["corrected_at"]     = now_iso
+            corrected.append({**_brief(i, r), "price_before": before, "price_after": fill_price,
+                              "fill_qty": fill.get("fill_qty")})
+
+    result = {"date": order_date, "targets": targets, "corrected": corrected,
+              "skipped": skipped, "dry_run": dry_run}
+
+    # 5) 드라이런이면 여기서 끝 — 파일 무접촉
+    if dry_run or not corrected:
+        return result
+
+    # 백업 → 임시 파일 쓰기 → os.replace (원자적)
+    backup_path = f"/tmp/trade_log_backup_{datetime.now(kst).strftime('%Y%m%d_%H%M%S')}.json"
+    try:
+        shutil.copy2(TRADE_LOG_PATH, backup_path)
+    except Exception as exc:
+        return {"error": f"백업 실패 — 보정을 중단합니다: {exc}"}
+    tmp_path = TRADE_LOG_PATH + ".tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(records, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, TRADE_LOG_PATH)
+    except Exception as exc:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        return {"error": f"장부 쓰기 실패(백업은 {backup_path}에 있음): {exc}"}
+    result["backup_path"] = backup_path
+    return result
+
+
 def get_trade_log(rule_tag: str | None = None) -> dict:
     """
     거래 로그를 반환한다.
@@ -4654,6 +4797,24 @@ if __name__ == "__main__":
     # "./venv/bin/python tools.py killswitch" → 오프라인 테스트(거래 로그 + 킬 스위치
     # T1~T6)까지만 실행하고 종료한다. 이후 테스트는 네트워크·대화형 입력이 필요하다.
     _KS_ONLY = "killswitch" in sys.argv[1:]
+
+    # "./venv/bin/python tools.py reconcile 20260827 [--write]" → 장 마감 후 체결가
+    # 사후 보정(③ 방안 B). --write 없으면 드라이런(파일 무접촉). 결과 JSON 출력 후 종료.
+    if "reconcile" in sys.argv[1:]:
+        _args = [a for a in sys.argv[1:] if a != "reconcile"]
+        _write = "--write" in _args
+        _dates = [a for a in _args if a != "--write"]
+        if len(_dates) != 1:
+            print("사용법: tools.py reconcile YYYYMMDD [--write]")
+            sys.exit(2)
+        _res = reconcile_fill_prices(_dates[0], dry_run=not _write)
+        print(json.dumps(_res, ensure_ascii=False, indent=2, default=str))
+        if "error" in _res:
+            sys.exit(1)
+        print(f"\n[reconcile] {'드라이런' if not _write else '실제 보정'} — "
+              f"대상 {len(_res['targets'])}건 / 보정 {len(_res['corrected'])}건 / "
+              f"건너뜀 {len(_res['skipped'])}건")
+        sys.exit(0)
 
     def _pp(label: str, data: dict):
         print(f"\n{'='*55}")
