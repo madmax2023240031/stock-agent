@@ -456,6 +456,7 @@ def get_kis_balance() -> dict:
     domestic: dict = {}
     dom_pages = 0
     dom_truncated = False
+    dom_page_times: list[str] = []  # 미확정 후보 ⑤(a) — 페이지별 조회 시각(관찰 26)
 
     try:
         dom_params = {
@@ -486,6 +487,7 @@ def get_kis_balance() -> dict:
             resp.raise_for_status()
             d = resp.json()
             dom_pages += 1
+            dom_page_times.append(datetime.now().strftime("%H:%M:%S.%f")[:-3])  # 후보 ⑤(a)
 
             if d.get("rt_cd") != "0":
                 dom_error = d.get("msg1") or d.get("msg") or str(d)
@@ -553,15 +555,25 @@ def get_kis_balance() -> dict:
                 "profit_loss_krw":    _i(o2_last.get("evlu_pfls_smtl_amt")),
                 "pages":              dom_pages,
                 "truncated":          dom_truncated,
+                "page_times":         dom_page_times,  # 후보 ⑤(a)
             }
 
             # 자기검증: 종목 평가금액 합 vs 계좌 요약 합. 값은 원본 유지, 경고만.
             eval_sum = sum(h["eval_amount"] for h in dom_holdings)
             if domestic["eval_stock_krw"] and abs(eval_sum - domestic["eval_stock_krw"]) > 1:
+                # 후보 ⑤(a): 페이지별 조회 시각·간격 병기 (관찰 26 — 페이지 간 시세 틱 반영 가능성 관측)
+                _span = ""
+                if len(dom_page_times) >= 2:
+                    try:
+                        _t0 = datetime.strptime(dom_page_times[0], "%H:%M:%S.%f")
+                        _t1 = datetime.strptime(dom_page_times[-1], "%H:%M:%S.%f")
+                        _span = f", 간격 {(_t1 - _t0).total_seconds():.1f}초"
+                    except ValueError:
+                        _span = ""
                 print(
                     "⚠️ get_kis_balance: 국내 평가금액 불일치 — "
                     f"종목합 {eval_sum:,} vs 요약 {domestic['eval_stock_krw']:,} "
-                    f"(페이지 {dom_pages})"
+                    f"(페이지 {dom_pages}, 조회시각 {' → '.join(dom_page_times)}{_span})"
                 )
     except Exception as exc:
         dom_holdings = []
