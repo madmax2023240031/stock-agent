@@ -3699,6 +3699,9 @@ def log_trade(
     reason: str,
     sector: str | None = None,
     source_rule: str | None = None,
+    order_no: str | None = None,
+    price_source: str | None = None,
+    fill_reason: str | None = None,
 ) -> dict:
     """
     거래 1건을 TRADE_LOG_PATH(trade_log.json)에 기록한다.
@@ -3719,6 +3722,15 @@ def log_trade(
                   귀속시키는 필드. 매도 기록 시 반드시 전달할 것
                   (A/B 손익 비교와 kill switch 규칙별 기록에 필요).
                   허용값: None 또는 "A"/"B".
+    order_no : str | None  KIS 주문번호(ODNO). 장 마감 후 체결가 사후 보정
+                  (reconcile_fill_prices)의 짝맞춤 키. 없으면 None.
+    price_source : str | None  price 값의 출처.
+                  "fill_avg"        = 주문 직후 체결평균가 조회 성공값
+                  "order_time"      = 체결가 조회 실패 → 주문 시점가로 기록
+                  "fill_avg_retro"  = 장 마감 후 사후 보정으로 교체된 값
+                  None = 이 필드가 없던 시절(2026-08-26 이전)의 레코드.
+    fill_reason : str | None  체결가 조회 실패 사유(get_kis_fill_price의
+                  reason). 성공 시 None.
 
     Returns
     -------
@@ -3776,6 +3788,11 @@ def log_trade(
         # SELL 태그 매도가 어느 규칙(A/B)의 보유분을 판 것인지 귀속시키는 필드.
         # 매도 기록 시 반드시 전달할 것 (A/B 손익 비교와 kill switch 규칙별 기록에 필요).
         "source_rule": source_rule,
+        # ③ 부분체결 장부가 보정(방안 B, 2026-08-26 설계 확정) — 사후 보정용 필드 3개.
+        # 기본값 None → 기존 호출·기존 레코드와 호환. 값은 auto_trader 호출부가 채운다.
+        "order_no":     order_no,
+        "price_source": price_source,
+        "fill_reason":  fill_reason,
     }
 
     # 기존 장부 읽기 — 손상된 장부는 절대 덮어쓰지 않는다 (fail-safe)
