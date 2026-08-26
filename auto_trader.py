@@ -302,6 +302,15 @@ def _print_kill_switch_line(rule_tag: str, ks: dict) -> None:
           f"as_of {ks.get('as_of')}")
 
 
+def _order_brief(ticker: str, name: str, side: str, qty: int, price,
+                 execution: dict | None) -> dict:
+    """실행 요약 라인용 주문 1건 요약 (미확정 후보 ⑦). 주문번호는 execution에 있을 때만, 없으면 None."""
+    sent = bool(execution and execution.get("success"))
+    order_no = (execution.get("summary", {}) or {}).get("order_no") if sent else None
+    return {"ticker": ticker, "name": name, "side": side, "qty": qty,
+            "price": price, "sent": sent, "order_no": order_no or None}
+
+
 # ═══════════════════════════════════════════════
 # dry-run 전용 로그 (trade_log.json과 완전히 분리)
 # ═══════════════════════════════════════════════
@@ -663,6 +672,7 @@ def run_buy_rule(
     drafted = 0
     approved_count = 0
     rejected_count = 0
+    orders: list[dict] = []  # 후보 ⑦ 실행 요약용
 
     for cand in candidates:
         if drafted >= max_orders:
@@ -803,6 +813,9 @@ def run_buy_rule(
             test_now=test_now))
         records += 1
         drafted += 1
+        orders.append(_order_brief(ticker, name, "BUY", qty,
+                                   book_log["fill"]["fill_price"] if book_log and book_log["fill"].get("success") else price,
+                                   execution))  # 후보 ⑦
 
         if not approved:
             rejected_count += 1
@@ -819,7 +832,8 @@ def run_buy_rule(
 
     return {"run_id": run_id, "rule_tag": rule_tag,
             "candidates": len(candidates), "records": records, "drafted": drafted,
-            "approved": approved_count, "rejected": rejected_count}
+            "approved": approved_count, "rejected": rejected_count,
+            "orders": orders}  # 후보 ⑦
 
 
 # ═══════════════════════════════════════════════
@@ -928,6 +942,7 @@ def run_sell_rule(test_now: str | None = None) -> dict:
     session_trades = 0
     approved_count = 0
     rejected_count = 0
+    orders: list[dict] = []  # 후보 ⑦ 실행 요약용
 
     for cand in sell_candidates:
         ticker = cand.get("ticker", "")
@@ -1078,6 +1093,9 @@ def run_sell_rule(test_now: str | None = None) -> dict:
             test_now=test_now))
         records += 1
         drafted += 1
+        orders.append(_order_brief(ticker, name, "SELL", qty,
+                                   book_log["fill"]["fill_price"] if book_log and book_log["fill"].get("success") else price,
+                                   execution))  # 후보 ⑦
         if approved:
             approved_count += 1
             session_trades += 1
@@ -1086,7 +1104,8 @@ def run_sell_rule(test_now: str | None = None) -> dict:
 
     return {"run_id": run_id, "rule_tag": "SELL",
             "candidates": len(sell_candidates), "records": records, "drafted": drafted,
-            "approved": approved_count, "rejected": rejected_count}
+            "approved": approved_count, "rejected": rejected_count,
+            "orders": orders}  # 후보 ⑦
 
 
 # ═══════════════════════════════════════════════
@@ -1165,6 +1184,14 @@ def main() -> None:
                       if APPROVAL_REQUIRED else
                       f" — 전송 {s.get('approved', 0)}건 (승인 면제)")
                      if s.get('drafted', 0) else ""))
+            for o in s.get("orders", []):  # 후보 ⑦ 종목당 1줄
+                _p = o.get("price")
+                _p_txt = f"@{_p:,.0f}" if isinstance(_p, (int, float)) else "@—"
+                _no = o.get("order_no")
+                print(f"    └ {o.get('side')} {o.get('ticker')} {o.get('name')} "
+                      f"{o.get('qty')}주 {_p_txt} "
+                      f"{'전송✓' if o.get('sent') else '미전송'}"
+                      f"{' 주문번호 ' + str(_no) if _no else ''}")
     print(f"\n상세 기록: {DRYRUN_LOG_PATH}")
     if _is_live_mode() and PHASE == 4:
         print("🔴 4단계 승인 면제 모드로 실행되었습니다. 실제 전송 결과는 각 기록의 execution 필드를 확인하세요.")
