@@ -279,6 +279,29 @@ class _TimestampedStream:
         return getattr(self._stream, name)
 
 
+def _kill_switch_snapshot(ks: dict) -> dict:
+    """킬 스위치 상태 dict에서 기록용 5키만 추출 (미확정 후보 ②, 8/25 설계)."""
+    return {
+        "daily_pnl_pct":        ks.get("daily_pnl_pct"),
+        "cumulative_pnl_pct":   ks.get("cumulative_pnl_pct"),
+        "daily_triggered":      ks.get("daily_triggered"),
+        "cumulative_triggered": ks.get("cumulative_triggered"),
+        "as_of":                ks.get("as_of"),
+    }
+
+
+def _print_kill_switch_line(rule_tag: str, ks: dict) -> None:
+    """회차 시작 시 킬 스위치 판정 1줄 출력 — 주문 0건 회차에도 남는 최소 신호 (후보 ②)."""
+    def _pct(v):
+        return f"{v:+.2f}%" if isinstance(v, (int, float)) else "—"
+    def _flag(v):
+        return "O" if v else "X"
+    print(f"🛡 킬스위치 [{rule_tag}] 일일 {_pct(ks.get('daily_pnl_pct'))} / "
+          f"누적 {_pct(ks.get('cumulative_pnl_pct'))} "
+          f"(발동: 일일 {_flag(ks.get('daily_triggered'))} / 누적 {_flag(ks.get('cumulative_triggered'))}) "
+          f"as_of {ks.get('as_of')}")
+
+
 # ═══════════════════════════════════════════════
 # dry-run 전용 로그 (trade_log.json과 완전히 분리)
 # ═══════════════════════════════════════════════
@@ -577,6 +600,7 @@ def run_buy_rule(
                             test_now=test_now)
         _append_dryrun_log(entry)
         return {"run_id": run_id, "error": ks["error"]}
+    _print_kill_switch_line(rule_tag, ks)  # 후보 ② 회차 시작 킬스위치 1줄
 
     # ── 1. 규칙 평가 (판단/제안만) ──────────────────────────────
     result = rule_fn(market=market, universe_limit=universe_limit)
@@ -595,6 +619,7 @@ def run_buy_rule(
     _append_dryrun_log(_make_entry(
         run_id, rule_tag, "EVAL_SUMMARY", side="BUY",
         eval_summary={
+            "kill_switch": _kill_switch_snapshot(ks),  # 후보 ②
             "candidates_count": len(candidates),
             "excluded_count": result.get("excluded_count", len(excluded)),
             "universe_cache_note": result.get("universe_cache_note"),
@@ -819,6 +844,7 @@ def run_sell_rule(test_now: str | None = None) -> dict:
                             test_now=test_now)
         _append_dryrun_log(entry)
         return {"run_id": run_id, "error": ks["error"]}
+    _print_kill_switch_line("SELL", ks)  # 후보 ② 회차 시작 킬스위치 1줄
 
     # ── 1. 매도 규칙 평가 (판단/제안만) ─────────────────────────
     result = evaluate_sell_rules()
@@ -838,6 +864,7 @@ def run_sell_rule(test_now: str | None = None) -> dict:
     _append_dryrun_log(_make_entry(
         run_id, "SELL", "EVAL_SUMMARY", side="SELL",
         eval_summary={
+            "kill_switch":              _kill_switch_snapshot(ks),  # 후보 ②
             "stop_loss_count":          summary.get("stop_loss_count"),
             "take_profit_count":        summary.get("take_profit_count"),
             "stop_loss_deferred_count": summary.get("stop_loss_deferred_count"),
