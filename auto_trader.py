@@ -69,6 +69,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -237,6 +238,45 @@ def _now_kst() -> datetime:
     """KST 현재 시각 (tz 포함)."""
     from zoneinfo import ZoneInfo
     return datetime.now(ZoneInfo("Asia/Seoul"))
+
+
+class _TimestampedStream:
+    """stdout/stderr 래퍼 — 각 줄 첫머리에 [HH:MM:SS] KST 접두 (미확정 후보 ①, 8/25 설계).
+
+    - 빈 줄·구분선(=, -, ═, ─, 🔴 등만으로 된 줄)에는 접두를 붙이지 않는다.
+    - 매 write 마다 flush 해서 launchd 로그 리다이렉션에서도 시각이 왜곡되지 않게 한다.
+    - 출력 문자열만 바꾸며 매매 로직·JSON 기록에는 관여하지 않는다.
+    """
+
+    _SEP_CHARS = "=-─═━╌┄🔴"
+
+    def __init__(self, stream):
+        self._stream = stream
+        self._at_line_start = True
+
+    @classmethod
+    def _is_separator(cls, piece: str) -> bool:
+        body = piece.strip()
+        return bool(body) and all(ch in cls._SEP_CHARS for ch in body)
+
+    def write(self, text: str) -> int:
+        if not text:
+            return 0
+        out = []
+        for piece in text.splitlines(keepends=True):
+            if self._at_line_start and piece.strip() and not self._is_separator(piece):
+                out.append(f"[{_now_kst().strftime('%H:%M:%S')}] ")
+            out.append(piece)
+            self._at_line_start = piece.endswith("\n")
+        self._stream.write("".join(out))
+        self._stream.flush()
+        return len(text)
+
+    def flush(self) -> None:
+        self._stream.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
 
 
 # ═══════════════════════════════════════════════
@@ -1013,6 +1053,8 @@ def run_sell_rule(test_now: str | None = None) -> dict:
 # ═══════════════════════════════════════════════
 
 def main() -> None:
+    sys.stdout = _TimestampedStream(sys.stdout)  # 후보 ① 라인 타임스탬프
+    sys.stderr = _TimestampedStream(sys.stderr)
     _assert_phase_config()
 
     parser = argparse.ArgumentParser(
