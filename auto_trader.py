@@ -808,6 +808,10 @@ def run_buy_rule(
                 qty=qty, price=record_price,
                 reason=f"[auto_trader {run_id}] 규칙 {rule_tag} 자동매수 {price_note}",
                 sector=sector, source_rule=None,
+                # ③ 방안 B: 사후 보정용 필드 — 주문번호·가격 출처·조회 실패 사유
+                order_no=execution.get("summary", {}).get("order_no") or None,
+                price_source="fill_avg" if fill.get("success") else "order_time",
+                fill_reason=None if fill.get("success") else fill.get("reason"),
             )
             book_log = {"fill": fill,
                         "entries": [{"source_rule": None, "qty": qty, "result": r}],
@@ -1089,6 +1093,10 @@ def run_sell_rule(test_now: str | None = None) -> dict:
                     qty=part_qty, price=record_price,
                     reason=f"[auto_trader {run_id}] 매도 규칙 자동매도 — {reason} {price_note}",
                     sector=None, source_rule=src,
+                    # ③ 방안 B: 사후 보정용 필드 — A/B 분할 레코드에 같은 주문번호 기록
+                    order_no=execution.get("summary", {}).get("order_no") or None,
+                    price_source="fill_avg" if fill.get("success") else "order_time",
+                    fill_reason=None if fill.get("success") else fill.get("reason"),
                 )
                 entries.append({"source_rule": src, "qty": part_qty, "result": r})
             book_log = {"fill": fill, "entries": entries,
