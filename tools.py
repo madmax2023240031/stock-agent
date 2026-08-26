@@ -3016,6 +3016,7 @@ def evaluate_sell_rules() -> dict:
             "count":    len(hold),
             "domestic": hold_kr,
             "overseas": hold_us,
+            "items":    hold,  # 미확정 후보 ④ — 보유 유지 종목 관측 (키 추가만)
         },
         "summary": {
             "total_holdings":          len(holdings),

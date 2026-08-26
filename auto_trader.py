@@ -857,6 +857,7 @@ def run_sell_rule(test_now: str | None = None) -> dict:
     sell_candidates = list(result.get("stop_loss", [])) + list(result.get("take_profit", []))
     summary = result.get("summary", {})
     deferred = result.get("stop_loss_deferred", [])
+    hold_items = list(result.get("hold", {}).get("items", []))  # 후보 ④
     records = 0
 
     # ── 1-1. 평가 요약 기록 (관찰 데이터) ───────────────
@@ -874,10 +875,23 @@ def run_sell_rule(test_now: str | None = None) -> dict:
                  "trend_note": d.get("trend_note")}
                 for d in deferred
             ],
+            "hold_count": summary.get("hold_count"),  # 후보 ④
+            "hold": [
+                {"ticker": h.get("ticker"), "name": h.get("name"),
+                 "profit_loss_pct": h.get("profit_loss_pct")}
+                for h in hold_items
+            ],
         },
-        note="매도 규칙 평가 요약 (stop_loss_deferred 포함 — 관찰 데이터)",
+        note="매도 규칙 평가 요약 (stop_loss_deferred·hold 포함 — 관찰 데이터)",
         test_now=test_now))
     records += 1
+    if hold_items:  # 후보 ④ 보유 유지 종목 1줄
+        _hold_txt = ", ".join(
+            f"{h.get('ticker')} {h.get('name')}({h.get('profit_loss_pct'):+.2f}%)"
+            if isinstance(h.get("profit_loss_pct"), (int, float))
+            else f"{h.get('ticker')} {h.get('name')}(—)"
+            for h in hold_items)
+        print(f"  📌 보유 유지 {len(hold_items)}종목: {_hold_txt}")
 
     # ── 1-2. 자동매매 장부 조회 (작업 3-b, C-1: 자동매매는 자동매매가 산 것만 판다) ──
     # fail-safe: 장부 재생 실패(로그 불일치)는 킬 스위치 실패와 동일 — 이 사이클 매도 전부 중단.
