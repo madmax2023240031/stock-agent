@@ -673,9 +673,24 @@ def run_buy_rule(
     approved_count = 0
     rejected_count = 0
     orders: list[dict] = []  # 후보 ⑦ 실행 요약용
+    truncated: list[dict] = []  # 후보 ⑥ max_orders 절단 탈락 종목
 
-    for cand in candidates:
+    for idx, cand in enumerate(candidates, start=1):
         if drafted >= max_orders:
+            # 후보 ⑥: 조용히 break 하지 않고 남은 후보를 SKIPPED로 기록한다 (관찰 데이터, 주문 없음)
+            n_total = len(candidates)
+            for k, rest in enumerate(candidates[idx - 1:], start=idx):
+                _t, _n, _sc = rest.get("ticker", ""), rest.get("name", ""), rest.get("score")
+                _append_dryrun_log(_make_entry(
+                    run_id, rule_tag, "SKIPPED", ticker=_t, name=_n, side="BUY",
+                    sector=rest.get("sector") or "기타/미분류",
+                    note=f"max_orders 절단 — 순위 {k}/{n_total}, 점수 {_sc}",
+                    test_now=test_now))
+                records += 1
+                truncated.append({"ticker": _t, "name": _n, "rank": k, "score": _sc})
+            _f = truncated[0]
+            print(f"  ⏭ max_orders 절단: {_f['rank']}위 {_f['ticker']} {_f['name']}(점수 {_f['score']}) "
+                  f"이하 {len(truncated)}종목 주문서 미작성")
             break
 
         ticker = cand.get("ticker", "")
@@ -833,7 +848,8 @@ def run_buy_rule(
     return {"run_id": run_id, "rule_tag": rule_tag,
             "candidates": len(candidates), "records": records, "drafted": drafted,
             "approved": approved_count, "rejected": rejected_count,
-            "orders": orders}  # 후보 ⑦
+            "orders": orders,  # 후보 ⑦
+            "truncated": truncated}  # 후보 ⑥
 
 
 # ═══════════════════════════════════════════════
