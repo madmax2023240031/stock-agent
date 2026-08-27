@@ -3434,6 +3434,41 @@ def evaluate_buy_rule_B(market: str = "ALL", universe_limit: int | None = None) 
     }
 
 
+# ── KR 휴장일 목록 (로컬 파일, 세션 4 구현 1 / 휴장-①) ──────────────
+# tools.py가 있는 폴더 기준으로 찾는다 (launchd 실행 시 작업 폴더가 달라도 안전).
+HOLIDAYS_KR_PATH = str(Path(__file__).resolve().parent / "holidays_kr.json")
+
+
+def _load_kr_holidays(session_year: int) -> tuple[set[str] | None, str]:
+    """
+    KR 휴장일 목록을 로컬 JSON(holidays_kr.json)에서 읽는다.
+    형식: {"market": "KR", "source": "...", "updated": "YYYY-MM-DD", "holidays": ["YYYY-MM-DD", ...]}
+
+    반환: (휴장일 set 또는 None, 사유 문자열)
+    None이면 fail-safe 차단 대상 — 파일 부재 / 파싱 실패 / updated 연도 ≠ 세션 연도 / holidays 형식 오류.
+    캐시 없음: 주문마다 다시 읽어 파일 교체가 즉시 반영된다 (파일이 작아 비용 무시 가능).
+    """
+    import json as _json
+    import os as _os
+    p = HOLIDAYS_KR_PATH
+    if not _os.path.exists(p):
+        return None, f"휴장일 파일 없음: {p}"
+    try:
+        with open(p, encoding="utf-8") as f:
+            data = _json.load(f)
+    except Exception as e:
+        return None, f"휴장일 파일 파싱 실패: {p} — {e}"
+    if not isinstance(data, dict):
+        return None, f"휴장일 파일 최상위가 dict가 아님: {p}"
+    updated = str(data.get("updated", ""))
+    if not updated[:4].isdigit() or int(updated[:4]) != session_year:
+        return None, f"휴장일 파일 updated 연도 불일치: {updated!r} vs 세션 {session_year}"
+    hol = data.get("holidays")
+    if not isinstance(hol, list) or not all(isinstance(x, str) and len(x) == 10 for x in hol):
+        return None, f"휴장일 파일 holidays 형식 오류: {p}"
+    return set(hol), f"휴장일 파일 로드 (updated {updated}, {len(hol)}건)"
+
+
 # ═══════════════════════════════════════════════
 # 13. check_guardrails  (자동매매 가드레일 검사)
 # ═══════════════════════════════════════════════
@@ -3590,6 +3625,21 @@ def check_guardrails(
     )
     if not _check("거래일", is_trading_day, detail):
         return _block("거래일", f"주말은 거래일이 아닙니다 — {detail}")
+
+    # ── 0-b. 휴장일 (KR만, 로컬 holidays_kr.json 기준, fail-safe 차단) ──
+    # 세션 4 구현 1 (휴장-①). US는 범위 밖(세션 5에서 holidays_us.json 검토).
+    if market == "KR":
+        session_date = session_day.strftime("%Y-%m-%d")
+        holidays, why = _load_kr_holidays(session_day.year)
+        if holidays is None:
+            detail = f"세션 기준일 {session_date} — 휴장 여부 판정 불가({why})"
+            _check("휴장일", False, detail)
+            return _block("휴장일", f"휴장일 판정 불가로 차단(fail-safe) — {detail}")
+        if session_date in holidays:
+            detail = f"세션 기준일 {session_date} — 휴장일({why})"
+            _check("휴장일", False, detail)
+            return _block("휴장일", f"휴장일은 거래일이 아닙니다 — {detail}")
+        _check("휴장일", True, f"세션 기준일 {session_date} — 휴장일 아님({why})")
 
     # ── 1. 거래 시간 ─────────────────────────────────────────────
     if market == "KR":
