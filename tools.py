@@ -3985,6 +3985,8 @@ def log_trade(
     order_no: str | None = None,
     price_source: str | None = None,
     fill_reason: str | None = None,
+    currency: str = "KRW",
+    exchange: str | None = None,
 ) -> dict:
     """
     거래 1건을 TRADE_LOG_PATH(trade_log.json)에 기록한다.
@@ -4014,6 +4016,8 @@ def log_trade(
                   None = 이 필드가 없던 시절(2026-08-26 이전)의 레코드.
     fill_reason : str | None  체결가 조회 실패 사유(get_kis_fill_price의
                   reason). 성공 시 None.
+    currency : str  통화. "KRW" 기본, US 실주문 승격 후 "USD" (⑦-B).
+    exchange : str | None  US 전용 거래소 코드 NASD·NYSE·AMEX. 국내 건은 None.
 
     Returns
     -------
@@ -4076,6 +4080,9 @@ def log_trade(
         "order_no":     order_no,
         "price_source": price_source,
         "fill_reason":  fill_reason,
+        # ⑦-B: 키 부재(시즌 1 레코드) = "KRW"/국내로 해석. 기존 호출부 무변경(기본값).
+        "currency":     currency,
+        "exchange":     exchange,
     }
 
     # 기존 장부 읽기 — 손상된 장부는 절대 덮어쓰지 않는다 (fail-safe)
