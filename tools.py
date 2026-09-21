@@ -636,6 +636,14 @@ def get_kis_balance() -> dict:
                             qty = _i(item.get("ovrs_cblc_qty", "0"))
                             if qty == 0:
                                 continue
+                            # 후보 ⑤: exchange는 조회 파라미터(excg_cd)가 아니라 행별
+                            # 응답 필드 ovrs_excg_cd(실제 상장 거래소)에서 읽는다 —
+                            # NASD 조회가 미국 전체를 반환하므로(2026-07-22 실측)
+                            # 조회 코드는 실제 거래소와 다를 수 있다.
+                            # 필드 부재·허용 외 값이면 None → 매도 주문 단계에서
+                            # 사유 명시 SKIPPED (fail-safe, ⑦-D 추정 금지).
+                            # ovrs_excg_cd 존재 여부는 키 재발급 후 ⑹ dry-run에서 실측.
+                            _row_excg = str(item.get("ovrs_excg_cd", "")).strip().upper()
                             items.append({
                                 "ticker":          item.get("ovrs_pdno", ""),
                                 "name":            item.get("ovrs_item_name", ""),
@@ -648,7 +656,7 @@ def get_kis_balance() -> dict:
                                 "profit_loss_pct": _f(item.get("evlu_pfls_rt")),
                                 "currency":        crcy_cd,
                                 "market":          "US",
-                                "exchange":        excg_cd,
+                                "exchange":        _row_excg if _row_excg in ("NASD", "NYSE", "AMEX") else None,
                             })
                         page_items   = items
                         page_tr_cont = (r.headers.get("tr_cont") or "").strip().upper()
@@ -2562,6 +2570,50 @@ def _load_universe_disk_cache(key: str) -> tuple[list, str] | dict:
     except Exception as e:
         return {"error": f"디스크 캐시 읽기 실패: {e}"}
 
+
+def _fetch_us_exchange_map() -> tuple[dict, str | None]:
+    """
+    FDR 거래소별 상장 목록(NASDAQ/NYSE/AMEX)으로
+    심볼 → KIS 거래소 코드("NASD"/"NYSE"/"AMEX") 매핑을 만든다.
+
+    후보 ⑤ 설계 (2026-09-21 실측 근거)
+    ------------------------------------
+    - 매칭은 strip+대문자화 후 정확 일치만. 구분자 변환·제거는 하지 않는다
+      — S&P500 목록의 BRKB·BFB(구분자 제거 표기)는 의도적으로 미매핑(None)
+      으로 남긴다. KIS PDNO 표기 미확인 상태에서의 강제 매칭은 추정(⑦-D 위반).
+      실측: 503개 중 501개 정확히 1곳 매칭, 복수 매칭 0건 (2026-09-21).
+    - 복수 거래소 등재 심볼은 None 처리 (실측 0건이나 목록 변동 대비 가드 유지).
+    - 목록 조회 실패 시 ({}, 사유) 반환 — 이때 후보 exchange=None
+      → 주문 단계 SKIPPED (fail-safe).
+    """
+    _SOURCES = [("NASDAQ", "NASD"), ("NYSE", "NYSE"), ("AMEX", "AMEX")]
+    per_exchange: dict[str, set] = {}
+    try:
+        for listing_name, kis_code in _SOURCES:
+            df = fdr.StockListing(listing_name)
+            if "Symbol" not in df.columns:
+                return {}, f"{listing_name} 목록에 Symbol 칼럼 없음 — 매핑 중단"
+            per_exchange[kis_code] = {
+                str(s).strip().upper() for s in df["Symbol"].dropna().astype(str)
+            }
+    except Exception as e:
+        return {}, f"US 거래소 목록 조회 실패: {e}"
+
+    mapping: dict = {}
+    ambiguous = 0
+    for kis_code, symbols in per_exchange.items():
+        for s in symbols:
+            if s in mapping and mapping[s] != kis_code:
+                if mapping[s] is not None:
+                    ambiguous += 1
+                mapping[s] = None   # 복수 거래소 등재 — 모호 → 제외
+            elif s not in mapping:
+                mapping[s] = kis_code
+    clean = {s: c for s, c in mapping.items() if c is not None}
+    note = f"복수 거래소 등재로 제외 {ambiguous}건" if ambiguous else None
+    return clean, note
+
+
 def get_universe(market: str = "ALL") -> dict:
     """
     발굴 대상 종목 유니버스를 반환한다.
@@ -2648,6 +2700,24 @@ def get_universe(market: str = "ALL") -> dict:
                 }
                 for _, row in sp500.iterrows()
             ]
+            # 후보 ⑤: 각 종목에 KIS 거래소 코드 부착 (캐시 저장 전 보강 —
+            # 디스크 캐시에도 exchange 포함). 미매핑은 None → 매수 주문 단계
+            # SKIPPED (fail-safe). 유니버스 자체는 유효하므로 매핑 실패를
+            # 전체 실패로 승격하지 않는다.
+            # 알려진 한계: BRKB·BFB 2건은 표기 차이로 항상 미매핑 (설계 결정).
+            ex_map, ex_note = _fetch_us_exchange_map()
+            unmapped = 0
+            for r in result:
+                r["exchange"] = ex_map.get(str(r["ticker"]).strip().upper())
+                if r["exchange"] is None:
+                    unmapped += 1
+            if unmapped or ex_note:
+                parts = []
+                if unmapped:
+                    parts.append(f"US exchange 미매핑 {unmapped}건")
+                if ex_note:
+                    parts.append(ex_note)
+                fallback_notes.append("; ".join(parts))
             with _universe_lock:
                 _universe_cache["US"] = (time.time(), result)
             _save_universe_disk_cache("US", result)
@@ -3179,6 +3249,11 @@ def evaluate_sell_rules() -> dict:
             "profit_loss_pct": pct,
             "market":          market,
             "currency":        currency,
+            # 후보 ⑤: US 매도 주문용 KIS 거래소 코드. 잔고 파싱에서 검증된
+            # 값만 전달되며(NASD/NYSE/AMEX), 없으면 None → 주문 단계 SKIPPED
+            # (⑦-D). KR은 항상 None — dry-run 로그 규약(exchange는 US 건만
+            # 값 존재)과 일치.
+            "exchange":        h.get("exchange") if market == "US" else None,
         }
 
         if pct <= HARD_FLOOR_PCT:
@@ -3367,6 +3442,19 @@ def evaluate_buy_rule_A(market: str = "ALL", universe_limit: int | None = None) 
     if "error" in screened:
         return {"error": f"스크리닝 실패: {screened['error']}"}
 
+    # 후보 ⑤: US 후보용 ticker→거래소 매핑. screen_stocks가 방금 데워둔
+    # 유니버스 인메모리 캐시를 재사용하므로 추가 원격 조회 없음.
+    # 조회 실패 시 빈 dict → US 후보 exchange=None → 주문 단계 SKIPPED (fail-safe).
+    _us_ex: dict = {}
+    if market in ("US", "ALL"):
+        _uni_us = get_universe("US")
+        if "error" not in _uni_us:
+            _us_ex = {
+                t["ticker"]: t.get("exchange")
+                for t in _uni_us.get("tickers", [])
+                if t.get("exchange")
+            }
+
     # ── 3. 필터: 점수 기준 + 미보유 ─────────────────────────────
     excluded: list[dict] = []   # 규칙상 제외/보류된 후보 (사유 기록 — Phase 0 관찰 데이터)
     candidates: list[dict] = []
@@ -3387,12 +3475,16 @@ def evaluate_buy_rule_A(market: str = "ALL", universe_limit: int | None = None) 
                 "reason": "흑자전환★ 제외 — 성장률 기저효과로 점수 왜곡 가능",
             })
             continue
+        _mkt = "KR" if _is_korean(item["ticker"]) else "US"
         candidates.append({
             "ticker":      item["ticker"],
             "name":        item["name"],
             "score":       item["total_score"],
             "sector":      item["sector"],
-            "market":      "KR" if _is_korean(item["ticker"]) else "US",
+            "market":      _mkt,
+            # 후보 ⑤: US 매수 주문용 KIS 거래소 코드. 미매핑이면 None
+            # → 주문 단계 SKIPPED (⑦-D). KR은 항상 None.
+            "exchange":    _us_ex.get(item["ticker"]) if _mkt == "US" else None,
             "reason":      "점수 상위",
             "key_metrics": item["key_metrics"],
         })
@@ -3582,6 +3674,19 @@ def evaluate_buy_rule_B(market: str = "ALL", universe_limit: int | None = None) 
             ),
         }
 
+    # 후보 ⑤: US 후보용 ticker→거래소 매핑. screen_stocks가 방금 데워둔
+    # 유니버스 인메모리 캐시를 재사용하므로 추가 원격 조회 없음.
+    # 조회 실패 시 빈 dict → US 후보 exchange=None → 주문 단계 SKIPPED (fail-safe).
+    _us_ex: dict = {}
+    if market in ("US", "ALL"):
+        _uni_us = get_universe("US")
+        if "error" not in _uni_us:
+            _us_ex = {
+                t["ticker"]: t.get("exchange")
+                for t in _uni_us.get("tickers", [])
+                if t.get("exchange")
+            }
+
     # ── 5. 후보 필터: 부족 섹터 + 점수 기준 + 미보유 ─────────────
     excluded: list[dict] = []   # 규칙상 제외/보류된 후보 (사유 기록 — Phase 0 관찰 데이터)
     candidates: list[dict] = []
@@ -3604,12 +3709,16 @@ def evaluate_buy_rule_B(market: str = "ALL", universe_limit: int | None = None) 
                 "reason": "흑자전환★ 제외 — 성장률 기저효과로 점수 왜곡 가능",
             })
             continue
+        _mkt = "KR" if _is_korean(item["ticker"]) else "US"
         candidates.append({
             "ticker":      item["ticker"],
             "name":        item["name"],
             "score":       item["total_score"],
             "sector":      item["sector"],
-            "market":      "KR" if _is_korean(item["ticker"]) else "US",
+            "market":      _mkt,
+            # 후보 ⑤: US 매수 주문용 KIS 거래소 코드. 미매핑이면 None
+            # → 주문 단계 SKIPPED (⑦-D). KR은 항상 None.
+            "exchange":    _us_ex.get(item["ticker"]) if _mkt == "US" else None,
             "reason":      f"부족섹터 {item['sector']} 보강",
             "key_metrics": item["key_metrics"],
         })
