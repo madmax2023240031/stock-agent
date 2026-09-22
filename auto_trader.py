@@ -87,6 +87,7 @@ from tools import (
     log_trade,
     get_kis_fill_price,
     place_kis_order,
+    place_kis_order_us,
     update_kill_switch_state,
 )
 
@@ -115,6 +116,12 @@ DRYRUN_LOG_PATH = str(_BASE_DIR / "auto_trader_dryrun_log.json")
 DEFAULT_BUDGET_PER_ORDER_KRW = 500_000   # 매수 1건당 예산 (place_kis_order 상한 100만 원의 절반)
 HIGH_PRICE_SINGLE_SHARE_CAP_KRW = 2_000_000  # 고가주 1주 예외 상한 (place_kis_order 상한과 동일)
 DEFAULT_MAX_ORDERS_PER_RULE = 3          # 규칙 1회 실행당 주문서 작성 최대 건수
+
+# ── 미국장 모드 (9/12 안건 ④) ──────────────────────────────
+# 허용값: "off"(기본) | "dry_run". ⚠️ "live" 값은 존재하지 않는다 —
+# 미국 실주문 경로는 이 코드에 없음(구조적 안전장치, 결정 ⑤).
+# 실주문 승격은 별도 승인 + 별도 커밋으로만 가능. 시즌 2 개시 시 "dry_run"으로 변경.
+US_MODE = "off"
 
 
 # ═══════════════════════════════════════════════
@@ -370,8 +377,11 @@ def _make_entry(
     approval: dict | None = None,
     execution: dict | None = None,
     book_log: dict | None = None,
+    currency: str = "KRW",
+    exchange: str | None = None,
+    order_amount_usd: float | None = None,
 ) -> dict:
-    """dry-run 로그 1건 양식. decision: ORDER_DRAFTED | BLOCKED | SKIPPED | ERROR | EVAL_SUMMARY"""
+    """dry-run 로그 1건 양식. decision: ORDER_DRAFTED | BLOCKED | SKIPPED | ERROR | EVAL_SUMMARY | US_DRYRUN"""
     return {
         "timestamp": _now_kst().isoformat(timespec="seconds"),
         "run_id": run_id,
@@ -385,6 +395,9 @@ def _make_entry(
         "qty": qty,
         "price": price,
         "order_amount_krw": order_amount_krw,
+        "currency": currency,            # ⑦-A: 키 부재(시즌 1 레코드) = "KRW"로 해석
+        "exchange": exchange,            # US 건만 값 존재 (NASD/NYSE/AMEX)
+        "order_amount_usd": order_amount_usd,  # US 건 전용 — 국내 건은 None
         "sector": sector,
         "guardrail": guardrail,
         "order_draft": order_draft,
@@ -697,12 +710,47 @@ def run_buy_rule(
         name = cand.get("name", "")
         sector = cand.get("sector") or "기타/미분류"
 
-        # ── 3. 국내 전용 확인 (place_kis_order 제약) ────────────
-        if cand.get("market") != "KR":
+        # ── 3. 시장 분기 (9/12 안건 ④: US 허용 경로 — dry-run 전용) ──
+        market = cand.get("market")
+        if market == "US" and US_MODE == "dry_run":
+            us_exchange = cand.get("exchange")
+            if not us_exchange:
+                _append_dryrun_log(_make_entry(
+                    run_id, rule_tag, "SKIPPED", ticker=ticker, name=name, side="BUY",
+                    sector=sector, currency="USD",
+                    note="US 후보에 exchange 정보 없음 — 추정 금지(⑦-D), 주문서 생략",
+                    test_now=test_now))
+                records += 1
+                continue
+            quote = get_quote(ticker)
+            close = None if "error" in quote else quote.get("close")
+            if close is None:
+                _append_dryrun_log(_make_entry(
+                    run_id, rule_tag, "ERROR", ticker=ticker, name=name, side="BUY",
+                    sector=sector, currency="USD", exchange=us_exchange,
+                    note="US 현재가 조회 실패 — 주문서 생략",
+                    test_now=test_now))
+                records += 1
+                continue
+            price_usd = float(close)  # ⚠️ close의 통화 단위(USD 여부)는 첫 dry-run 실측에서 검증 (규칙 20)
+            draft = place_kis_order_us(ticker, "BUY", 1, price_usd, us_exchange,
+                                       dry_run=True)  # 수량 1주 고정(관찰 단계) — dry_run 하드코딩
+            _append_dryrun_log(_make_entry(
+                run_id, rule_tag, "US_DRYRUN", ticker=ticker, name=name, side="BUY",
+                qty=1, price=price_usd, sector=sector,
+                currency="USD", exchange=us_exchange,
+                order_amount_usd=(draft.get("order", {}).get("estimated_amount_usd")
+                                  if isinstance(draft, dict) else None),
+                order_draft=draft,
+                note="US dry-run 주문서 (결정 ⑤ — 실주문 경로 없음). 국내 통계 카운터 미반영(records만).",
+                test_now=test_now))
+            records += 1
+            continue
+        if market != "KR":
             _append_dryrun_log(_make_entry(
                 run_id, rule_tag, "SKIPPED", ticker=ticker, name=name, side="BUY",
                 sector=sector,
-                note="미국 종목 — place_kis_order는 국내 6자리 전용이라 주문서 생략",
+                note="비KR 종목(US_MODE off 포함) — 국내 주문서 생략",
                 test_now=test_now))
             records += 1
             continue
@@ -969,12 +1017,19 @@ def run_sell_rule(test_now: str | None = None) -> dict:
         name = cand.get("name", "")
         reason = cand.get("reason", "")
 
-        # ── 3. 국내 전용 확인 ───────────────────────────────────
-        if cand.get("market") != "KR":
+        # ── 3. 시장 분기 (9/12 안건 ④-D: US 매도는 보유 발생 후 활성화) ──
+        market = cand.get("market")
+        if market != "KR":
+            if market == "US" and US_MODE == "dry_run":
+                _note = "US 매도 후보 — 시즌 2 초기 US 보유 없음, 매도 dry-run 경로는 보유 발생 후 활성화 (④-D)"
+                _cur = "USD"
+            else:
+                _note = f"비KR 종목(US_MODE off 포함) — 매도 주문서 생략 ({reason})"
+                _cur = "KRW"
             _append_dryrun_log(_make_entry(
                 run_id, "SELL", "SKIPPED", ticker=ticker, name=name, side="SELL",
-                note=f"미국 종목 — place_kis_order는 국내 6자리 전용이라 주문서 생략 ({reason})",
-                test_now=test_now))
+                currency=_cur, exchange=cand.get("exchange"),
+                note=_note, test_now=test_now))
             records += 1
             continue
 

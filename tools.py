@@ -155,12 +155,22 @@ _KIS_TOKEN_BUFFER_SEC = 600   # 만료 10분 전에 갱신 트리거
 # ── place_kis_order 안전장치 상수 ──────────────────────────────
 _KIS_MOCK_ACCOUNT   = "50193730-01"   # 허용된 모의투자 계좌 (하드코딩)
 _KIS_ORDER_LIMIT_KRW = 2_000_000      # 1회 매수 주문 금액 상한 (200만 원 — 고가주 1주 예외 지원) — 매도는 제외 (결정 2)
+_KIS_ORDER_LIMIT_USD = 1500.00        # 미국 1회 매수 상한 (USD 고정 — 환율 연동 기각, 9/12 결정 ⑤-D) — 매도 면제 (결정 2 준용)
 
 # 모의투자 tr_id (국내주식 주문)
 # ⚠️ 실전: TTTC0802U(매수) / TTTC0801U(매도) — 이 코드에서 절대 사용 금지
 # ⚠️ 모의: VTTC0802U(매수) / VTTC0801U(매도)
 _KIS_MOCK_TR_BUY  = "VTTC0802U"
 _KIS_MOCK_TR_SELL = "VTTC0801U"
+
+# ── 미국 주문/체결 TR (모의투자 전용 — 구조적 안전장치: 실전 분기 없음) ──
+# ⚠️ 실전: TTTT1002U(매수) / TTTT1006U(매도) / TTTS3035R(체결) — 이 코드에서 절대 사용 금지
+# ⚠️ 미국 매도 모의 TR은 V치환 예외 — VTTT1006U 아님, VTTT1001U가 정답
+#    (KIS 공식 GitHub 샘플 주석 5곳 교차 확인, 2026-09-12)
+_KIS_MOCK_TR_US_BUY  = "VTTT1002U"
+_KIS_MOCK_TR_US_SELL = "VTTT1001U"
+_KIS_MOCK_TR_US_CCNL = "VTTS3035R"
+_KIS_US_ORDER_EXCHANGES = ("NASD", "NYSE", "AMEX")   # 주문 허용 거래소 (안건 ②-D) — 아래 잔고 조회용 _KIS_US_EXCHANGES와 별개
 
 # 모의투자에서 조회할 미국 거래소 목록 (거래소코드, 통화코드)
 _KIS_US_EXCHANGES = [
@@ -626,6 +636,14 @@ def get_kis_balance() -> dict:
                             qty = _i(item.get("ovrs_cblc_qty", "0"))
                             if qty == 0:
                                 continue
+                            # 후보 ⑤: exchange는 조회 파라미터(excg_cd)가 아니라 행별
+                            # 응답 필드 ovrs_excg_cd(실제 상장 거래소)에서 읽는다 —
+                            # NASD 조회가 미국 전체를 반환하므로(2026-07-22 실측)
+                            # 조회 코드는 실제 거래소와 다를 수 있다.
+                            # 필드 부재·허용 외 값이면 None → 매도 주문 단계에서
+                            # 사유 명시 SKIPPED (fail-safe, ⑦-D 추정 금지).
+                            # ovrs_excg_cd 존재 여부는 키 재발급 후 ⑹ dry-run에서 실측.
+                            _row_excg = str(item.get("ovrs_excg_cd", "")).strip().upper()
                             items.append({
                                 "ticker":          item.get("ovrs_pdno", ""),
                                 "name":            item.get("ovrs_item_name", ""),
@@ -638,7 +656,7 @@ def get_kis_balance() -> dict:
                                 "profit_loss_pct": _f(item.get("evlu_pfls_rt")),
                                 "currency":        crcy_cd,
                                 "market":          "US",
-                                "exchange":        excg_cd,
+                                "exchange":        _row_excg if _row_excg in ("NASD", "NYSE", "AMEX") else None,
                             })
                         page_items   = items
                         page_tr_cont = (r.headers.get("tr_cont") or "").strip().upper()
@@ -1080,6 +1098,217 @@ def get_kis_fill_price(
     if not result["success"]:
         result["reason"] = f"{result.get('reason')} (조회 {attempts}회 시도)"
     return result
+
+
+# ═══════════════════════════════════════════════
+# 0-B-1-c. 미국 주문/체결 (시즌 2 — 모의투자 전용, dry-run 게이트)
+# ═══════════════════════════════════════════════
+
+def place_kis_order_us(
+    ticker: str,
+    side: str,
+    qty: int,
+    price_usd: float,
+    exchange: str,
+    dry_run: bool = True,
+) -> dict:
+    """
+    KIS 모의투자 미국주식 주문을 낸다 (지정가 전용).
+
+    Parameters
+    ----------
+    ticker    : str    미국 티커 (예: "AAPL")
+    side      : str    "BUY" | "SELL"
+    qty       : int    주문 수량 (1 이상 정수)
+    price_usd : float  1주당 지정가 (달러). 모의투자는 지정가만 지원 —
+                       시장가·MOO·LOC 불가 (KIS 공식 샘플 명시, 2026-09-12 검증).
+    exchange  : str    "NASD" | "NYSE" | "AMEX"
+    dry_run   : bool   True(기본) → 주문서만 반환. False → 실제 API 호출.
+
+    안전장치 (국내 place_kis_order와 동일 철학)
+    ------------------------------------------
+    1. 허용 계좌: _KIS_MOCK_ACCOUNT만 허용.
+    2. 매수 1회 상한: _KIS_ORDER_LIMIT_USD (9/12 결정 ⑤). 매도는 상한 면제(결정 2 준용).
+    3. 모의 TR 하드코딩 — 실전 TR로 가는 코드 경로 자체가 없음.
+    """
+    import os
+    import requests
+    from dotenv import load_dotenv
+
+    load_dotenv()
+
+    # ── 입력 검증 ──────────────────────────────────────────
+    ticker = ticker.strip().upper()
+    if _is_korean(ticker):
+        return {"error": f"place_kis_order_us는 미국 티커 전용입니다. 입력: '{ticker}'"}
+    if not (1 <= len(ticker) <= 6) or not ticker.isalpha():
+        return {"error": f"미국 티커 형식 오류 (영문 1~6자): '{ticker}'"}
+
+    side = side.upper().strip()
+    if side not in ("BUY", "SELL"):
+        return {"error": f"side는 'BUY' 또는 'SELL' 이어야 합니다. 입력: '{side}'"}
+
+    exchange = exchange.upper().strip()
+    if exchange not in _KIS_US_ORDER_EXCHANGES:
+        return {"error": f"exchange는 {_KIS_US_ORDER_EXCHANGES} 중 하나여야 합니다. 입력: '{exchange}'"}
+
+    if not isinstance(qty, int) or qty < 1:
+        return {"error": f"qty는 1 이상 정수여야 합니다. 입력: {qty}"}
+
+    if not isinstance(price_usd, (int, float)) or price_usd <= 0:
+        return {"error": f"price_usd는 양수여야 합니다 (모의투자는 지정가 전용). 입력: {price_usd}"}
+    price_str = f"{price_usd:.2f}"   # KIS 형식: "145.00"
+
+    # ── 환경변수 + 안전장치 1: 계좌 확인 (국내와 동일) ──────
+    app_key    = os.getenv("KIS_APP_KEY",    "").strip()
+    app_secret = os.getenv("KIS_APP_SECRET", "").strip()
+    account_no = os.getenv("KIS_ACCOUNT_NO", "").strip().replace("-", "")
+    if len(account_no) != 10:
+        return {"error": f"KIS_ACCOUNT_NO 형식 오류 (10자리 필요): '{account_no}'"}
+    cano, acnt_prdt_cd = account_no[:8], account_no[8:]
+    if account_no != _KIS_MOCK_ACCOUNT.replace("-", ""):
+        return {"error": f"계좌 불일치 — 허용 모의계좌: {_KIS_MOCK_ACCOUNT}"}
+
+    # ── 안전장치 2: 매수 금액 상한 (달러, 9/12 결정 ⑤ — $1,500) ──
+    estimated_usd = round(price_usd * qty, 2)
+    if side == "BUY" and estimated_usd > _KIS_ORDER_LIMIT_USD:
+        return {"error": (f"주문 금액 상한 초과 — 상한 ${_KIS_ORDER_LIMIT_USD:,.2f}, "
+                          f"예상 ${estimated_usd:,.2f} (지정가 {price_str} × {qty}주)")}
+
+    # ── 주문 파라미터 (KIS 공식 샘플 원문 기준, 2026-09-12 검증) ──
+    tr_id = _KIS_MOCK_TR_US_BUY if side == "BUY" else _KIS_MOCK_TR_US_SELL
+    api_body = {
+        "CANO":            cano,
+        "ACNT_PRDT_CD":    acnt_prdt_cd,
+        "OVRS_EXCG_CD":    exchange,
+        "PDNO":            ticker,
+        "ORD_QTY":         str(qty),
+        "OVRS_ORD_UNPR":   price_str,
+        "CTAC_TLNO":       "",
+        "MGCO_APTM_ODNO":  "",
+        "SLL_TYPE":        "00" if side == "SELL" else "",
+        "ORD_SVR_DVSN_CD": "0",
+        "ORD_DVSN":        "00",   # 모의투자는 지정가만 가능
+    }
+    order_summary = {
+        "account": f"{cano}-{acnt_prdt_cd}", "ticker": ticker, "side": side,
+        "exchange": exchange, "qty": qty, "price_usd": price_usd,
+        "tr_id": tr_id, "estimated_amount_usd": estimated_usd,
+        "currency": "USD",
+    }
+    safety_info = {
+        "account_ok": True, "amount_ok": True,
+        "limit_usd": _KIS_ORDER_LIMIT_USD, "estimated_usd": estimated_usd,
+        "mock_account": _KIS_MOCK_ACCOUNT,
+    }
+
+    if dry_run:
+        return {"dry_run": True, "order": order_summary, "api_body": api_body,
+                "safety": safety_info,
+                "message": "[DRY RUN] 실제 주문이 전송되지 않았습니다."}
+
+    # ── 실제 호출 (국내와 동일 패턴, URL만 해외주식) ─────────
+    tok = get_kis_token()
+    if "error" in tok:
+        return tok
+    headers = {
+        "content-type": "application/json; charset=utf-8",
+        "authorization": f"Bearer {tok['access_token']}",
+        "appkey": app_key, "appsecret": app_secret,
+        "tr_id": tr_id, "custtype": "P",
+    }
+    url = f"{_KIS_DOMAIN}/uapi/overseas-stock/v1/trading/order"
+    try:
+        resp = requests.post(url, json=api_body, headers=headers, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as exc:
+        return {"error": f"{_kis_maintenance_hint()}\n\nKIS 미국 주문 요청 실패: {exc}"}
+    if data.get("rt_cd") != "0":
+        return {"error": f"KIS 미국 주문 API 오류: {data.get('msg1', data)}", "raw": data}
+    output = data.get("output", {})
+    return {"dry_run": False, "order": order_summary,
+            "result": {"order_no": output.get("ODNO", ""),
+                       "order_time": output.get("ORD_TMD", ""),
+                       "rt_cd": data.get("rt_cd"), "msg": data.get("msg1", "")}}
+
+
+def get_kis_fill_price_us(
+    order_no: str,
+    ticker: str,
+    expected_qty: int,
+    order_date_kst: str,
+    max_attempts: int = 10,
+    retry_interval: float = 3.0,
+) -> dict:
+    """
+    미국 모의투자 주문의 체결가를 조회한다 (읽기 전용).
+
+    모의계좌는 전체 조회만 가능하므로(공식 샘플 명시 — 종목/매매구분/체결구분/
+    거래소 필터 불가), 주문일 ±1일 기간을 통째로 받아 ODNO가 일치하는 행을 찾는다.
+    ORD_DT의 시간대(ET/KST)는 미확인 — ±1일 방어 조회로 흡수 (실측 후 확정, 안건 ③-C).
+    order_date_kst: "YYYYMMDD" (KST 기준 주문일)
+    """
+    import os, time, requests
+    from datetime import datetime, timedelta
+    from dotenv import load_dotenv
+    load_dotenv()
+
+    d = datetime.strptime(order_date_kst, "%Y%m%d")
+    strt = (d - timedelta(days=1)).strftime("%Y%m%d")
+    end  = (d + timedelta(days=1)).strftime("%Y%m%d")
+
+    account_no = os.getenv("KIS_ACCOUNT_NO", "").strip().replace("-", "")
+    if account_no != _KIS_MOCK_ACCOUNT.replace("-", ""):
+        return {"error": f"계좌 불일치 — 허용 모의계좌: {_KIS_MOCK_ACCOUNT}"}
+    cano, acnt_prdt_cd = account_no[:8], account_no[8:]
+
+    tok = get_kis_token()
+    if "error" in tok:
+        return tok
+    headers = {
+        "content-type": "application/json; charset=utf-8",
+        "authorization": f"Bearer {tok['access_token']}",
+        "appkey": os.getenv("KIS_APP_KEY", "").strip(),
+        "appsecret": os.getenv("KIS_APP_SECRET", "").strip(),
+        "tr_id": _KIS_MOCK_TR_US_CCNL, "custtype": "P",
+    }
+    params = {
+        "CANO": cano, "ACNT_PRDT_CD": acnt_prdt_cd,
+        "PDNO": "",              # 모의: 전체만
+        "ORD_STRT_DT": strt, "ORD_END_DT": end,
+        "SLL_BUY_DVSN": "00",    # 모의: 전체만
+        "CCLD_NCCS_DVSN": "00",  # 모의: 전체만
+        "OVRS_EXCG_CD": "",      # 모의: 전체만
+        "SORT_SQN": "DS",
+        "ORD_DT": "", "ORD_GNO_BRNO": "02111", "ODNO": "",
+        "CTX_AREA_NK200": "", "CTX_AREA_FK200": "",
+    }
+    url = f"{_KIS_DOMAIN}/uapi/overseas-stock/v1/trading/inquire-ccnl"
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp = requests.get(url, params=params, headers=headers, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as exc:
+            if attempt == max_attempts:
+                return {"error": f"KIS 미국 체결 조회 실패 (재시도 소진): {exc}"}
+            time.sleep(retry_interval); continue
+        if data.get("rt_cd") != "0":
+            if attempt == max_attempts:
+                return {"error": f"KIS 미국 체결 조회 API 오류: {data.get('msg1', data)}", "raw": data}
+            time.sleep(retry_interval); continue
+        rows = data.get("output", []) or []
+        hit = [r for r in rows if r.get("odno", r.get("ODNO", "")) == order_no]
+        if hit:
+            r = hit[0]
+            return {"order_no": order_no, "ticker": ticker,
+                    "row": r, "currency": "USD",
+                    "note": "필드명 실측 전 — row 원본 그대로 반환 (규칙 20)"}
+        if attempt < max_attempts:
+            time.sleep(retry_interval)
+    return {"error": f"체결 내역에서 주문번호 {order_no} 미발견 (기간 {strt}~{end}, {max_attempts}회 시도)"}
 
 
 # ═══════════════════════════════════════════════
@@ -2341,6 +2570,50 @@ def _load_universe_disk_cache(key: str) -> tuple[list, str] | dict:
     except Exception as e:
         return {"error": f"디스크 캐시 읽기 실패: {e}"}
 
+
+def _fetch_us_exchange_map() -> tuple[dict, str | None]:
+    """
+    FDR 거래소별 상장 목록(NASDAQ/NYSE/AMEX)으로
+    심볼 → KIS 거래소 코드("NASD"/"NYSE"/"AMEX") 매핑을 만든다.
+
+    후보 ⑤ 설계 (2026-09-21 실측 근거)
+    ------------------------------------
+    - 매칭은 strip+대문자화 후 정확 일치만. 구분자 변환·제거는 하지 않는다
+      — S&P500 목록의 BRKB·BFB(구분자 제거 표기)는 의도적으로 미매핑(None)
+      으로 남긴다. KIS PDNO 표기 미확인 상태에서의 강제 매칭은 추정(⑦-D 위반).
+      실측: 503개 중 501개 정확히 1곳 매칭, 복수 매칭 0건 (2026-09-21).
+    - 복수 거래소 등재 심볼은 None 처리 (실측 0건이나 목록 변동 대비 가드 유지).
+    - 목록 조회 실패 시 ({}, 사유) 반환 — 이때 후보 exchange=None
+      → 주문 단계 SKIPPED (fail-safe).
+    """
+    _SOURCES = [("NASDAQ", "NASD"), ("NYSE", "NYSE"), ("AMEX", "AMEX")]
+    per_exchange: dict[str, set] = {}
+    try:
+        for listing_name, kis_code in _SOURCES:
+            df = fdr.StockListing(listing_name)
+            if "Symbol" not in df.columns:
+                return {}, f"{listing_name} 목록에 Symbol 칼럼 없음 — 매핑 중단"
+            per_exchange[kis_code] = {
+                str(s).strip().upper() for s in df["Symbol"].dropna().astype(str)
+            }
+    except Exception as e:
+        return {}, f"US 거래소 목록 조회 실패: {e}"
+
+    mapping: dict = {}
+    ambiguous = 0
+    for kis_code, symbols in per_exchange.items():
+        for s in symbols:
+            if s in mapping and mapping[s] != kis_code:
+                if mapping[s] is not None:
+                    ambiguous += 1
+                mapping[s] = None   # 복수 거래소 등재 — 모호 → 제외
+            elif s not in mapping:
+                mapping[s] = kis_code
+    clean = {s: c for s, c in mapping.items() if c is not None}
+    note = f"복수 거래소 등재로 제외 {ambiguous}건" if ambiguous else None
+    return clean, note
+
+
 def get_universe(market: str = "ALL") -> dict:
     """
     발굴 대상 종목 유니버스를 반환한다.
@@ -2427,6 +2700,24 @@ def get_universe(market: str = "ALL") -> dict:
                 }
                 for _, row in sp500.iterrows()
             ]
+            # 후보 ⑤: 각 종목에 KIS 거래소 코드 부착 (캐시 저장 전 보강 —
+            # 디스크 캐시에도 exchange 포함). 미매핑은 None → 매수 주문 단계
+            # SKIPPED (fail-safe). 유니버스 자체는 유효하므로 매핑 실패를
+            # 전체 실패로 승격하지 않는다.
+            # 알려진 한계: BRKB·BFB 2건은 표기 차이로 항상 미매핑 (설계 결정).
+            ex_map, ex_note = _fetch_us_exchange_map()
+            unmapped = 0
+            for r in result:
+                r["exchange"] = ex_map.get(str(r["ticker"]).strip().upper())
+                if r["exchange"] is None:
+                    unmapped += 1
+            if unmapped or ex_note:
+                parts = []
+                if unmapped:
+                    parts.append(f"US exchange 미매핑 {unmapped}건")
+                if ex_note:
+                    parts.append(ex_note)
+                fallback_notes.append("; ".join(parts))
             with _universe_lock:
                 _universe_cache["US"] = (time.time(), result)
             _save_universe_disk_cache("US", result)
@@ -2958,6 +3249,11 @@ def evaluate_sell_rules() -> dict:
             "profit_loss_pct": pct,
             "market":          market,
             "currency":        currency,
+            # 후보 ⑤: US 매도 주문용 KIS 거래소 코드. 잔고 파싱에서 검증된
+            # 값만 전달되며(NASD/NYSE/AMEX), 없으면 None → 주문 단계 SKIPPED
+            # (⑦-D). KR은 항상 None — dry-run 로그 규약(exchange는 US 건만
+            # 값 존재)과 일치.
+            "exchange":        h.get("exchange") if market == "US" else None,
         }
 
         if pct <= HARD_FLOOR_PCT:
@@ -3146,6 +3442,19 @@ def evaluate_buy_rule_A(market: str = "ALL", universe_limit: int | None = None) 
     if "error" in screened:
         return {"error": f"스크리닝 실패: {screened['error']}"}
 
+    # 후보 ⑤: US 후보용 ticker→거래소 매핑. screen_stocks가 방금 데워둔
+    # 유니버스 인메모리 캐시를 재사용하므로 추가 원격 조회 없음.
+    # 조회 실패 시 빈 dict → US 후보 exchange=None → 주문 단계 SKIPPED (fail-safe).
+    _us_ex: dict = {}
+    if market in ("US", "ALL"):
+        _uni_us = get_universe("US")
+        if "error" not in _uni_us:
+            _us_ex = {
+                t["ticker"]: t.get("exchange")
+                for t in _uni_us.get("tickers", [])
+                if t.get("exchange")
+            }
+
     # ── 3. 필터: 점수 기준 + 미보유 ─────────────────────────────
     excluded: list[dict] = []   # 규칙상 제외/보류된 후보 (사유 기록 — Phase 0 관찰 데이터)
     candidates: list[dict] = []
@@ -3166,12 +3475,16 @@ def evaluate_buy_rule_A(market: str = "ALL", universe_limit: int | None = None) 
                 "reason": "흑자전환★ 제외 — 성장률 기저효과로 점수 왜곡 가능",
             })
             continue
+        _mkt = "KR" if _is_korean(item["ticker"]) else "US"
         candidates.append({
             "ticker":      item["ticker"],
             "name":        item["name"],
             "score":       item["total_score"],
             "sector":      item["sector"],
-            "market":      "KR" if _is_korean(item["ticker"]) else "US",
+            "market":      _mkt,
+            # 후보 ⑤: US 매수 주문용 KIS 거래소 코드. 미매핑이면 None
+            # → 주문 단계 SKIPPED (⑦-D). KR은 항상 None.
+            "exchange":    _us_ex.get(item["ticker"]) if _mkt == "US" else None,
             "reason":      "점수 상위",
             "key_metrics": item["key_metrics"],
         })
@@ -3361,6 +3674,19 @@ def evaluate_buy_rule_B(market: str = "ALL", universe_limit: int | None = None) 
             ),
         }
 
+    # 후보 ⑤: US 후보용 ticker→거래소 매핑. screen_stocks가 방금 데워둔
+    # 유니버스 인메모리 캐시를 재사용하므로 추가 원격 조회 없음.
+    # 조회 실패 시 빈 dict → US 후보 exchange=None → 주문 단계 SKIPPED (fail-safe).
+    _us_ex: dict = {}
+    if market in ("US", "ALL"):
+        _uni_us = get_universe("US")
+        if "error" not in _uni_us:
+            _us_ex = {
+                t["ticker"]: t.get("exchange")
+                for t in _uni_us.get("tickers", [])
+                if t.get("exchange")
+            }
+
     # ── 5. 후보 필터: 부족 섹터 + 점수 기준 + 미보유 ─────────────
     excluded: list[dict] = []   # 규칙상 제외/보류된 후보 (사유 기록 — Phase 0 관찰 데이터)
     candidates: list[dict] = []
@@ -3383,12 +3709,16 @@ def evaluate_buy_rule_B(market: str = "ALL", universe_limit: int | None = None) 
                 "reason": "흑자전환★ 제외 — 성장률 기저효과로 점수 왜곡 가능",
             })
             continue
+        _mkt = "KR" if _is_korean(item["ticker"]) else "US"
         candidates.append({
             "ticker":      item["ticker"],
             "name":        item["name"],
             "score":       item["total_score"],
             "sector":      item["sector"],
-            "market":      "KR" if _is_korean(item["ticker"]) else "US",
+            "market":      _mkt,
+            # 후보 ⑤: US 매수 주문용 KIS 거래소 코드. 미매핑이면 None
+            # → 주문 단계 SKIPPED (⑦-D). KR은 항상 None.
+            "exchange":    _us_ex.get(item["ticker"]) if _mkt == "US" else None,
             "reason":      f"부족섹터 {item['sector']} 보강",
             "key_metrics": item["key_metrics"],
         })
@@ -3437,36 +3767,48 @@ def evaluate_buy_rule_B(market: str = "ALL", universe_limit: int | None = None) 
 # ── KR 휴장일 목록 (로컬 파일, 세션 4 구현 1 / 휴장-①) ──────────────
 # tools.py가 있는 폴더 기준으로 찾는다 (launchd 실행 시 작업 폴더가 달라도 안전).
 HOLIDAYS_KR_PATH = str(Path(__file__).resolve().parent / "holidays_kr.json")
+HOLIDAYS_US_PATH = str(Path(__file__).resolve().parent / "holidays_us.json")
 
 
-def _load_kr_holidays(session_year: int) -> tuple[set[str] | None, str]:
+def _load_market_holidays(path: str, market: str, session_year: int) -> tuple[set[str] | None, str]:
     """
-    KR 휴장일 목록을 로컬 JSON(holidays_kr.json)에서 읽는다.
-    형식: {"market": "KR", "source": "...", "updated": "YYYY-MM-DD", "holidays": ["YYYY-MM-DD", ...]}
-
-    반환: (휴장일 set 또는 None, 사유 문자열)
-    None이면 fail-safe 차단 대상 — 파일 부재 / 파싱 실패 / updated 연도 ≠ 세션 연도 / holidays 형식 오류.
+    휴장일 목록을 로컬 JSON에서 읽는다 (KR/US 공통 — 시즌 2 안건 ①-B 일반화).
+    형식: {"market": ..., "updated": "YYYY-MM-DD", "holidays": ["YYYY-MM-DD", ...]}
+    반환: (휴장일 set 또는 None, 사유 문자열). None이면 fail-safe 차단 대상 —
+    파일 부재 / 파싱 실패 / market 불일치(신규) / updated 연도 ≠ 세션 연도 / holidays 형식 오류.
+    ※ US의 session_year는 호출부에서 ET(America/New_York) 기준 연도를 넘길 것 (안건 ①-C).
     캐시 없음: 주문마다 다시 읽어 파일 교체가 즉시 반영된다 (파일이 작아 비용 무시 가능).
     """
     import json as _json
     import os as _os
-    p = HOLIDAYS_KR_PATH
-    if not _os.path.exists(p):
-        return None, f"휴장일 파일 없음: {p}"
+    if not _os.path.exists(path):
+        return None, f"휴장일 파일 없음: {path}"
     try:
-        with open(p, encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             data = _json.load(f)
     except Exception as e:
-        return None, f"휴장일 파일 파싱 실패: {p} — {e}"
+        return None, f"휴장일 파일 파싱 실패: {path} — {e}"
     if not isinstance(data, dict):
-        return None, f"휴장일 파일 최상위가 dict가 아님: {p}"
+        return None, f"휴장일 파일 최상위가 dict가 아님: {path}"
+    if str(data.get("market", "")) != market:
+        return None, f"휴장일 파일 market 불일치: {data.get('market')!r} vs {market!r}"
     updated = str(data.get("updated", ""))
     if not updated[:4].isdigit() or int(updated[:4]) != session_year:
         return None, f"휴장일 파일 updated 연도 불일치: {updated!r} vs 세션 {session_year}"
     hol = data.get("holidays")
     if not isinstance(hol, list) or not all(isinstance(x, str) and len(x) == 10 for x in hol):
-        return None, f"휴장일 파일 holidays 형식 오류: {p}"
+        return None, f"휴장일 파일 holidays 형식 오류: {path}"
     return set(hol), f"휴장일 파일 로드 (updated {updated}, {len(hol)}건)"
+
+
+def _load_kr_holidays(session_year: int) -> tuple[set[str] | None, str]:
+    """KR 휴장일 로더 — _load_market_holidays 래퍼 (기존 호출부 무변경)."""
+    return _load_market_holidays(HOLIDAYS_KR_PATH, "KR", session_year)
+
+
+def _load_us_holidays(session_year_et: int) -> tuple[set[str] | None, str]:
+    """US 휴장일 로더 — 연도는 반드시 ET(America/New_York) 기준으로 넘길 것 (안건 ①-C)."""
+    return _load_market_holidays(HOLIDAYS_US_PATH, "US", session_year_et)
 
 
 # ═══════════════════════════════════════════════
@@ -3752,6 +4094,8 @@ def log_trade(
     order_no: str | None = None,
     price_source: str | None = None,
     fill_reason: str | None = None,
+    currency: str = "KRW",
+    exchange: str | None = None,
 ) -> dict:
     """
     거래 1건을 TRADE_LOG_PATH(trade_log.json)에 기록한다.
@@ -3781,6 +4125,8 @@ def log_trade(
                   None = 이 필드가 없던 시절(2026-08-26 이전)의 레코드.
     fill_reason : str | None  체결가 조회 실패 사유(get_kis_fill_price의
                   reason). 성공 시 None.
+    currency : str  통화. "KRW" 기본, US 실주문 승격 후 "USD" (⑦-B).
+    exchange : str | None  US 전용 거래소 코드 NASD·NYSE·AMEX. 국내 건은 None.
 
     Returns
     -------
@@ -3843,6 +4189,9 @@ def log_trade(
         "order_no":     order_no,
         "price_source": price_source,
         "fill_reason":  fill_reason,
+        # ⑦-B: 키 부재(시즌 1 레코드) = "KRW"/국내로 해석. 기존 호출부 무변경(기본값).
+        "currency":     currency,
+        "exchange":     exchange,
     }
 
     # 기존 장부 읽기 — 손상된 장부는 절대 덮어쓰지 않는다 (fail-safe)
