@@ -381,7 +381,7 @@ def _make_entry(
     exchange: str | None = None,
     order_amount_usd: float | None = None,
 ) -> dict:
-    """dry-run 로그 1건 양식. decision: ORDER_DRAFTED | BLOCKED | SKIPPED | ERROR | EVAL_SUMMARY | US_DRYRUN"""
+    """dry-run 로그 1건 양식. decision: ORDER_DRAFTED | BLOCKED | SKIPPED | ERROR | EVAL_SUMMARY | US_DRYRUN | US_DRYRUN_BLOCKED"""
     return {
         "timestamp": _now_kst().isoformat(timespec="seconds"),
         "run_id": run_id,
@@ -722,6 +722,36 @@ def run_buy_rule(
                     test_now=test_now))
                 records += 1
                 continue
+            # 결정 ③: US dry-run도 가드레일 통과 필수 — 금액 검사 3종 면제(원화 누적과 섞지 않음),
+            # 거래일·휴장일·거래시간·kill switch만 실질 검사. order_amount_krw=1은 자리값(면제로 미사용),
+            # daily_trades=0은 KR 실주문 카운트와 분리하기 위함.
+            gr = check_guardrails(
+                ticker, 1,
+                side="BUY",
+                market="US",
+                skip_amount_checks=True,
+                daily_trades=0,
+                daily_pnl_pct=ks["daily_pnl_pct"],
+                cumulative_pnl_pct=ks["cumulative_pnl_pct"],
+                now=now_inject,
+            )
+            if "error" in gr:
+                _append_dryrun_log(_make_entry(
+                    run_id, rule_tag, "ERROR", ticker=ticker, name=name, side="BUY",
+                    sector=sector, currency="USD", exchange=us_exchange,
+                    note=f"US 가드레일 검사 자체 실패: {gr['error']}",
+                    test_now=test_now))
+                records += 1
+                continue
+            if not gr.get("passed"):
+                _append_dryrun_log(_make_entry(
+                    run_id, rule_tag, "US_DRYRUN_BLOCKED", ticker=ticker, name=name, side="BUY",
+                    sector=sector, currency="USD", exchange=us_exchange,
+                    guardrail=gr,
+                    note=f"US 가드레일 차단: {gr.get('blocked_by')} — {gr.get('reason')}",
+                    test_now=test_now))
+                records += 1
+                continue
             quote = get_quote(ticker)
             close = None if "error" in quote else quote.get("close")
             if close is None:
@@ -741,6 +771,7 @@ def run_buy_rule(
                 currency="USD", exchange=us_exchange,
                 order_amount_usd=(draft.get("order", {}).get("estimated_amount_usd")
                                   if isinstance(draft, dict) else None),
+                guardrail=gr,
                 order_draft=draft,
                 note="US dry-run 주문서 (결정 ⑤ — 실주문 경로 없음). 국내 통계 카운터 미반영(records만).",
                 test_now=test_now))

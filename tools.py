@@ -3829,6 +3829,7 @@ def check_guardrails(
     daily_pnl_pct: float = 0.0,
     cumulative_pnl_pct: float = 0.0,
     now: datetime | None = None,
+    skip_amount_checks: bool = False,
 ) -> dict:
     """
     자동매매 주문 전 가드레일(안전장치)을 순서대로 검사한다.
@@ -3851,6 +3852,9 @@ def check_guardrails(
     cumulative_pnl_pct     : float 누적 손익률 (%)
     now                    : datetime  테스트용 시각 주입. None이면 KST 현재 시각 사용.
                              naive datetime은 KST로 간주하고, tz가 있으면 KST로 변환한다.
+    skip_amount_checks     : bool  US dry-run 전용 (결정 ③). True면 금액 검사 3종을
+                             "검사 생략 + passed True"로 기록한다 (SELL 면제와 같은 방식).
+                             market != "US"에서 True면 error 반환 (잠금장치).
 
     검사 순서 (하나라도 차단되면 즉시 반환)
     ----------------------------------------
@@ -3913,6 +3917,8 @@ def check_guardrails(
     market = market.upper().strip()
     if market not in ("KR", "US"):
         return {"error": f"market은 'KR' 또는 'US' 이어야 합니다. 입력: '{market}'"}
+    if skip_amount_checks and market != "US":
+        return {"error": f"skip_amount_checks는 US dry-run 전용입니다 (market={market})"}
 
     # ── 현재 시각 (항상 KST 기준) ─────────────────────────────────
     try:
@@ -4023,6 +4029,10 @@ def check_guardrails(
         _check("자동매매한도", True, "매도 주문 — 금액 한도 면제 (결정 2) — 검사 생략")
         _check("1종목비중",   True, "매도 주문 — 금액 한도 면제 (결정 2) — 검사 생략")
         _check("1섹터비중",   True, "매도 주문 — 금액 한도 면제 (결정 2) — 검사 생략")
+    elif skip_amount_checks:   # US dry-run 전용 (결정 ③) — market == "US"는 입력 검증에서 보장
+        _check("자동매매한도", True, "US dry-run — 금액 검사 면제 (결정 ③) — 검사 생략")
+        _check("1종목비중",   True, "US dry-run — 금액 검사 면제 (결정 ③) — 검사 생략")
+        _check("1섹터비중",   True, "US dry-run — 금액 검사 면제 (결정 ③) — 검사 생략")
     else:
         # ── 2. 자동매매 한도 ─────────────────────────────────────
         total_after = accumulated_krw + order_amount_krw
