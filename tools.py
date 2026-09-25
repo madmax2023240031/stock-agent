@@ -3983,6 +3983,22 @@ def check_guardrails(
             return _block("휴장일", f"휴장일은 거래일이 아닙니다 — {detail}")
         _check("휴장일", True, f"세션 기준일 {session_date} — 휴장일 아님({why})")
 
+    # ── 0-b-US. US 휴장일 검사 (결정 ①, 2026-09-25) — 위 KR 블록 주석의 'US는 범위 밖'은 이 블록 추가로 해소됨 ──
+    # 로컬 holidays_us.json 기준, 날짜·연도 모두 뉴욕 현지(session_day = now_ny), fail-safe 차단 (KR과 같은 문구).
+    # early_closes(13:00 ET 조기폐장)는 허용 창(~12:30 ET)보다 늦어 범위 밖 — 평상일로 취급.
+    if market == "US":
+        session_date = session_day.strftime("%Y-%m-%d")
+        holidays, why = _load_us_holidays(session_day.year)
+        if holidays is None:
+            detail = f"세션 기준일 {session_date}(뉴욕 현지) — 휴장 여부 판정 불가({why})"
+            _check("휴장일", False, detail)
+            return _block("휴장일", f"휴장일 판정 불가로 차단(fail-safe) — {detail}")
+        if session_date in holidays:
+            detail = f"세션 기준일 {session_date}(뉴욕 현지) — 휴장일({why})"
+            _check("휴장일", False, detail)
+            return _block("휴장일", f"휴장일은 거래일이 아닙니다 — {detail}")
+        _check("휴장일", True, f"세션 기준일 {session_date}(뉴욕 현지) — 휴장일 아님({why})")
+
     # ── 1. 거래 시간 ─────────────────────────────────────────────
     if market == "KR":
         in_hours = KR_OPEN <= now_t <= KR_CLOSE
