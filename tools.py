@@ -153,7 +153,7 @@ _KIS_TOKEN_CACHE_FILE = str(_BASE_DIR / ".kis_token_cache.json")
 _KIS_TOKEN_BUFFER_SEC = 600   # 만료 10분 전에 갱신 트리거
 
 # ── place_kis_order 안전장치 상수 ──────────────────────────────
-_KIS_MOCK_ACCOUNT   = "50193730-01"   # 허용된 모의투자 계좌 (하드코딩)
+_KIS_MOCK_ACCOUNT   = "50213915-01"   # 허용된 모의투자 계좌 (하드코딩)
 _KIS_ORDER_LIMIT_KRW = 2_000_000      # 1회 매수 주문 금액 상한 (200만 원 — 고가주 1주 예외 지원) — 매도는 제외 (결정 2)
 _KIS_ORDER_LIMIT_USD = 1500.00        # 미국 1회 매수 상한 (USD 고정 — 환율 연동 기각, 9/12 결정 ⑤-D) — 매도 면제 (결정 2 준용)
 
