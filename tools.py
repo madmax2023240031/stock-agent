@@ -723,7 +723,7 @@ def get_kis_balance() -> dict:
         if usd_krw and "error" not in domestic else None
     )
 
-    return {
+    result = {
         "account_no": f"{cano}-{acnt_prdt_cd}",
         "as_of":      datetime.now().isoformat(timespec="seconds"),
         "holdings":   dom_holdings + ovrs_holdings,
@@ -740,6 +740,14 @@ def get_kis_balance() -> dict:
             "total_assets_krw_all": total_assets_krw_all,
         },
     }
+
+    # fail-safe (2026-09-29): 국내 조회가 실패하면 최상위에도 error를 올린다.
+    # 호출 지점은 모두 최상위 "error"만 검사하므로, 이 처리가 없으면 매수 규칙 A가
+    # 보유 종목이 없다고 착각해 이미 가진 종목을 다시 살 수 있다(스모크 2차 발견).
+    # 해외 거래소별 오류는 기존대로 overseas.errors에만 둔다.
+    if "error" in domestic:
+        result["error"] = domestic["error"]
+    return result
 
 
 # ═══════════════════════════════════════════════
