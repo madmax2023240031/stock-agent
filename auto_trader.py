@@ -86,6 +86,7 @@ from tools import (
     get_quote,
     log_trade,
     get_kis_fill_price,
+    find_kis_order_after_unknown,
     place_kis_order,
     place_kis_order_us,
     update_kill_switch_state,
@@ -112,6 +113,11 @@ _PHASE4_CONFIRM_PHRASE = "승인 면제 4단계를 승인합니다"  # .env PHAS
 
 _BASE_DIR = Path(__file__).resolve().parent
 DRYRUN_LOG_PATH = str(_BASE_DIR / "auto_trader_dryrun_log.json")
+
+# 2026-09-30 결정 3: 결과 미확인 주문 잠금 파일 — 있으면 다음 회차부터 매수 규칙 차단(매도는 계속).
+# 해제는 사람이 KIS 앱 대조·장부 보정 후 이 파일을 logs/로 옮긴다 (삭제 대신 이동 — 기록 보존).
+ORDER_UNKNOWN_LOCK_PATH = str(_BASE_DIR / "order_unknown_lock.json")
+_UNKNOWN_ORDER_IN_PROCESS: dict | None = None   # 같은 실행 안 차단용 메모리 표시 (잠금 파일 쓰기 실패 대비)
 
 DEFAULT_BUDGET_PER_ORDER_KRW = 500_000   # 매수 1건당 예산 (place_kis_order 상한 100만 원의 절반)
 HIGH_PRICE_SINGLE_SHARE_CAP_KRW = 2_000_000  # 고가주 1주 예외 상한 (place_kis_order 상한과 동일)
@@ -314,8 +320,11 @@ def _order_brief(ticker: str, name: str, side: str, qty: int, price,
     """실행 요약 라인용 주문 1건 요약 (미확정 후보 ⑦). 주문번호는 execution에 있을 때만, 없으면 None."""
     sent = bool(execution and execution.get("success"))
     order_no = (execution.get("summary", {}) or {}).get("order_no") if sent else None
+    unknown = bool(execution and execution.get("unknown") and not execution.get("success"))
+    recovered = bool(execution and execution.get("recovered"))
     return {"ticker": ticker, "name": name, "side": side, "qty": qty,
-            "price": price, "sent": sent, "order_no": order_no or None}
+            "price": price, "sent": sent, "order_no": order_no or None,
+            "unknown": unknown, "recovered": recovered}   # 2026-09-30 결정 3 표시용
 
 
 # ═══════════════════════════════════════════════
@@ -493,6 +502,10 @@ def _execute_order(ticker: str, side: str, qty: int) -> dict:
 
     result = place_kis_order(ticker, side, qty, "MARKET", dry_run=DRY_RUN)
     success = isinstance(result, dict) and "error" not in result
+    # 2026-09-30 결정 1·2: "결과 미확인"은 실패로 단정하지 않고 체결 조회로 확인한다.
+    unknown = isinstance(result, dict) and bool(result.get("unknown"))
+    confirm = None
+    recovered = False
     if success:
         r = result.get("result", {})
         summary = {
@@ -501,14 +514,115 @@ def _execute_order(ticker: str, side: str, qty: int) -> dict:
             "rt_cd":      r.get("rt_cd"),
             "msg":        r.get("msg", ""),
         }
+    elif unknown:
+        print(f"  ⚠️ [주문 결과 미확인] {side} {ticker} {qty}주 — {result.get('error')}")
+        print("     → 종목 기준 체결 조회로 확인 중 (5초 간격, 최대 90초)...")
+        confirm = find_kis_order_after_unknown(ticker, side, qty, result.get("sent_at", ""))
+        if confirm.get("status") == "confirmed":
+            recovered = True
+            success = True
+            summary = {
+                "order_no":       confirm.get("order_no", ""),
+                "order_time":     confirm.get("order_time", ""),
+                "rt_cd":          None,
+                "msg":            "응답 시간 초과 → 체결 조회로 주문 확인",
+                "original_error": result.get("error"),
+                "sent_at":        result.get("sent_at"),
+            }
+            print(f"     ✅ 확인됨: 주문번호 {summary['order_no']} 주문시각 {summary['order_time']} "
+                  f"(조회 {confirm.get('polls')}회) — 정상 장부 기록으로 진행")
+        else:
+            summary = {"error": result.get("error"), "sent_at": result.get("sent_at")}
+            print(f"     ⛔ 확인 실패: {confirm.get('reason')} — 이 회차 남은 주문 중단 + 잠금 기록")
     else:
         summary = {"error": result.get("error") if isinstance(result, dict) else str(result)}
-    return {
+    execution = {
         "executed": True,
         "success": success,
+        "unknown": unknown,        # 2026-09-30: 전송 결과가 한때 미확인이었는가
+        "recovered": recovered,    # 미확인 → 체결 조회로 확인됨
+        "confirm": confirm,        # find_kis_order_after_unknown 결과 (미확인일 때만)
         "summary": summary,
         "executed_at": _now_kst().isoformat(timespec="seconds"),
     }
+    if unknown and not success:
+        _register_unknown_order(ticker, side, qty, execution)
+    return execution
+
+
+def _unknown_lock_status() -> dict | None:
+    """
+    결과 미확인 잠금 상태 (2026-09-30 결정 3). None = 잠금 없음.
+    같은 실행의 메모리 표시가 있거나 잠금 파일이 있으면 잠금이다.
+    파일이 있는데 읽지 못하면 잠금으로 간주한다 (fail-safe).
+    """
+    if _UNKNOWN_ORDER_IN_PROCESS is not None:
+        return {"source": "process", "info": _UNKNOWN_ORDER_IN_PROCESS}
+    if os.path.exists(ORDER_UNKNOWN_LOCK_PATH):
+        try:
+            with open(ORDER_UNKNOWN_LOCK_PATH, "r", encoding="utf-8") as f:
+                return {"source": "file", "info": json.load(f)}
+        except Exception as e:
+            return {"source": "file", "info": None,
+                    "note": f"잠금 파일 읽기 실패 — 잠금으로 간주: {e}"}
+    return None
+
+
+def _register_unknown_order(ticker: str, side: str, qty: int, execution: dict) -> None:
+    """
+    결과 미확인 주문을 잠금으로 남긴다 (2026-09-30 결정 3).
+    - 메모리 표시를 먼저 켠다 → 파일 쓰기가 실패해도 이번 실행의 남은 매수는 막힌다.
+    - 잠금 파일에 사건을 덧붙인다 (기존 파일을 읽지 못하면 덮어쓰지 않는다 — 파일이 있으므로 잠금은 유지).
+    - 쓰기 결과는 execution["lock"]에 남긴다 (dry-run 기록에 그대로 실린다).
+    """
+    global _UNKNOWN_ORDER_IN_PROCESS
+    summary = execution.get("summary") or {}
+    confirm = execution.get("confirm") or {}
+    event = {
+        "recorded_at":    _now_kst().isoformat(timespec="seconds"),
+        "ticker":         ticker,
+        "side":           side,
+        "qty":            qty,
+        "sent_at":        summary.get("sent_at"),
+        "error":          summary.get("error"),
+        "confirm_reason": confirm.get("reason"),
+        "confirm_polls":  confirm.get("polls"),
+    }
+    _UNKNOWN_ORDER_IN_PROCESS = event
+    data = {
+        "note": ("결과 미확인 주문 잠금 — 이 파일이 있으면 auto_trader 매수 규칙은 실행되지 않는다(매도는 계속). "
+                 "KIS 앱(잔고·체결/예약 탭)과 장부를 대조·보정한 뒤 이 파일을 logs/로 옮겨 해제한다."),
+        "events": [],
+    }
+    if os.path.exists(ORDER_UNKNOWN_LOCK_PATH):
+        try:
+            with open(ORDER_UNKNOWN_LOCK_PATH, "r", encoding="utf-8") as f:
+                old = json.load(f)
+            if not (isinstance(old, dict) and isinstance(old.get("events"), list)):
+                raise ValueError("구조 이상")
+            data["events"] = old["events"]
+        except Exception as e:
+            execution["lock"] = {"written": False,
+                                 "note": f"기존 잠금 파일 읽기 실패 — 덮어쓰지 않음(잠금은 유지): {e}"}
+            print(f"     ⚠️ {execution['lock']['note']}")
+            return
+    data["events"].append(event)
+    tmp = ORDER_UNKNOWN_LOCK_PATH + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, ORDER_UNKNOWN_LOCK_PATH)
+        execution["lock"] = {"written": True, "path": ORDER_UNKNOWN_LOCK_PATH,
+                             "events": len(data["events"])}
+    except Exception as e:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        execution["lock"] = {"written": False,
+                             "note": f"잠금 파일 쓰기 실패 — 이번 실행만 메모리로 차단, 즉시 사람 확인 필요: {e}"}
+        print(f"     ⛔ {execution['lock']['note']}")
 
 
 def _ask_approval(
@@ -613,6 +727,19 @@ def run_buy_rule(
 
     rule_fn = evaluate_buy_rule_A if rule_tag == "A" else evaluate_buy_rule_B
 
+    # ── 0-0. 결과 미확인 잠금 검사 (2026-09-30 결정 3) — 잠금 중에는 매수 규칙을 실행하지 않는다 ──
+    lock = _unknown_lock_status()
+    if lock is not None:
+        msg = ("결과 미확인 주문 잠금 중 → 매수 중단 "
+               f"({'이번 실행에서 발생' if lock['source'] == 'process' else ORDER_UNKNOWN_LOCK_PATH}). "
+               "KIS 앱 대조·장부 보정 후 잠금 파일을 logs/로 옮겨 해제")
+        print(f"  ⛔ [{rule_tag}] {msg}")
+        _append_dryrun_log(_make_entry(
+            run_id, rule_tag, "BLOCKED", side="BUY",
+            note=msg + (f" / {lock['note']}" if lock.get("note") else ""),
+            test_now=test_now))
+        return {"run_id": run_id, "error": msg}
+
     # ── 0. 킬 스위치 상태 갱신 (작업 1-b 배선 — 판단은 check_guardrails가 한다) ──
     ks = update_kill_switch_state(now=now_inject)
     if "error" in ks:
@@ -687,6 +814,7 @@ def run_buy_rule(
     rejected_count = 0
     orders: list[dict] = []  # 후보 ⑦ 실행 요약용
     truncated: list[dict] = []  # 후보 ⑥ max_orders 절단 탈락 종목
+    unknown_stop: dict | None = None  # 2026-09-30 결정 3: 결과 미확인으로 남은 후보 중단 시 기록
 
     for idx, cand in enumerate(candidates, start=1):
         if drafted >= max_orders:
@@ -882,6 +1010,8 @@ def run_buy_rule(
                 record_price = price
                 price_note   = (f"(시장가 — 기록가는 주문시점 현재가 / "
                                 f"체결가 조회 실패: {fill.get('reason')})")
+            if execution.get("recovered"):   # 2026-09-30 결정 2
+                price_note += " / 응답 시간 초과 → 체결 조회로 주문 확인"
             r = log_trade(
                 rule_tag=rule_tag, ticker=ticker, side="BUY",
                 qty=qty, price=record_price,
@@ -928,11 +1058,27 @@ def run_buy_rule(
         session_by_sector[sector] = session_by_sector.get(sector, 0) + order_amount
         session_trades += 1
 
+        # ── 7. 결과 미확인 → 이 회차 남은 후보 중단 (2026-09-30 결정 3) ──
+        if execution is not None and execution.get("unknown") and not execution.get("success"):
+            n_total = len(candidates)
+            rest_list = candidates[idx:]
+            for k, rest in enumerate(rest_list, start=idx + 1):
+                _append_dryrun_log(_make_entry(
+                    run_id, rule_tag, "SKIPPED", ticker=rest.get("ticker", ""), name=rest.get("name", ""),
+                    side="BUY", sector=rest.get("sector") or "기타/미분류",
+                    note=f"결과 미확인 주문({ticker}) 발생 → 이 회차 남은 후보 중단 — 순위 {k}/{n_total}",
+                    test_now=test_now))
+                records += 1
+            unknown_stop = {"ticker": ticker, "skipped": len(rest_list)}
+            print(f"  ⛔ 결과 미확인({ticker}) → 규칙 {rule_tag} 남은 후보 {len(rest_list)}종목 중단")
+            break
+
     return {"run_id": run_id, "rule_tag": rule_tag,
             "candidates": len(candidates), "records": records, "drafted": drafted,
             "approved": approved_count, "rejected": rejected_count,
             "orders": orders,  # 후보 ⑦
-            "truncated": truncated}  # 후보 ⑥
+            "truncated": truncated,  # 후보 ⑥
+            "unknown_stop": unknown_stop}  # 2026-09-30 결정 3
 
 
 # ═══════════════════════════════════════════════
@@ -947,6 +1093,17 @@ def run_sell_rule(test_now: str | None = None) -> dict:
     _assert_phase_config()
     run_id = f"sell-{uuid.uuid4().hex[:8]}"
     now_inject = _parse_test_now(test_now)
+
+    # ── 0-0. 같은 실행의 결과 미확인 검사 (2026-09-30 결정 3 — 그 회차 남은 주문은 매수·매도 모두 중단) ──
+    # 이번 실행(메모리 표시)에서 생긴 미확인만 막는다. 이전 실행이 남긴 잠금 파일은 매도를 막지 않는다.
+    lock = _unknown_lock_status()
+    if lock is not None and lock.get("source") == "process":
+        msg = ("이번 실행에서 결과 미확인 주문 발생 → 이 회차 매도 중단 "
+               "(다음 회차 매도는 계속). KIS 앱 대조·장부 보정 필요")
+        print(f"  ⛔ [SELL] {msg}")
+        _append_dryrun_log(_make_entry(run_id, "SELL", "BLOCKED", side="SELL", note=msg,
+                                       test_now=test_now))
+        return {"run_id": run_id, "error": msg}
 
     # ── 0. 킬 스위치 상태 갱신 (작업 1-b 배선 — 판단은 check_guardrails가 한다) ──
     ks = update_kill_switch_state(now=now_inject)
@@ -1042,8 +1199,9 @@ def run_sell_rule(test_now: str | None = None) -> dict:
     approved_count = 0
     rejected_count = 0
     orders: list[dict] = []  # 후보 ⑦ 실행 요약용
+    unknown_stop: dict | None = None  # 2026-09-30 결정 3
 
-    for cand in sell_candidates:
+    for s_idx, cand in enumerate(sell_candidates, start=1):
         ticker = cand.get("ticker", "")
         name = cand.get("name", "")
         reason = cand.get("reason", "")
@@ -1169,6 +1327,8 @@ def run_sell_rule(test_now: str | None = None) -> dict:
                 record_price = price
                 price_note   = (f"(시장가 — 기록가는 주문시점 현재가 / "
                                 f"체결가 조회 실패: {fill.get('reason')})")
+            if execution.get("recovered"):   # 2026-09-30 결정 2
+                price_note += " / 응답 시간 초과 → 체결 조회로 주문 확인"
             entries = []
             for src in ("A", "B"):
                 part_qty = int(split.get(src, 0))
@@ -1212,10 +1372,25 @@ def run_sell_rule(test_now: str | None = None) -> dict:
         else:
             rejected_count += 1
 
+        # 2026-09-30 결정 3: 결과 미확인 → 이 회차 남은 매도 후보 중단 (다음 회차 매도는 계속)
+        if execution is not None and execution.get("unknown") and not execution.get("success"):
+            rest_list = sell_candidates[s_idx:]
+            for rest in rest_list:
+                _append_dryrun_log(_make_entry(
+                    run_id, "SELL", "SKIPPED", ticker=rest.get("ticker", ""), name=rest.get("name", ""),
+                    side="SELL",
+                    note=f"결과 미확인 주문({ticker}) 발생 → 이 회차 남은 매도 후보 중단",
+                    test_now=test_now))
+                records += 1
+            unknown_stop = {"ticker": ticker, "skipped": len(rest_list)}
+            print(f"  ⛔ 결과 미확인({ticker}) → 매도 남은 후보 {len(rest_list)}종목 중단")
+            break
+
     return {"run_id": run_id, "rule_tag": "SELL",
             "candidates": len(sell_candidates), "records": records, "drafted": drafted,
             "approved": approved_count, "rejected": rejected_count,
-            "orders": orders}  # 후보 ⑦
+            "orders": orders,  # 후보 ⑦
+            "unknown_stop": unknown_stop}  # 2026-09-30 결정 3
 
 
 # ═══════════════════════════════════════════════
@@ -1300,9 +1475,13 @@ def main() -> None:
                 _no = o.get("order_no")
                 print(f"    └ {o.get('side')} {o.get('ticker')} {o.get('name')} "
                       f"{o.get('qty')}주 {_p_txt} "
-                      f"{'전송✓' if o.get('sent') else '미전송'}"
+                      f"{('전송✓' + ('(응답 지연 후 확인)' if o.get('recovered') else '')) if o.get('sent') else ('결과 미확인⚠' if o.get('unknown') else '미전송')}"
                       f"{' 주문번호 ' + str(_no) if _no else ''}")
     print(f"\n상세 기록: {DRYRUN_LOG_PATH}")
+    _lk = _unknown_lock_status()   # 2026-09-30 결정 3
+    if _lk is not None:
+        print(f"⛔ 결과 미확인 주문 잠금 활성 — {ORDER_UNKNOWN_LOCK_PATH} "
+              "(다음 회차부터 매수 차단, 매도는 계속). KIS 앱 대조·장부 보정 후 파일을 logs/로 옮겨 해제하세요.")
     if _is_live_mode() and PHASE == 4:
         print("🔴 4단계 승인 면제 모드로 실행되었습니다. 실제 전송 결과는 각 기록의 execution 필드를 확인하세요.")
     elif _is_live_mode():

@@ -54,3 +54,6 @@ launchd/
 .Rhistory
 
 benchmark_records.json
+
+# 2026-09-30 결과 미확인 주문 잠금 파일 (상태 파일 — 커밋 대상 아님)
+order_unknown_lock.json

@@ -793,6 +793,9 @@ def place_kis_order(
         dry_run=True  : {"dry_run": True,  "order": {...}, "api_body": {...}, "safety": {...}, "message": str}
         dry_run=False : {"dry_run": False, "order": {...}, "result": {...}}
         오류 시       : {"error": "..."}
+        결과 미확인   : {"error": "...", "unknown": True, "sent_at": ISO(KST)}
+                        (2026-09-30 — 보낸 뒤 응답 없음·연결 끊김·서버 5xx·응답 해석 실패.
+                         주문이 접수됐을 수 있으므로 호출부는 실패로 단정하지 말 것)
     """
     import os
     import requests
@@ -943,17 +946,41 @@ def place_kis_order(
 
     url = f"{_KIS_DOMAIN}/uapi/domestic-stock/v1/trading/order-cash"
 
+    # ── 2026-09-30 결정 1·4: "응답 없음"은 "실패"가 아니다 ────────────
+    # - 연결 자체가 안 된 경우(ConnectTimeout)만 "미전송" 실패로 본다.
+    # - 보낸 뒤 응답을 못 받음·연결 끊김·서버 5xx·응답 해석 실패는
+    #   "결과 미확인"(unknown=True)으로 돌려준다 → 호출부가 체결 조회로 확인한다.
+    # - 호환: 미확인도 "error" 키를 유지한다 → 수정하지 않은 호출부는 계속 실패로 본다.
+    # - 응답 대기(read) 10초 → 30초 (9/30 실측: 요청 후 최소 23초·12초 뒤 접수). 연결 대기는 10초 유지.
+    # - ConnectTimeout은 ConnectionError의 자식이므로 반드시 가장 먼저 잡는다.
+    from zoneinfo import ZoneInfo
+    sent_at = datetime.now(ZoneInfo("Asia/Seoul")).isoformat(timespec="seconds")
+
+    def _unknown(detail: str) -> dict:
+        return {
+            "error": (f"KIS 주문 결과 미확인 — {detail}. "
+                      "주문이 접수·체결됐을 수 있으므로 실패로 단정하지 않는다(체결 조회로 확인 필요)."),
+            "unknown": True,
+            "sent_at": sent_at,
+        }
+
     try:
-        resp = requests.post(url, json=api_body, headers=headers, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-    except requests.HTTPError as exc:
-        body_text = exc.response.text if exc.response is not None else ""
+        resp = requests.post(url, json=api_body, headers=headers, timeout=(10, 30))
+    except requests.exceptions.ConnectTimeout as exc:
         hint = _kis_maintenance_hint()
-        return {"error": f"{hint}\n\nKIS 주문 HTTP 오류: {exc} — {body_text}"}
+        return {"error": f"{hint}\n\nKIS 주문 연결 실패(미전송 — 서버 연결 전 시간 초과): {exc}"}
     except Exception as exc:
+        return _unknown(f"요청 후 응답 없음·연결 끊김 ({type(exc).__name__}: {exc})")
+
+    if resp.status_code >= 500:
+        return _unknown(f"서버 오류 응답 HTTP {resp.status_code} ({resp.text[:200]})")
+    if resp.status_code >= 400:
         hint = _kis_maintenance_hint()
-        return {"error": f"{hint}\n\nKIS 주문 요청 실패: {exc}"}
+        return {"error": f"{hint}\n\nKIS 주문 HTTP 오류: {resp.status_code} — {resp.text}"}
+    try:
+        data = resp.json()
+    except Exception as exc:
+        return _unknown(f"응답 해석 실패 ({type(exc).__name__}: {exc})")
 
     if data.get("rt_cd") != "0":
         msg = data.get("msg1") or data.get("msg") or str(data)
@@ -1106,6 +1133,187 @@ def get_kis_fill_price(
     if not result["success"]:
         result["reason"] = f"{result.get('reason')} (조회 {attempts}회 시도)"
     return result
+
+
+# ═══════════════════════════════════════════════
+# 0-B-1-b-2. find_kis_order_after_unknown (2026-09-30 결정 2 — 결과 미확인 주문 확인, 읽기 전용)
+# ═══════════════════════════════════════════════
+
+def find_kis_order_after_unknown(
+    ticker: str,
+    side: str,
+    qty: int,
+    sent_at: str,
+    max_wait: float = 90.0,
+    interval: float = 5.0,
+    initial_wait: float = 5.0,
+    lookback_sec: int = 120,
+) -> dict:
+    """
+    응답을 못 받아 "결과 미확인"이 된 국내 주문이 실제로 접수·체결됐는지
+    주문번호 없이 종목 기준으로 찾는다 (읽기 전용 — 주문·장부 무접촉).
+
+    KIS 주식일별주문체결조회(VTTC0081R, 모의 전용)를 ODNO 빈칸 + PDNO로 호출한다.
+    2026-09-30 13:05 실측: ODNO 빈칸 조회 시 해당 종목 행만 반환, 응답에 ord_tmd(HHMMSS)·
+    sll_buy_dvsn_cd(매수 "02")·ord_qty·ord_dt 있음. 매도 "01"은 실측 없음 — 정확히 일치할 때만 인정
+    (값이 다르면 확인 실패 → 호출부 잠금, 잘못된 장부 기록 없음).
+
+    확인 조건 (모두 만족하는 행이 정확히 1건 + 전량 체결일 때만 confirmed)
+    - pdno == ticker / sll_buy_dvsn_cd == "02"(BUY)·"01"(SELL) / ord_dt == 보낸 날짜(KST)
+    - odno가 같은 날 장부(trade_log.json) 기록의 주문번호에 없음 (앞 0 제거 후 비교)
+    - ord_tmd >= 보낸 시각 - lookback_sec (HHMMSS 비교)
+    - cncl_yn != "Y" / ord_qty == qty / tot_ccld_qty == qty / avg_prvs > 0
+
+    폴링: initial_wait 뒤 조회, 확인 안 되면 interval 간격으로 max_wait(초)까지 반복.
+    후보 2건 이상·취소·주문수량 불일치·응답 파싱 실패는 기다려도 달라지지 않으므로 즉시 중단.
+    장부 읽기 실패·토큰 실패·시간 소진은 전부 unresolved (fail-safe: 모르면 확인 안 된 것).
+
+    Returns
+    -------
+    dict
+      확인  : {"status": "confirmed", "order_no": str, "order_time": str, "fill_price": float,
+               "fill_qty": int, "fill_amount": int, "polls": int}
+      미확인: {"status": "unresolved", "reason": str, "polls": int}
+    """
+    import json as _json
+    import os
+    import time
+    import requests
+    from zoneinfo import ZoneInfo
+    from dotenv import load_dotenv
+
+    load_dotenv()
+
+    side = str(side).upper().strip()
+    want_dvsn = {"BUY": "02", "SELL": "01"}.get(side)
+    if want_dvsn is None:
+        return {"status": "unresolved", "reason": f"side 값 이상: {side}", "polls": 0}
+    ticker = str(ticker).strip()
+
+    kst = ZoneInfo("Asia/Seoul")
+    try:
+        sent_dt = datetime.fromisoformat(str(sent_at))
+        if sent_dt.tzinfo is None:
+            sent_dt = sent_dt.replace(tzinfo=kst)
+        sent_dt = sent_dt.astimezone(kst)
+    except Exception as exc:
+        return {"status": "unresolved", "reason": f"sent_at 해석 실패: {exc}", "polls": 0}
+    day_ymd = sent_dt.strftime("%Y%m%d")
+    day_iso = sent_dt.strftime("%Y-%m-%d")
+    min_tmd = (sent_dt - timedelta(seconds=lookback_sec)).strftime("%H%M%S")
+
+    # 같은 날 장부에 이미 있는 주문번호는 후보에서 뺀다 (이미 기록된 주문과 혼동 방지)
+    try:
+        with open(TRADE_LOG_PATH, "r", encoding="utf-8") as f:
+            book = _json.load(f)
+        if not isinstance(book, list):
+            raise ValueError(f"최상위가 list가 아님 ({type(book).__name__})")
+    except FileNotFoundError:
+        book = []
+    except Exception as exc:
+        return {"status": "unresolved", "reason": f"장부 읽기 실패 — 기존 주문번호 제외 불가: {exc}",
+                "polls": 0}
+    known = {str(r.get("order_no") or "").strip().lstrip("0")
+             for r in book
+             if isinstance(r, dict) and str(r.get("timestamp", "")).startswith(day_iso)}
+    known.discard("")
+
+    app_key    = os.getenv("KIS_APP_KEY",    "").strip()
+    app_secret = os.getenv("KIS_APP_SECRET", "").strip()
+    account_no = os.getenv("KIS_ACCOUNT_NO", "").strip().replace("-", "")
+    if len(account_no) != 10:
+        return {"status": "unresolved", "reason": "KIS_ACCOUNT_NO 형식 오류", "polls": 0}
+    tok = get_kis_token()
+    if "error" in tok:
+        return {"status": "unresolved", "reason": f"토큰 실패: {tok['error']}", "polls": 0}
+
+    url = f"{_KIS_DOMAIN}/uapi/domestic-stock/v1/trading/inquire-daily-ccld"
+    headers = {
+        "content-type":  "application/json",
+        "authorization": f"Bearer {tok['access_token']}",
+        "appkey":        app_key,
+        "appsecret":     app_secret,
+        "tr_id":         "VTTC0081R",   # 모의투자 전용 — 실전 tr_id 사용 금지
+        "custtype":      "P",
+    }
+    params = {
+        "CANO": account_no[:8], "ACNT_PRDT_CD": account_no[8:],
+        "INQR_STRT_DT": day_ymd, "INQR_END_DT": day_ymd,
+        "SLL_BUY_DVSN_CD": "00", "PDNO": ticker,
+        "CCLD_DVSN": "00", "INQR_DVSN": "00", "INQR_DVSN_3": "00",
+        "ORD_GNO_BRNO": "", "ODNO": "", "INQR_DVSN_1": "",
+        "CTX_AREA_FK100": "", "CTX_AREA_NK100": "",
+    }
+
+    def _query():
+        """반환: (사유, 확인된 행 또는 None, 영구 실패 여부)"""
+        try:
+            resp = requests.get(url, headers=headers, params=params, timeout=10)
+            resp.raise_for_status()
+            d = resp.json()
+        except Exception as exc:
+            return (f"조회 API 에러: {type(exc).__name__}: {exc}", None, False)
+        if d.get("rt_cd") != "0":
+            return (f"조회 API 오류: {d.get('msg1') or d.get('rt_cd')}", None, False)
+        cands = []
+        for row in d.get("output1", []) or []:
+            if str(row.get("pdno", "")).strip() != ticker:
+                continue
+            if str(row.get("sll_buy_dvsn_cd", "")).strip() != want_dvsn:
+                continue
+            if str(row.get("ord_dt", "")).strip() != day_ymd:
+                continue
+            odno = str(row.get("odno", "")).strip().lstrip("0")
+            if not odno or odno in known:
+                continue
+            tmd = str(row.get("ord_tmd", "")).strip()
+            if len(tmd) != 6 or not tmd.isdigit() or tmd < min_tmd:
+                continue
+            cands.append(row)
+        if not cands:
+            return ("조건에 맞는 주문 미발견", None, False)
+        if len(cands) > 1:
+            return (f"조건에 맞는 주문 {len(cands)}건 — 하나로 특정 불가", None, True)
+        row = cands[0]
+        if str(row.get("cncl_yn", "")).strip().upper() == "Y":
+            return ("찾은 주문이 취소 상태", None, True)
+        try:
+            ord_qty    = int(float(row.get("ord_qty") or 0))
+            fill_qty   = int(float(row.get("tot_ccld_qty") or 0))
+            fill_price = round(float(row.get("avg_prvs") or 0), 2)
+        except Exception as exc:
+            return (f"응답 파싱 실패: {exc}", None, True)
+        if ord_qty != int(qty):
+            return (f"주문수량 불일치(조회 {ord_qty} / 기대 {qty})", None, True)
+        if fill_qty != int(qty):
+            return (f"체결 대기·부분체결(체결 {fill_qty}/주문 {qty})", None, False)
+        if fill_price <= 0:
+            return (f"체결평균가 이상값: {fill_price}", None, False)
+        return ("", row, False)
+
+    time.sleep(initial_wait)
+    start = time.monotonic()
+    polls = 0
+    reason = "조회 전"
+    while True:
+        reason, row, permanent = _query()
+        polls += 1
+        if row is not None:
+            return {
+                "status":      "confirmed",
+                "order_no":    str(row.get("odno", "")).strip(),
+                "order_time":  str(row.get("ord_tmd", "")).strip(),
+                "fill_price":  round(float(row.get("avg_prvs")), 2),
+                "fill_qty":    int(float(row.get("tot_ccld_qty"))),
+                "fill_amount": int(float(row.get("tot_ccld_amt") or 0)),
+                "polls":       polls,
+            }
+        if permanent:
+            break
+        if time.monotonic() - start + interval > max_wait:
+            break
+        time.sleep(interval)
+    return {"status": "unresolved", "reason": f"{reason} (조회 {polls}회)", "polls": polls}
 
 
 # ═══════════════════════════════════════════════
