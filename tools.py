@@ -151,6 +151,7 @@ def _fetch_ohlcv(ticker: str, days: int = 200) -> pd.DataFrame | None:
 _KIS_DOMAIN          = "https://openapivts.koreainvestment.com:29443"
 _KIS_TOKEN_CACHE_FILE = str(_BASE_DIR / ".kis_token_cache.json")
 _KIS_TOKEN_BUFFER_SEC = 600   # 만료 10분 전에 갱신 트리거
+_KIS_TOKEN_TIMEOUT_SEC = 30   # 토큰 발급 응답 대기(초) — 10/1 11:30 ReadTimeout(10초) 대응, 10/3 결정 3
 
 # ── place_kis_order 안전장치 상수 ──────────────────────────────
 _KIS_MOCK_ACCOUNT   = "50213915-01"   # 허용된 모의투자 계좌 (하드코딩)
@@ -304,7 +305,7 @@ def get_kis_token() -> dict:
     }
 
     try:
-        resp = requests.post(url, json=body, timeout=10)
+        resp = requests.post(url, json=body, timeout=_KIS_TOKEN_TIMEOUT_SEC)
         resp.raise_for_status()
         data = resp.json()
     except requests.HTTPError as exc:
