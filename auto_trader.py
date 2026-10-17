@@ -23,10 +23,8 @@ tools.py에 이미 만들어진 부품들을 **순서대로 연결만** 한다. 
    · 0단계 세트: PHASE=0, MASTER_ENABLE=False, DRY_RUN=True,  APPROVAL_REQUIRED=True
    · 3단계 세트: PHASE=3, MASTER_ENABLE=True,  DRY_RUN=False, APPROVAL_REQUIRED=True
    · 4단계 세트: PHASE=4, MASTER_ENABLE=True,  DRY_RUN=False, APPROVAL_REQUIRED=False
-   그 외 모든 조합은 즉시 예외로 중단. **현재 상수는 3단계 세트다** —
-   4단계 세트는 준비 커밋으로 허용 목록에만 등록된 상태이며, 실제 전환은
-   JJG의 "승인 면제 전환을 승인합니다" 명시 승인 + 상수 세트 단독 커밋으로만 한다.
-   (진입 커밋 — JJG의 "진입 커밋을 승인합니다" 명시 승인. 절대 불변 규칙 1 공식 개정.)
+   그 외 모든 조합은 즉시 예외로 중단. 세트는 .env의 STOCK_AGENT_PHASE(0/3/4)로
+   고르며, 값이 없으면 3단계 세트(주문마다 y/n 승인)다 (2026-10-17 개정).
 2. place_kis_order 호출은 정확히 두 곳 — 주문서 작성 _draft_order(dry_run=True 리터럴)와
    실주문 게이트 _execute_order(dry_run=DRY_RUN 전달). 이 파일 어디에도
    dry_run 인자에 False를 직접 쓴 리터럴은 없다 (grep으로 검증 가능).
@@ -98,15 +96,38 @@ from tools import (
 #   0단계 세트: PHASE=0, MASTER_ENABLE=False, DRY_RUN=True,  APPROVAL_REQUIRED=True
 #   3단계 세트: PHASE=3, MASTER_ENABLE=True,  DRY_RUN=False, APPROVAL_REQUIRED=True
 #   4단계 세트: PHASE=4, MASTER_ENABLE=True,  DRY_RUN=False, APPROVAL_REQUIRED=False
-# 세트 전환은 사람이 별도 세션에서 네 값을 한꺼번에 바꿀 때만 가능하다.
+#
+# 2026-10-17 개정 (공개 배포 대비): 단계는 .env의 STOCK_AGENT_PHASE 한 줄로 고른다.
+#   - 값이 없으면 3단계 세트 = 터미널(cmd)에서 주문마다 y/n 승인. 저장소를 받은 사람의 기본값.
+#   - 0 / 3 / 4 이외의 값이면 어느 세트에도 맞지 않아 _assert_phase_config가 전체 중단.
+#   - 나머지 세 값은 아래 _PHASE_SETS 표에서 세트 단위로만 정해진다 (개별 변경 경로 없음).
+#   - 4단계(승인 면제·무인 실행)는 STOCK_AGENT_PHASE=4 와 PHASE4_CONFIRM 핀이 둘 다 있어야 한다.
 # ═══════════════════════════════════════════════
 
-PHASE = 4                      # 현재 단계 — 4단계 세트 (2026-07-27 JJG "승인 면제 전환을 승인합니다" 승인 전환)
-MASTER_ENABLE = True           # 실주문 마스터 스위치 — 4단계에서 열림 (승인 면제, PHASE4_CONFIRM 핀 필수)
-DRY_RUN = False                # 4단계 세트에서는 False — 실주문 게이트는 dry_run=DRY_RUN으로만 전달
-APPROVAL_REQUIRED = False      # 4단계: 승인 면제 모드 — 주문마다 y/n 승인 없이 실행.
-                               # 0·3단계 세트는 True. 승인 면제(False)는 4단계 세트뿐이며,
-                               # 전환은 "승인 면제 전환을 승인합니다" 승인 + 단독 커밋으로만.
+_PHASE_SETS = {
+    0: {"MASTER_ENABLE": False, "DRY_RUN": True,  "APPROVAL_REQUIRED": True},
+    3: {"MASTER_ENABLE": True,  "DRY_RUN": False, "APPROVAL_REQUIRED": True},
+    4: {"MASTER_ENABLE": True,  "DRY_RUN": False, "APPROVAL_REQUIRED": False},
+}
+_DEFAULT_PHASE = 3
+
+
+def _read_phase_from_env():
+    """.env의 STOCK_AGENT_PHASE를 읽는다. 없으면 3, 잘못된 값은 그대로 돌려줘 중단을 유도."""
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parent / ".env")
+    raw = os.environ.get("STOCK_AGENT_PHASE", "").strip()
+    if raw == "":
+        return _DEFAULT_PHASE
+    if raw in ("0", "3", "4"):
+        return int(raw)
+    return raw   # 허용되지 않는 값 → 아래 세트 조회 실패 → _assert_phase_config가 중단
+
+
+PHASE = _read_phase_from_env()
+MASTER_ENABLE = _PHASE_SETS.get(PHASE, {}).get("MASTER_ENABLE")
+DRY_RUN = _PHASE_SETS.get(PHASE, {}).get("DRY_RUN")
+APPROVAL_REQUIRED = _PHASE_SETS.get(PHASE, {}).get("APPROVAL_REQUIRED")
 
 _PHASE3_CONFIRM_PHRASE = "실주문 3단계를 승인합니다"   # .env PHASE3_CONFIRM · 시작 확인 입력 공용 문구
 _PHASE4_CONFIRM_PHRASE = "승인 면제 4단계를 승인합니다"  # .env PHASE4_CONFIRM 전용 (4단계 세트에서만 검사)

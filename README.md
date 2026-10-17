@@ -26,8 +26,17 @@
 ### 자동매매 진행 단계
 
 자동매매 실험은 관찰(0단계) → 승인 모드(3단계) → 승인 면제(4단계) 순으로 단계를 밟아 진행하며,
-현재 단계는 `auto_trader.py`의 상수 세트(`PHASE`/`MASTER_ENABLE`/`DRY_RUN`/`APPROVAL_REQUIRED`)로 관리됩니다.
-(2026-07 기준: 4단계 — 승인 면제 모드, KIS 모의계좌 실주문, 킬 스위치·가드레일 상시 적용)
+단계는 `.env`의 `STOCK_AGENT_PHASE` 한 줄로 고르며, `auto_trader.py`가 그 값에 맞는
+상수 세트(`PHASE`/`MASTER_ENABLE`/`DRY_RUN`/`APPROVAL_REQUIRED`)를 통째로 적용합니다.
+
+| `STOCK_AGENT_PHASE` | 단계 | 동작 |
+|---|---|---|
+| `0` | 관찰 | 주문서만 만들고 실제 주문 없음 (dry-run 기록만) |
+| 비워 두거나 `3` **(기본값)** | 승인 모드 | 터미널·cmd 창에서 주문서마다 `y`/`n` 으로 직접 승인 |
+| `4` | 승인 면제 | y/n 없이 자동 주문 — 무인 실행용, `PHASE4_CONFIRM` 핀 추가 필요 |
+
+> 저장소를 받은 분은 **기본값(3단계 승인 모드)** 으로 시작하는 것을 권장합니다.
+> 0·3·4 외의 값을 넣으면 안전장치가 실행 자체를 막습니다.
 
 ---
 
@@ -109,6 +118,11 @@ KIS_APP_KEY=PSxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 KIS_APP_SECRET=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 KIS_ACCOUNT_NO=XXXXXXXX-XX
 KIS_HTS_ID=your_hts_id
+
+# 자동매매 (auto_trader.py 를 쓸 때만)
+KIS_ALLOWED_MOCK_ACCOUNT=XXXXXXXX-XX        # 위 KIS_ACCOUNT_NO 와 똑같이 한 번 더 (주문 허용 계좌)
+STOCK_AGENT_PHASE=3                         # 0=관찰 / 3=y/n 승인(기본) / 4=승인 면제
+PHASE3_CONFIRM=실주문 3단계를 승인합니다       # 3단계 확인 핀 (문구를 한 글자도 바꾸지 말 것)
 ```
 
 - **ANTHROPIC_API_KEY**: [Anthropic Console](https://console.anthropic.com)에서 발급
@@ -116,6 +130,9 @@ KIS_HTS_ID=your_hts_id
 - **KIS_APP_KEY / KIS_APP_SECRET**: KIS Developers에서 모의투자 계좌로 앱 등록 후 발급
 - **KIS_ACCOUNT_NO**: 모의투자 계좌번호 (`XXXXXXXX-XX` 형식)
 - **KIS_HTS_ID**: 한국투자증권 HTS 로그인 아이디
+- **KIS_ALLOWED_MOCK_ACCOUNT**: 주문을 허용할 모의계좌. `KIS_ACCOUNT_NO`와 정확히 같아야 주문·체결 조회가 열립니다.
+  비어 있거나 다르면 모든 주문이 거부됩니다 (두 번 적게 해서 실수로 다른 계좌를 쓰는 것을 막는 장치).
+  이 프로그램은 KIS **모의투자 서버 주소만** 쓰도록 고정돼 있어 실전 계좌로는 주문이 나가지 않습니다.
 
 > ⚠️ `.env` 파일과 `.kis_token_cache.json`(토큰 캐시)은 절대 GitHub에 올리지 마세요.
 > 이 외에도 `.dart_corp_codes.json`(DART 기업코드 캐시), `trade_log.json`·`trade_log_TEST.json`(거래 로그),
@@ -130,20 +147,40 @@ streamlit run app.py
 브라우저에서 채팅 화면이 열립니다. 종목이나 시황을 자연어로 물어보세요.
 웹 UI는 분석·판단 전용이며 주문 기능이 없습니다.
 
-### 5. 실행 — 자동매매 (모의 전용, 별도 안전장치 필요)
+### 5. 실행 — 자동매매 (모의 전용, 기본은 y/n 승인 모드)
+
+**평일 장 시간(09:00~15:30)에** 터미널(macOS) 또는 cmd 창(Windows)에서 실행합니다.
 
 ```bash
-caffeinate -i ./venv/bin/python auto_trader.py --rule ALL --market KR
+# macOS / Linux
+./venv/bin/python auto_trader.py --rule ALL --market KR
+
+# Windows (cmd)
+venv\Scripts\python auto_trader.py --rule ALL --market KR
 ```
 
-단, 아래 안전장치를 전부 통과해야만 실제로 동작합니다.
+3단계(기본값)에서는 이렇게 진행됩니다.
 
-- `auto_trader.py`의 상수 4개가 허용된 세트 조합이어야 함 (어중간한 조합이면 즉시 중단)
-- `.env`에 현재 단계에 맞는 확인 핀(`PHASE3_CONFIRM` 또는 `PHASE4_CONFIRM`)이 정확한 문구로 존재해야 함 — 없으면 기동 자체가 차단됨
-- 허용된 모의계좌 번호가 하드코딩으로 검증되며, 매수 1회 200만 원 상한 적용 (기본 예산은 1건당 50만 원, 현재가 200만 원 이내 고가주는 1주 예외 허용 — 2026-07-31 옵션2)
+1. 시작할 때 확인 문구 `실주문 3단계를 승인합니다` 를 그대로 타이핑 → 틀리면 즉시 종료(주문 0건)
+2. 규칙 A → B → 매도 규칙 순서로 후보를 고르고, 주문서가 하나 만들어질 때마다 화면에 요약이 뜸
+3. `y` 를 치면 그 주문이 KIS 모의계좌로 전송되고, **`y` 이외의 입력(Enter 포함)은 전부 거절**
+
+처음에는 `.env`에 `STOCK_AGENT_PHASE=0` 을 넣고 한 번 돌려 보며 화면 흐름을 익히는 것을 권장합니다
+(주문서만 만들고 실제 주문은 나가지 않음).
+
+아래 안전장치는 단계와 상관없이 항상 켜져 있습니다.
+
+- 단계 값이 0·3·4가 아니면 즉시 중단 (네 상수는 세트 단위로만 적용)
+- 단계별 확인 핀(`PHASE3_CONFIRM` / `PHASE4_CONFIRM`)이 정확한 문구로 없으면 기동 자체가 차단
+- `KIS_ALLOWED_MOCK_ACCOUNT`와 `KIS_ACCOUNT_NO`가 다르면 모든 주문 거부, 모의투자 서버 주소 고정
+- 매수 1회 200만 원 상한 (기본 예산은 1건당 50만 원, 현재가 200만 원 이내 고가주는 1주 예외 허용)
 - 킬 스위치(일일 -5% / 누적 -15%) 발동 시 전체 주문 차단
+- 프로그램이 직접 산 종목만 팝니다 — 손으로 산 보유 종목은 건드리지 않음
 
-> 저장소를 클론만 한 상태에서는 확인 핀이 없어 자동매매가 실행되지 않는 것이 정상입니다.
+> 4단계(승인 면제)는 사람이 지켜보지 않는 무인 실행(macOS launchd 등)용입니다.
+> 승인 모드로 충분히 기록을 쌓은 뒤, `STOCK_AGENT_PHASE=4`와
+> `PHASE4_CONFIRM=승인 면제 4단계를 승인합니다` 두 줄을 넣어야만 켜집니다.
+> 예약 실행 설정(launchd plist·Windows 작업 스케줄러)은 각자 컴퓨터 경로가 달라 저장소에 포함하지 않습니다.
 
 ---
 

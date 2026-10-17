@@ -154,7 +154,14 @@ _KIS_TOKEN_BUFFER_SEC = 600   # 만료 10분 전에 갱신 트리거
 _KIS_TOKEN_TIMEOUT_SEC = 30   # 토큰 발급 응답 대기(초) — 10/1 11:30 ReadTimeout(10초) 대응, 10/3 결정 3
 
 # ── place_kis_order 안전장치 상수 ──────────────────────────────
-_KIS_MOCK_ACCOUNT   = "50213915-01"   # 허용된 모의투자 계좌 (하드코딩)
+# 허용 모의투자 계좌 — 계좌번호는 저장소에 두지 않는다 (2026-10-17, 공개 배포 대비).
+# .env의 KIS_ALLOWED_MOCK_ACCOUNT 와 KIS_ACCOUNT_NO 가 정확히 같을 때만 주문·조회가 열린다.
+# KIS_ALLOWED_MOCK_ACCOUNT 가 비어 있으면 어떤 계좌도 허용되지 않는다 (fail-safe).
+# 실전 서버로 가는 경로는 없다 — _KIS_DOMAIN(모의투자 서버) 하드코딩이 구조적 안전장치.
+def _allowed_mock_account() -> str:
+    """허용 모의계좌 번호("XXXXXXXX-XX")를 .env에서 읽는다. 없으면 빈 문자열(=전부 거부)."""
+    import os
+    return os.getenv("KIS_ALLOWED_MOCK_ACCOUNT", "").strip()
 _KIS_ORDER_LIMIT_KRW = 2_000_000      # 1회 매수 주문 금액 상한 (200만 원 — 고가주 1주 예외 지원) — 매도는 제외 (결정 2)
 _KIS_ORDER_LIMIT_USD = 1500.00        # 미국 1회 매수 상한 (USD 고정 — 환율 연동 기각, 9/12 결정 ⑤-D) — 매도 면제 (결정 2 준용)
 
@@ -792,8 +799,8 @@ def place_kis_order(
 
     안전장치 (하드코딩, 변경 불가)
     --------------------------------
-    1. 허용 계좌: _KIS_MOCK_ACCOUNT(50193730-01)만 허용.
-       환경변수 계좌가 다르면 즉시 거부.
+    1. 허용 계좌: .env KIS_ALLOWED_MOCK_ACCOUNT 와 같은 계좌만 허용.
+       환경변수 계좌가 다르거나 허용 계좌가 비어 있으면 즉시 거부.
     2. 주문 금액 상한: 매수(BUY) 1회 ≤ 100만 원. 매도(SELL)는 상한 제외
        (결정 2 — 매도는 리스크 축소 행위). 금액 계산·기록은 매도도 수행.
        - 지정가: price × qty
@@ -852,11 +859,14 @@ def place_kis_order(
     account_fmt  = f"{cano}-{acnt_prdt_cd}"
 
     # ── 안전장치 1: 계좌 확인 ──────────────────────────────────
-    allowed_no = _KIS_MOCK_ACCOUNT.replace("-", "")
+    allowed = _allowed_mock_account()
+    if not allowed:
+        return {"error": "KIS_ALLOWED_MOCK_ACCOUNT가 .env에 없습니다 — 주문할 수 없습니다."}
+    allowed_no = allowed.replace("-", "")
     if account_no != allowed_no:
         return {
             "error": (
-                f"계좌 불일치 — 허용 모의계좌: {_KIS_MOCK_ACCOUNT}, "
+                f"계좌 불일치 — 허용 모의계좌: {allowed}, "
                 f"현재 설정: {account_fmt}. "
                 "실전 계좌 또는 다른 모의 계좌에는 주문할 수 없습니다."
             )
@@ -929,7 +939,7 @@ def place_kis_order(
         "limit_krw":     _KIS_ORDER_LIMIT_KRW,
         "estimated_krw": estimated_amount,
         "quote_failed":  quote_failed,   # 재검토 ① — True면 매도 금액 미상 진행
-        "mock_account":  _KIS_MOCK_ACCOUNT,
+        "mock_account":  _allowed_mock_account(),
     }
 
     # ── dry_run 모드: 주문서만 반환 ───────────────────────────
@@ -1358,7 +1368,7 @@ def place_kis_order_us(
 
     안전장치 (국내 place_kis_order와 동일 철학)
     ------------------------------------------
-    1. 허용 계좌: _KIS_MOCK_ACCOUNT만 허용.
+    1. 허용 계좌: .env KIS_ALLOWED_MOCK_ACCOUNT 와 같은 계좌만 허용.
     2. 매수 1회 상한: _KIS_ORDER_LIMIT_USD (9/12 결정 ⑤). 매도는 상한 면제(결정 2 준용).
     3. 모의 TR 하드코딩 — 실전 TR로 가는 코드 경로 자체가 없음.
     """
@@ -1397,8 +1407,9 @@ def place_kis_order_us(
     if len(account_no) != 10:
         return {"error": f"KIS_ACCOUNT_NO 형식 오류 (10자리 필요): '{account_no}'"}
     cano, acnt_prdt_cd = account_no[:8], account_no[8:]
-    if account_no != _KIS_MOCK_ACCOUNT.replace("-", ""):
-        return {"error": f"계좌 불일치 — 허용 모의계좌: {_KIS_MOCK_ACCOUNT}"}
+    allowed = _allowed_mock_account()
+    if not allowed or account_no != allowed.replace("-", ""):
+        return {"error": f"계좌 불일치 — 허용 모의계좌: {allowed or '(.env KIS_ALLOWED_MOCK_ACCOUNT 없음)'}"}
 
     # ── 안전장치 2: 매수 금액 상한 (달러, 9/12 결정 ⑤ — $1,500) ──
     estimated_usd = round(price_usd * qty, 2)
@@ -1430,7 +1441,7 @@ def place_kis_order_us(
     safety_info = {
         "account_ok": True, "amount_ok": True,
         "limit_usd": _KIS_ORDER_LIMIT_USD, "estimated_usd": estimated_usd,
-        "mock_account": _KIS_MOCK_ACCOUNT,
+        "mock_account": _allowed_mock_account(),
     }
 
     if dry_run:
@@ -1490,8 +1501,9 @@ def get_kis_fill_price_us(
     end  = (d + timedelta(days=1)).strftime("%Y%m%d")
 
     account_no = os.getenv("KIS_ACCOUNT_NO", "").strip().replace("-", "")
-    if account_no != _KIS_MOCK_ACCOUNT.replace("-", ""):
-        return {"error": f"계좌 불일치 — 허용 모의계좌: {_KIS_MOCK_ACCOUNT}"}
+    allowed = _allowed_mock_account()
+    if not allowed or account_no != allowed.replace("-", ""):
+        return {"error": f"계좌 불일치 — 허용 모의계좌: {allowed or '(.env KIS_ALLOWED_MOCK_ACCOUNT 없음)'}"}
     cano, acnt_prdt_cd = account_no[:8], account_no[8:]
 
     tok = get_kis_token()
