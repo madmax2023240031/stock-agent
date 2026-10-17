@@ -893,6 +893,21 @@ def run_buy_rule(
             price_usd = float(close)  # ⚠️ close의 통화 단위(USD 여부)는 첫 dry-run 실측에서 검증 (규칙 20)
             draft = place_kis_order_us(ticker, "BUY", 1, price_usd, us_exchange,
                                        dry_run=True)  # 수량 1주 고정(관찰 단계) — dry_run 하드코딩
+            # 결함 ① (2026-10-17): 주문서가 에러면 US_DRYRUN이 아니라 ERROR로 기록한다.
+            # (9/30 SNDK 사례 — 에러 주문서가 US_DRYRUN으로 남아 결정값만 세면 정상 주문서로 읽혔음)
+            if not isinstance(draft, dict) or "error" in draft:
+                _us_err = (draft.get("error") if isinstance(draft, dict)
+                           else f"주문서 응답 형식 오류: {type(draft).__name__}")
+                _append_dryrun_log(_make_entry(
+                    run_id, rule_tag, "ERROR", ticker=ticker, name=name, side="BUY",
+                    qty=1, price=price_usd, sector=sector,
+                    currency="USD", exchange=us_exchange,
+                    guardrail=gr,
+                    order_draft=draft,
+                    note=f"US 주문서 에러 — 주문서 생략: {_us_err}",
+                    test_now=test_now))
+                records += 1
+                continue
             _append_dryrun_log(_make_entry(
                 run_id, rule_tag, "US_DRYRUN", ticker=ticker, name=name, side="BUY",
                 qty=1, price=price_usd, sector=sector,
