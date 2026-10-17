@@ -810,6 +810,7 @@ def run_buy_rule(
     session_trades = 0
 
     drafted = 0
+    us_drafted = 0  # 결함 ③ (2026-10-17): US dry-run 주문서 건수 — 국내 drafted와 따로 센다 (US_MODE off면 항상 0)
     approved_count = 0
     rejected_count = 0
     orders: list[dict] = []  # 후보 ⑦ 실행 요약용
@@ -817,7 +818,7 @@ def run_buy_rule(
     unknown_stop: dict | None = None  # 2026-09-30 결정 3: 결과 미확인으로 남은 후보 중단 시 기록
 
     for idx, cand in enumerate(candidates, start=1):
-        if drafted >= max_orders:
+        if drafted + us_drafted >= max_orders:  # 결함 ③: US dry-run 주문서도 상한에 넣는다
             # 후보 ⑥: 조용히 break 하지 않고 남은 후보를 SKIPPED로 기록한다 (관찰 데이터, 주문 없음)
             n_total = len(candidates)
             for k, rest in enumerate(candidates[idx - 1:], start=idx):
@@ -933,6 +934,7 @@ def run_buy_rule(
                 note="US dry-run 주문서 (결정 ⑤ — 실주문 경로 없음). 국내 통계 카운터 미반영(records만).",
                 test_now=test_now))
             records += 1
+            us_drafted += 1  # 결함 ③: 정상 US_DRYRUN 주문서만 센다 (SKIPPED·ERROR·BLOCKED 제외)
             continue
         if market != "KR":
             _append_dryrun_log(_make_entry(
@@ -1104,6 +1106,7 @@ def run_buy_rule(
 
     return {"run_id": run_id, "rule_tag": rule_tag,
             "candidates": len(candidates), "records": records, "drafted": drafted,
+            "us_drafted": us_drafted,  # 결함 ③
             "approved": approved_count, "rejected": rejected_count,
             "orders": orders,  # 후보 ⑦
             "truncated": truncated,  # 후보 ⑥
