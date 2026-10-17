@@ -891,6 +891,20 @@ def run_buy_rule(
                 records += 1
                 continue
             price_usd = float(close)  # ⚠️ close의 통화 단위(USD 여부)는 첫 dry-run 실측에서 검증 (규칙 20)
+            # 결함 ② (2026-10-17): 수량 1주 고정이라 1주 가격이 매수 1회 상한을 넘으면 주문서가 항상 에러다.
+            # → 후보 단계에서 SKIPPED로 거르고 다음 후보로. 상한 값(tools._KIS_ORDER_LIMIT_USD)과
+            #   주문서 단계의 상한 검사는 그대로 둔다(이중 안전장치). 비교식은 주문서 단계와 같은 round(가격×1, 2).
+            _limit_usd = tools._KIS_ORDER_LIMIT_USD
+            if round(price_usd * 1, 2) > _limit_usd:
+                _append_dryrun_log(_make_entry(
+                    run_id, rule_tag, "SKIPPED", ticker=ticker, name=name, side="BUY",
+                    qty=1, price=price_usd, sector=sector,
+                    currency="USD", exchange=us_exchange,
+                    guardrail=gr,
+                    note=f"1주 가격 {price_usd:,.2f} USD가 상한 {_limit_usd:,.2f} USD 초과 — 주문서 생략",
+                    test_now=test_now))
+                records += 1
+                continue
             draft = place_kis_order_us(ticker, "BUY", 1, price_usd, us_exchange,
                                        dry_run=True)  # 수량 1주 고정(관찰 단계) — dry_run 하드코딩
             # 결함 ① (2026-10-17): 주문서가 에러면 US_DRYRUN이 아니라 ERROR로 기록한다.
