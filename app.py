@@ -1,5 +1,6 @@
 import streamlit as st
 import manager
+import pnl_view  # 2026-11-10 자동매매 성적표(읽기 전용, KIS 호출 없음)
 
 st.set_page_config(page_title="주식 멀티 에이전트 시스템", page_icon="🤖", layout="wide")
 
@@ -10,6 +11,9 @@ if "quick_question" not in st.session_state:
 
 # 사이드바 (조직도 — st.expander 방식, HTML 렌더링 오류 없음)
 with st.sidebar:
+    # 2026-11-10 — 자동매매 성적표(봇이 저장한 파일만 읽음, KIS·네트워크 호출 0)
+    pnl_view.render_sidebar()
+
     # CSS: 한 줄 문자열 연결로 작성 → Markdown이 코드 블록으로 오인하는 4칸 들여쓰기 원천 차단
     st.markdown(
         "<style>"
