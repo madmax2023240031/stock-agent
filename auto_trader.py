@@ -152,7 +152,7 @@ DEFAULT_MAX_ORDERS_PER_RULE = 3          # 규칙 1회 실행당 주문서 작�
 #   1) 4단계 세트(PHASE=4)  2) .env US_LIVE_CONFIRM 이 _US_LIVE_CONFIRM_PHRASE 와 정확히 일치  3) US_MODE == "live"
 # 1차 범위는 미국 "매수"만(D1). 미국 매도 실주문 경로는 없다(2차).
 # US_MODE 값 변경은 안전장치 등급 — 단독 커밋 + 감자 명시 승인으로만.
-US_MODE = "dry_run"
+US_MODE = "live"
 
 _US_LIVE_CONFIRM_PHRASE = "미국 실주문 1차를 승인합니다"   # .env US_LIVE_CONFIRM 전용 (D7)
 ORDER_UNKNOWN_LOCK_US_PATH = str(_BASE_DIR / "order_unknown_lock_us.json")  # D4·D5 미국 전용 잠금 (국내 무영향)
