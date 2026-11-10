@@ -67,7 +67,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import math
 import sys
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -144,11 +146,25 @@ DEFAULT_BUDGET_PER_ORDER_KRW = 500_000   # 매수 1건당 예산 (place_kis_orde
 HIGH_PRICE_SINGLE_SHARE_CAP_KRW = 2_000_000  # 고가주 1주 예외 상한 (place_kis_order 상한과 동일)
 DEFAULT_MAX_ORDERS_PER_RULE = 3          # 규칙 1회 실행당 주문서 작성 최대 건수
 
-# ── 미국장 모드 (9/12 안건 ④) ──────────────────────────────
-# 허용값: "off"(기본) | "dry_run". ⚠️ "live" 값은 존재하지 않는다 —
-# 미국 실주문 경로는 이 코드에 없음(구조적 안전장치, 결정 ⑤).
-# 실주문 승격은 별도 승인 + 별도 커밋으로만 가능. 시즌 2 개시 시 "dry_run"으로 변경.
+# ── 미국장 모드 (9/12 안건 ④ → 2026-11-06 결정 D1–D8로 "live" 추가) ──────────
+# 허용값: "off" | "dry_run" | "live".
+# "live"는 아래 세 조건이 모두 맞을 때만 실제로 켜진다(D7). 하나라도 빠지면 dry-run으로 내려가고 배너로 알린다.
+#   1) 4단계 세트(PHASE=4)  2) .env US_LIVE_CONFIRM 이 _US_LIVE_CONFIRM_PHRASE 와 정확히 일치  3) US_MODE == "live"
+# 1차 범위는 미국 "매수"만(D1). 미국 매도 실주문 경로는 없다(2차).
+# US_MODE 값 변경은 안전장치 등급 — 단독 커밋 + 감자 명시 승인으로만.
 US_MODE = "dry_run"
+
+_US_LIVE_CONFIRM_PHRASE = "미국 실주문 1차를 승인합니다"   # .env US_LIVE_CONFIRM 전용 (D7)
+ORDER_UNKNOWN_LOCK_US_PATH = str(_BASE_DIR / "order_unknown_lock_us.json")  # D4·D5 미국 전용 잠금 (국내 무영향)
+_US_UNKNOWN_IN_PROCESS: dict | None = None   # 같은 실행 안 차단용 메모리 표시
+US_LIVE_MAX_BUYS_PER_DAY = 1       # D2 — 미국 전체(A·B 합산) 하루 1건 (뉴욕 현지 날짜)
+US_LIVE_QTY = 1                    # D2 — 1주
+US_LIMIT_MARKUP_PCT = 0.5          # D3 — 지정가 = 현재가 × (1 + 0.5%), 센트 아래 버림
+US_SCREEN_MIN_SCORED = 450         # D6 — 스크리너 점수화 종목 수 하한 (미만이면 실주문 안 함)
+US_FILL_CHECK_ROUNDS = 6           # D5 — 체결 확인 반복 횟수 (1회 = get_kis_fill_price_us 1번). 2026-11-10 보완 3 → 6
+US_FILL_CHECK_INTERVAL_SEC = 10    # D5 — 반복 사이 대기(초). 2026-11-10 보완 5 → 10 (전량 체결 반영까지 최대 약 1분)
+# 2026-11-10 보완(3): 하루 1건은 "체결"이 아니라 "전송 시도" 기준 — dry-run 기록에서 세는 결정값
+_US_LIVE_ATTEMPT_DECISIONS = ("US_LIVE_ORDER", "US_LIVE_UNFILLED", "US_LIVE_UNKNOWN")
 
 
 # ═══════════════════════════════════════════════
@@ -337,7 +353,7 @@ def _print_kill_switch_line(rule_tag: str, ks: dict) -> None:
 
 
 def _order_brief(ticker: str, name: str, side: str, qty: int, price,
-                 execution: dict | None) -> dict:
+                 execution: dict | None, currency: str = "KRW") -> dict:
     """실행 요약 라인용 주문 1건 요약 (미확정 후보 ⑦). 주문번호는 execution에 있을 때만, 없으면 None."""
     sent = bool(execution and execution.get("success"))
     order_no = (execution.get("summary", {}) or {}).get("order_no") if sent else None
@@ -345,7 +361,8 @@ def _order_brief(ticker: str, name: str, side: str, qty: int, price,
     recovered = bool(execution and execution.get("recovered"))
     return {"ticker": ticker, "name": name, "side": side, "qty": qty,
             "price": price, "sent": sent, "order_no": order_no or None,
-            "unknown": unknown, "recovered": recovered}   # 2026-09-30 결정 3 표시용
+            "unknown": unknown, "recovered": recovered,   # 2026-09-30 결정 3 표시용
+            "currency": currency}   # 2026-11-10 보완(2): 요약 줄 원화/달러 표시는 종목코드 모양이 아니라 통화로
 
 
 # ═══════════════════════════════════════════════
@@ -646,6 +663,209 @@ def _register_unknown_order(ticker: str, side: str, qty: int, execution: dict) -
         print(f"     ⛔ {execution['lock']['note']}")
 
 
+# ═══════════════════════════════════════════════
+# 미국 실주문 1차 (2026-11-06 결정 D1–D8) — 매수만
+# ═══════════════════════════════════════════════
+
+def _us_live_status() -> dict:
+    """D7 — 미국 실주문 활성 여부. {"live": bool, "reason": str}. 조건 하나라도 빠지면 live=False."""
+    if US_MODE != "live":
+        return {"live": False, "reason": f"US_MODE={US_MODE!r} — 미국 주문 전송 없음"}
+    problems = []
+    if not (_is_live_mode() and PHASE == 4):
+        problems.append(f"4단계 세트 아님(PHASE={PHASE!r})")
+    from dotenv import load_dotenv
+    load_dotenv(_BASE_DIR / ".env")
+    if os.environ.get("US_LIVE_CONFIRM", "") != _US_LIVE_CONFIRM_PHRASE:
+        problems.append(".env US_LIVE_CONFIRM 핀 없음·불일치")
+    if problems:
+        return {"live": False,
+                "reason": "US_MODE='live'지만 " + " / ".join(problems) + " → dry-run으로 내려감"}
+    return {"live": True, "reason": "US_MODE='live' + 4단계 세트 + US_LIVE_CONFIRM 핀"}
+
+
+def _us_lock_status() -> dict | None:
+    """D4·D5 미국 전용 잠금 상태. None = 잠금 없음. 파일을 못 읽으면 잠금으로 간주(fail-safe)."""
+    if _US_UNKNOWN_IN_PROCESS is not None:
+        return {"source": "process", "info": _US_UNKNOWN_IN_PROCESS}
+    if os.path.exists(ORDER_UNKNOWN_LOCK_US_PATH):
+        try:
+            with open(ORDER_UNKNOWN_LOCK_US_PATH, "r", encoding="utf-8") as f:
+                return {"source": "file", "info": json.load(f)}
+        except Exception as e:
+            return {"source": "file", "info": None, "note": f"미국 잠금 파일 읽기 실패 — 잠금으로 간주: {e}"}
+    return None
+
+
+def _register_us_lock(event: dict) -> dict:
+    """
+    미국 실주문 잠금 기록 (D4 결과 미확인 / D5 미체결·장부 기록 실패).
+    메모리 표시를 먼저 켜고(파일 쓰기 실패 대비) 잠금 파일에 사건을 덧붙인다.
+    기존 파일을 못 읽으면 덮어쓰지 않는다(파일이 있으므로 잠금은 유지).
+    """
+    global _US_UNKNOWN_IN_PROCESS
+    event = {"recorded_at": _now_kst().isoformat(timespec="seconds"), **event}
+    _US_UNKNOWN_IN_PROCESS = event
+    data = {
+        "note": ("미국 실주문 잠금 — 이 파일이 있으면 미국 실주문은 나가지 않는다(dry-run 기록은 계속, 국내 무영향). "
+                 "KIS 앱(해외 잔고·체결/미체결)과 장부를 대조한 뒤 이 파일을 logs/로 옮겨 해제한다."),
+        "events": [],
+    }
+    if os.path.exists(ORDER_UNKNOWN_LOCK_US_PATH):
+        try:
+            with open(ORDER_UNKNOWN_LOCK_US_PATH, "r", encoding="utf-8") as f:
+                old = json.load(f)
+            if not (isinstance(old, dict) and isinstance(old.get("events"), list)):
+                raise ValueError("구조 이상")
+            data["events"] = old["events"]
+        except Exception as e:
+            note = f"기존 미국 잠금 파일 읽기 실패 — 덮어쓰지 않음(잠금은 유지): {e}"
+            print(f"     ⚠️ {note}")
+            return {"written": False, "note": note}
+    data["events"].append(event)
+    tmp = ORDER_UNKNOWN_LOCK_US_PATH + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, ORDER_UNKNOWN_LOCK_US_PATH)
+        return {"written": True, "path": ORDER_UNKNOWN_LOCK_US_PATH, "events": len(data["events"])}
+    except Exception as e:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        note = f"미국 잠금 파일 쓰기 실패 — 이번 실행만 메모리로 차단, 즉시 사람 확인 필요: {e}"
+        print(f"     ⛔ {note}")
+        return {"written": False, "note": note}
+
+
+def _us_limit_price(price_usd: float) -> float:
+    """D3 — 지정가 = 현재가 × (1 + US_LIMIT_MARKUP_PCT%), 센트 아래 버림 (현재가 +0.5% 이내 보장)."""
+    return math.floor(round(price_usd * (100 + US_LIMIT_MARKUP_PCT), 6)) / 100
+
+
+def _us_live_attempts_today(now: datetime | None = None) -> dict:
+    """
+    2026-11-10 보완(3) — 오늘(뉴욕 현지 날짜) dry-run 기록에 남은 미국 실주문 "전송 시도" 수 (읽기 전용).
+
+    미국 회차는 규칙 A·B가 따로 된 실행이라, A 주문이 거절(ERROR)되면 장부·잠금에 흔적이 없다.
+    그래서 장부 건수와 별도로 dry-run 기록의 시도 흔적도 센다:
+      - decision이 US_LIVE_ORDER / US_LIVE_UNFILLED / US_LIVE_UNKNOWN
+      - decision이 ERROR이면서 currency USD 이고 execution.executed 가 True (실주문 경로에서 난 거절)
+    기록 파일이 없으면 0, 읽기·해석 실패면 {"error": ...} — 호출부는 실주문을 하지 않는다(fail-safe).
+    """
+    from zoneinfo import ZoneInfo
+    ny = ZoneInfo("America/New_York")
+    if now is None:
+        now = _now_kst()
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=ZoneInfo("Asia/Seoul"))
+    today_ny = now.astimezone(ny).date()
+    if not os.path.exists(DRYRUN_LOG_PATH):
+        return {"count": 0, "today_ny": today_ny.isoformat()}
+    try:
+        with open(DRYRUN_LOG_PATH, "r", encoding="utf-8") as f:
+            recs = json.load(f).get("records", [])
+    except Exception as e:
+        return {"error": f"dry-run 기록 읽기 실패: {e}"}
+    n = 0
+    for r in recs:
+        if not isinstance(r, dict):
+            continue
+        dec = r.get("decision")
+        is_attempt = dec in _US_LIVE_ATTEMPT_DECISIONS or (
+            dec == "ERROR" and r.get("currency") == "USD"
+            and bool((r.get("execution") or {}).get("executed")))
+        if not is_attempt:
+            continue
+        try:
+            ts = datetime.fromisoformat(str(r.get("timestamp")))
+        except ValueError:
+            return {"error": f"dry-run 기록 timestamp 해석 실패: {r.get('timestamp')!r}"}
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=ZoneInfo("Asia/Seoul"))
+        if ts.astimezone(ny).date() == today_ny:
+            n += 1
+    return {"count": n, "today_ny": today_ny.isoformat()}
+
+
+def _us_live_precheck(rule_result: dict, session_sent: int, now: datetime | None) -> str | None:
+    """
+    실주문 직전 검사 (D2·D4·D5·D6). 통과하면 None, 막히면 사유 문자열 → 호출부는 dry-run 기록만.
+    """
+    lk = _us_lock_status()
+    if lk is not None:
+        return (f"미국 잠금 중({'이번 실행에서 발생' if lk['source'] == 'process' else ORDER_UNKNOWN_LOCK_US_PATH})"
+                + (f" / {lk['note']}" if lk.get("note") else ""))
+    scored = rule_result.get("screen_scored")
+    if not isinstance(scored, int):
+        return "스크리너 점수화 수 확인 불가 — 하한 판정 불가(fail-safe)"
+    if scored < US_SCREEN_MIN_SCORED:
+        return f"스크리너 점수화 {scored}/{rule_result.get('screen_total')} < 하한 {US_SCREEN_MIN_SCORED}"
+    if session_sent >= US_LIVE_MAX_BUYS_PER_DAY:
+        return f"이번 실행에서 이미 미국 실주문 {session_sent}건 — 하루 {US_LIVE_MAX_BUYS_PER_DAY}건 상한"
+    cnt = tools.count_us_live_buys_today(now=now)
+    if "error" in cnt:
+        return f"오늘 미국 매수 건수 집계 실패 — 진행 안 함(fail-safe): {cnt['error']}"
+    if cnt["count"] >= US_LIVE_MAX_BUYS_PER_DAY:
+        return (f"오늘(뉴욕 {cnt['today_ny']}) 미국 자동매수 {cnt['count']}건 — "
+                f"하루 {US_LIVE_MAX_BUYS_PER_DAY}건 상한")
+    att = _us_live_attempts_today(now)   # 2026-11-10 보완(3) — 거절도 1건으로 센다
+    if "error" in att:
+        return f"오늘 미국 실주문 시도 집계 실패 — 진행 안 함(fail-safe): {att['error']}"
+    if att["count"] >= US_LIVE_MAX_BUYS_PER_DAY:
+        return (f"오늘(뉴욕 {att['today_ny']}) 미국 실주문 시도 {att['count']}건(거절 포함) — "
+                f"하루 {US_LIVE_MAX_BUYS_PER_DAY}건 상한")
+    return None
+
+
+def _execute_order_us(ticker: str, qty: int, limit_price: float, exchange: str) -> dict:
+    """
+    미국 실주문 게이트 (D7) — 매수만(D1). dry_run 인자에 False 리터럴을 쓰지 않고 dry_run=DRY_RUN을 넘긴다.
+    조건이 하나라도 안 맞는데 여기까지 왔다면 배선 버그이므로 즉시 예외.
+    """
+    _assert_phase_config()
+    st = _us_live_status()
+    if not (st["live"] and _is_live_mode()):
+        raise RuntimeError(
+            "[안전장치] _execute_order_us는 미국 실주문 조건(D7)이 모두 맞을 때만 호출할 수 있습니다 — "
+            f"배선 버그, 중단합니다. ({st['reason']})")
+    _check_phase4_confirm()   # 방어 심층화 — 주문 직전에도 .env 핀 재검사
+
+    result = place_kis_order_us(ticker, "BUY", qty, limit_price, exchange, dry_run=DRY_RUN)
+    success = isinstance(result, dict) and "error" not in result
+    unknown = isinstance(result, dict) and bool(result.get("unknown")) and not success
+    if success:
+        r = result.get("result", {})
+        summary = {"order_no": r.get("order_no", ""), "order_time": r.get("order_time", ""),
+                   "rt_cd": r.get("rt_cd"), "msg": r.get("msg", "")}
+    else:
+        summary = {"error": result.get("error") if isinstance(result, dict) else str(result),
+                   "sent_at": result.get("sent_at") if isinstance(result, dict) else None}
+    return {"executed": True, "success": success, "unknown": unknown, "recovered": False,
+            "summary": summary, "limit_price_usd": limit_price, "currency": "USD",
+            "executed_at": _now_kst().isoformat(timespec="seconds")}
+
+
+def _confirm_us_fill(order_no: str, ticker: str, qty: int) -> dict:
+    """D5 — 체결 확인. 체결 확인되면 {"filled": True, "fill_price": ...}, 아니면 filled=False(사유 포함)."""
+    order_date = _now_kst().strftime("%Y%m%d")
+    last: dict = {"filled": False, "reason": "체결 확인 시도 없음"}
+    for i in range(1, US_FILL_CHECK_ROUNDS + 1):
+        f = tools.get_kis_fill_price_us(order_no, ticker, qty, order_date)
+        if not isinstance(f, dict) or "error" in f:
+            last = {"filled": False, "round": i,
+                    "reason": (f.get("error") if isinstance(f, dict) else str(f))[:300]}
+        else:
+            last = {**tools.parse_us_fill_row(f.get("row"), qty), "round": i, "row": f.get("row")}
+            if last.get("filled"):
+                return last
+        if i < US_FILL_CHECK_ROUNDS:
+            time.sleep(US_FILL_CHECK_INTERVAL_SEC)
+    return last
+
+
 def _ask_approval(
     rule_tag: str,
     ticker: str,
@@ -837,6 +1057,9 @@ def run_buy_rule(
     orders: list[dict] = []  # 후보 ⑦ 실행 요약용
     truncated: list[dict] = []  # 후보 ⑥ max_orders 절단 탈락 종목
     unknown_stop: dict | None = None  # 2026-09-30 결정 3: 결과 미확인으로 남은 후보 중단 시 기록
+    us_live = (_us_live_status() if market in ("US", "ALL")
+               else {"live": False, "reason": "KR 회차"})   # 2026-11-06 D7
+    us_live_sent = 0   # 2026-11-06 D2 — 이번 실행의 미국 실주문 시도 수 (성공·미확인·오류 모두)
 
     for idx, cand in enumerate(candidates, start=1):
         if drafted + us_drafted >= max_orders:  # 결함 ③: US dry-run 주문서도 상한에 넣는다
@@ -862,7 +1085,7 @@ def run_buy_rule(
 
         # ── 3. 시장 분기 (9/12 안건 ④: US 허용 경로 — dry-run 전용) ──
         market = cand.get("market")
-        if market == "US" and US_MODE == "dry_run":
+        if market == "US" and US_MODE in ("dry_run", "live"):
             us_exchange = cand.get("exchange")
             if not us_exchange:
                 _append_dryrun_log(_make_entry(
@@ -944,18 +1167,96 @@ def run_buy_rule(
                     test_now=test_now))
                 records += 1
                 continue
+            # ── 2026-11-06 D1–D7: 미국 실주문 1차 — 조건이 하나라도 안 맞으면 기존 dry-run 기록 ──
+            us_skip = (_us_live_precheck(result, us_live_sent, now_inject)
+                       if us_live["live"] else None)
+            if not us_live["live"] or us_skip:
+                _append_dryrun_log(_make_entry(
+                    run_id, rule_tag, "US_DRYRUN", ticker=ticker, name=name, side="BUY",
+                    qty=1, price=price_usd, sector=sector,
+                    currency="USD", exchange=us_exchange,
+                    order_amount_usd=(draft.get("order", {}).get("estimated_amount_usd")
+                                      if isinstance(draft, dict) else None),
+                    guardrail=gr,
+                    order_draft=draft,
+                    note=("US dry-run 주문서. 국내 통계 카운터 미반영(records만)."
+                          + (f" 실주문 생략: {us_skip}" if us_skip else "")),
+                    test_now=test_now))
+                records += 1
+                us_drafted += 1  # 결함 ③: 정상 US_DRYRUN 주문서만 센다 (SKIPPED·ERROR·BLOCKED 제외)
+                continue
+
+            # ── 실주문 (D2 1주 · D3 지정가 · D4 미확인 잠금 · D5 체결 확인 뒤에만 장부) ──
+            limit_price = _us_limit_price(price_usd)
+            execution = _execute_order_us(ticker, US_LIVE_QTY, limit_price, us_exchange)
+            us_live_sent += 1   # 전송 시도 자체를 센다 — 같은 실행에서 다시 보내지 않는다
+            book_log = None
+            lock = None
+            _no = (execution.get("summary") or {}).get("order_no") or ""
+            if execution.get("success"):
+                fill = _confirm_us_fill(_no, ticker, US_LIVE_QTY)
+                if fill.get("filled"):
+                    r = log_trade(
+                        rule_tag=rule_tag, ticker=ticker, side="BUY",
+                        qty=US_LIVE_QTY, price=fill["fill_price"],
+                        reason=(f"[auto_trader {run_id}] 규칙 {rule_tag} 미국 자동매수 "
+                                f"(지정가 {limit_price:,.2f} USD — 체결가 기록, 주문시점가 {price_usd:,.2f} USD)"),
+                        sector=sector, source_rule=None,
+                        order_no=_no or None, price_source="fill_avg", fill_reason=None,
+                        currency="USD", exchange=us_exchange,
+                    )
+                    book_log = {"fill": fill,
+                                "entries": [{"source_rule": None, "qty": US_LIVE_QTY, "result": r}],
+                                "all_logged": "error" not in r}
+                    decision = "US_LIVE_ORDER"
+                    if "error" in r:   # 장부 기록 실패 — 보유와 장부가 어긋나므로 잠금
+                        lock = _register_us_lock({"kind": "book_log_failed", "ticker": ticker,
+                                                  "order_no": _no, "error": r.get("error"),
+                                                  "rule_tag": rule_tag, "exchange": us_exchange,   # 2026-11-10 보완(4a) 기록용
+                                                  "fill_price_usd": fill.get("fill_price"),
+                                                  "order_date": _now_kst().strftime("%Y%m%d")})
+                else:
+                    book_log = {"fill": fill, "entries": [], "all_logged": False}
+                    decision = "US_LIVE_UNFILLED"
+                    lock = _register_us_lock({"kind": "unfilled", "ticker": ticker, "qty": US_LIVE_QTY,
+                                              "limit_price_usd": limit_price, "order_no": _no,
+                                              "reason": fill.get("reason"),
+                                              # 2026-11-10 보완(4a): tools.py us_book이 장부 1건을 다시 만들 때 쓰는 정보
+                                              "rule_tag": rule_tag, "name": name, "sector": sector,
+                                              "exchange": us_exchange, "price_order_time_usd": price_usd,
+                                              "order_date": _now_kst().strftime("%Y%m%d"),
+                                              "run_id": run_id})
+            elif execution.get("unknown"):
+                decision = "US_LIVE_UNKNOWN"
+                lock = _register_us_lock({"kind": "unknown", "ticker": ticker, "qty": US_LIVE_QTY,
+                                          "limit_price_usd": limit_price,
+                                          "rule_tag": rule_tag, "name": name, "exchange": us_exchange,   # 2026-11-10 보완(4a) 기록용
+                                          "order_date": _now_kst().strftime("%Y%m%d"),
+                                          "sent_at": (execution.get("summary") or {}).get("sent_at"),
+                                          "error": (execution.get("summary") or {}).get("error")})
+            else:
+                decision = "ERROR"   # 전송 전 거절·API 오류 — 주문 안 나감, 잠금 없음
+            execution["lock"] = lock
             _append_dryrun_log(_make_entry(
-                run_id, rule_tag, "US_DRYRUN", ticker=ticker, name=name, side="BUY",
-                qty=1, price=price_usd, sector=sector,
+                run_id, rule_tag, decision, ticker=ticker, name=name, side="BUY",
+                qty=US_LIVE_QTY, price=price_usd, sector=sector,
                 currency="USD", exchange=us_exchange,
-                order_amount_usd=(draft.get("order", {}).get("estimated_amount_usd")
-                                  if isinstance(draft, dict) else None),
-                guardrail=gr,
-                order_draft=draft,
-                note="US dry-run 주문서 (결정 ⑤ — 실주문 경로 없음). 국내 통계 카운터 미반영(records만).",
+                order_amount_usd=round(limit_price * US_LIVE_QTY, 2),
+                guardrail=gr, order_draft=draft, execution=execution, book_log=book_log,
+                note=(f"[US LIVE] 규칙 {rule_tag} 미국 매수 지정가 {limit_price:,.2f} USD "
+                      f"(현재가 {price_usd:,.2f} +{US_LIMIT_MARKUP_PCT}% 이내) — 결과 {decision}"
+                      + (" / ⛔ 미국 잠금 기록" if lock else "")
+                      + (" / ⚠️ 장부 기록 실패 — 수동 확인 필요" if book_log and book_log["entries"]
+                         and not book_log["all_logged"] else "")),
                 test_now=test_now))
             records += 1
-            us_drafted += 1  # 결함 ③: 정상 US_DRYRUN 주문서만 센다 (SKIPPED·ERROR·BLOCKED 제외)
+            us_drafted += 1
+            orders.append(_order_brief(
+                ticker, name, "BUY", US_LIVE_QTY,
+                book_log["fill"]["fill_price"] if book_log and book_log["fill"].get("filled") else limit_price,
+                execution, currency="USD"))
+            if lock is not None:
+                print(f"  ⛔ 미국 실주문 {decision}({ticker}) → 미국 잠금 기록, 이후 미국 실주문 중단")
             continue
         if market != "KR":
             _append_dryrun_log(_make_entry(
@@ -1128,6 +1429,7 @@ def run_buy_rule(
     return {"run_id": run_id, "rule_tag": rule_tag,
             "candidates": len(candidates), "records": records, "drafted": drafted,
             "us_drafted": us_drafted,  # 결함 ③
+            "us_live_sent": us_live_sent,  # 2026-11-06 D2
             "approved": approved_count, "rejected": rejected_count,
             "orders": orders,  # 후보 ⑦
             "truncated": truncated,  # 후보 ⑥
@@ -1262,8 +1564,8 @@ def run_sell_rule(test_now: str | None = None) -> dict:
         # ── 3. 시장 분기 (9/12 안건 ④-D: US 매도는 보유 발생 후 활성화) ──
         market = cand.get("market")
         if market != "KR":
-            if market == "US" and US_MODE == "dry_run":
-                _note = "US 매도 후보 — 시즌 2 초기 US 보유 없음, 매도 dry-run 경로는 보유 발생 후 활성화 (④-D)"
+            if market == "US" and US_MODE in ("dry_run", "live"):   # 2026-11-10 보완(1): live에서도 같은 문구
+                _note = "US 매도 후보 — 미국 매도 실주문은 2차 범위(2026-11-06 D1·D8), 지금은 주문서 없이 기록만"
                 _cur = "USD"
             else:
                 _note = f"비KR 종목(US_MODE off 포함) — 매도 주문서 생략 ({reason})"
@@ -1492,6 +1794,12 @@ def main() -> None:
     else:
         print("auto_trader v5 — 0단계 DRY RUN 전용 (실제 주문 없음)")
     print(f"PHASE={PHASE} / MASTER_ENABLE={MASTER_ENABLE} / DRY_RUN={DRY_RUN}")
+    if args.market in ("US", "ALL"):   # 2026-11-06 D7
+        _st = _us_live_status()
+        print(f"US_MODE={US_MODE} → "
+              + ("🔴 미국 실주문 1차(매수만 · 하루 1건 · 1주 · 지정가 현재가+0.5% 이내)" if _st["live"]
+                 else "미국 주문 전송 없음(dry-run 기록만)")
+              + f" — {_st['reason']}")
     print(f"기록 파일: {DRYRUN_LOG_PATH}")
     print("=" * 60)
 
@@ -1524,7 +1832,8 @@ def main() -> None:
                      if s.get('drafted', 0) else ""))
             for o in s.get("orders", []):  # 후보 ⑦ 종목당 1줄
                 _p = o.get("price")
-                _p_txt = f"@{_p:,.0f}" if isinstance(_p, (int, float)) else "@—"
+                _p_txt = ((f"@{_p:,.2f} USD" if o.get("currency") == "USD" else f"@{_p:,.0f}")
+                          if isinstance(_p, (int, float)) else "@—")
                 _no = o.get("order_no")
                 print(f"    └ {o.get('side')} {o.get('ticker')} {o.get('name')} "
                       f"{o.get('qty')}주 {_p_txt} "
@@ -1535,6 +1844,9 @@ def main() -> None:
     if _lk is not None:
         print(f"⛔ 결과 미확인 주문 잠금 활성 — {ORDER_UNKNOWN_LOCK_PATH} "
               "(다음 회차부터 매수 차단, 매도는 계속). KIS 앱 대조·장부 보정 후 파일을 logs/로 옮겨 해제하세요.")
+    if _us_lock_status() is not None:   # 2026-11-06 D4·D5
+        print(f"⛔ 미국 실주문 잠금 활성 — {ORDER_UNKNOWN_LOCK_US_PATH} "
+              "(미국 실주문 중단, dry-run 기록·국내는 계속). KIS 앱 대조 후 파일을 logs/로 옮겨 해제하세요.")
     if _is_live_mode() and PHASE == 4:
         print("🔴 4단계 승인 면제 모드로 실행되었습니다. 실제 전송 결과는 각 기록의 execution 필드를 확인하세요.")
     elif _is_live_mode():

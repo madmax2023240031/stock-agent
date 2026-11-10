@@ -1460,12 +1460,36 @@ def place_kis_order_us(
         "tr_id": tr_id, "custtype": "P",
     }
     url = f"{_KIS_DOMAIN}/uapi/overseas-stock/v1/trading/order"
+
+    # ── 2026-11-06 결정 D4: "응답 없음"은 "실패"가 아니다 (국내 9/30 결정 1·4와 같은 규칙) ──
+    # - 연결 자체가 안 된 경우(ConnectTimeout)만 "미전송" 실패.
+    # - 보낸 뒤 응답 없음·연결 끊김·서버 5xx·응답 해석 실패는 "결과 미확인"(unknown=True).
+    # - 미확인도 "error" 키를 유지한다 → 호출부가 실패로 오인해도 주문을 다시 보내지 않는다.
+    from zoneinfo import ZoneInfo
+    sent_at = datetime.now(ZoneInfo("Asia/Seoul")).isoformat(timespec="seconds")
+
+    def _unknown(detail: str) -> dict:
+        return {
+            "error": (f"KIS 미국 주문 결과 미확인 — {detail}. "
+                      "주문이 접수·체결됐을 수 있으므로 실패로 단정하지 않는다."),
+            "unknown": True,
+            "sent_at": sent_at,
+        }
+
     try:
-        resp = requests.post(url, json=api_body, headers=headers, timeout=10)
-        resp.raise_for_status()
+        resp = requests.post(url, json=api_body, headers=headers, timeout=(10, 30))
+    except requests.exceptions.ConnectTimeout as exc:
+        return {"error": f"{_kis_maintenance_hint()}\n\nKIS 미국 주문 연결 실패(미전송 — 서버 연결 전 시간 초과): {exc}"}
+    except Exception as exc:
+        return _unknown(f"요청 후 응답 없음·연결 끊김 ({type(exc).__name__}: {exc})")
+    if resp.status_code >= 500:
+        return _unknown(f"서버 오류 응답 HTTP {resp.status_code} ({resp.text[:200]})")
+    if resp.status_code >= 400:
+        return {"error": f"{_kis_maintenance_hint()}\n\nKIS 미국 주문 HTTP 오류: {resp.status_code} — {resp.text[:300]}"}
+    try:
         data = resp.json()
     except Exception as exc:
-        return {"error": f"{_kis_maintenance_hint()}\n\nKIS 미국 주문 요청 실패: {exc}"}
+        return _unknown(f"응답 해석 실패 ({type(exc).__name__}: {exc})")
     if data.get("rt_cd") != "0":
         return {"error": f"KIS 미국 주문 API 오류: {data.get('msg1', data)}", "raw": data}
     output = data.get("output", {})
@@ -1552,6 +1576,208 @@ def get_kis_fill_price_us(
         if attempt < max_attempts:
             time.sleep(retry_interval)
     return {"error": f"체결 내역에서 주문번호 {order_no} 미발견 (기간 {strt}~{end}, {max_attempts}회 시도)"}
+
+
+def parse_us_fill_row(row: dict | None, expected_qty: int) -> dict:
+    """
+    get_kis_fill_price_us가 돌려준 체결 내역 행(row)을 해석한다 (읽기 전용, 2026-11-06 결정 D5).
+
+    KIS 해외주식 주문체결내역 응답 필드(공식 문서 기준, 모의 실측 전):
+      ft_ccld_qty  체결수량 / ft_ccld_unpr3 체결단가 / nccs_qty 미체결수량
+    필드가 없거나 숫자가 아니거나, 체결수량이 주문수량과 다르거나, 미체결수량이 0이 아니면
+    "체결 확인 안 됨"(filled=False)으로 돌려준다 — 추정 금지(fail-safe).
+    """
+    if not isinstance(row, dict):
+        return {"filled": False, "reason": "체결 행 없음"}
+    def _num(key):
+        v = row.get(key, row.get(key.upper()))
+        try:
+            return float(str(v).replace(",", "").strip())
+        except (TypeError, ValueError):
+            return None
+    qty = _num("ft_ccld_qty")
+    price = _num("ft_ccld_unpr3")
+    nccs = _num("nccs_qty")
+    if qty is None or price is None or nccs is None:
+        return {"filled": False, "reason": "체결 행 필드(ft_ccld_qty·ft_ccld_unpr3·nccs_qty) 확인 불가",
+                "keys": sorted(row.keys())[:40]}
+    if int(qty) != int(expected_qty) or int(nccs) != 0 or price <= 0:
+        return {"filled": False, "fill_qty": int(qty), "nccs_qty": int(nccs), "fill_price": price,
+                "reason": f"미체결 또는 부분체결 (체결 {int(qty)} / 주문 {expected_qty} / 미체결 {int(nccs)})"}
+    return {"filled": True, "fill_qty": int(qty), "fill_price": round(price, 2), "nccs_qty": 0}
+
+
+def count_us_live_buys_today(now: datetime | None = None) -> dict:
+    """
+    오늘(뉴욕 현지 날짜 기준) 장부에 기록된 미국 자동매수(A·B, currency USD, BUY) 건수 (읽기 전용, D2).
+    장부를 읽지 못하면 {"error": ...} — 호출부는 실주문을 하지 않는다(fail-safe).
+    """
+    from zoneinfo import ZoneInfo
+    ny = ZoneInfo("America/New_York")
+    if now is None:
+        now = datetime.now(ZoneInfo("Asia/Seoul"))
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=ZoneInfo("Asia/Seoul"))
+    today_ny = now.astimezone(ny).date()
+    log = get_trade_log()
+    if "error" in log:
+        return {"error": f"장부 읽기 실패: {log['error']}"}
+    n = 0
+    for t in log.get("trades", []):
+        if t.get("currency") != "USD" or t.get("side") != "BUY" or t.get("rule_tag") not in ("A", "B"):
+            continue
+        try:
+            ts = datetime.fromisoformat(str(t.get("timestamp")))
+        except ValueError:
+            return {"error": f"장부 timestamp 해석 실패: {t.get('timestamp')!r}"}
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=ZoneInfo("Asia/Seoul"))
+        if ts.astimezone(ny).date() == today_ny:
+            n += 1
+    return {"count": n, "today_ny": today_ny.isoformat()}
+
+
+# 2026-11-10 보완(4a) — auto_trader.ORDER_UNKNOWN_LOCK_US_PATH 와 같은 파일 (읽기만 한다)
+ORDER_UNKNOWN_LOCK_US_PATH_FOR_BOOK = str(_BASE_DIR / "order_unknown_lock_us.json")
+
+
+def us_book_from_lock(order_date: str, dry_run: bool = True) -> dict:
+    """
+    미국 실주문 "미체결로 판정됐지만 실제로는 체결된" 1주를 장부에 사후 기록한다 (2026-11-10 보완 4a).
+
+    언제 쓰나: 미국 잠금 파일(order_unknown_lock_us.json)에 kind "unfilled" 사건이 남은 날,
+    감자가 KIS 앱(해외 체결/잔고)에서 실제 체결을 확인한 뒤. 국내 reconcile처럼
+    드라이런(R) → --write(W) 두 번에 나눠 실행한다.
+
+    동작
+    ----
+    1. 미국 잠금 파일을 읽는다(쓰지 않는다 — 잠금 해제는 감자가 파일을 옮겨서).
+    2. 대상 = kind "unfilled" + order_date(KST YYYYMMDD)가 인자와 같음 + order_no 있음
+       + rule_tag가 A/B + recorded_at(주문 밤 시각) 있음. 같은 order_no는 한 번만.
+    3. 같은 order_no의 미국 장부 레코드가 이미 있으면 건너뜀(두 번 기록 방지).
+    4. get_kis_fill_price_us(..., max_attempts=1)로 1회 조회 → parse_us_fill_row로 전량 체결일 때만 기록.
+       부분체결·필드 확인 불가·조회 실패는 건너뜀(사유 포함) — 추정 기록 금지.
+    5. 장부 레코드: timestamp = 사건의 recorded_at(주문 밤, 하루 1건 집계가 주문 날짜로 잡히도록),
+       price = 체결가, price_source = "fill_avg_retro", currency USD, booked_at = 기록 시각.
+    6. dry_run=False일 때만 /tmp 백업 → 임시 파일 → os.replace (reconcile과 같은 원자적 쓰기).
+
+    Returns {"date", "targets", "booked", "skipped", "dry_run"} / 실패 시 {"error": ...}
+    """
+    import json
+    import os
+    import shutil
+    from zoneinfo import ZoneInfo
+    kst = ZoneInfo("Asia/Seoul")
+
+    order_date = str(order_date).strip()
+    if len(order_date) != 8 or not order_date.isdigit():
+        return {"error": f"order_date는 YYYYMMDD 8자리여야 합니다: '{order_date}'"}
+
+    if not os.path.exists(ORDER_UNKNOWN_LOCK_US_PATH_FOR_BOOK):
+        return {"date": order_date, "targets": [], "booked": [], "skipped": [], "dry_run": dry_run,
+                "note": "미국 잠금 파일 없음 — 대상 없음"}
+    try:
+        with open(ORDER_UNKNOWN_LOCK_US_PATH_FOR_BOOK, "r", encoding="utf-8") as f:
+            lock = json.load(f)
+        events = lock.get("events")
+        if not isinstance(events, list):
+            raise ValueError("events가 list가 아님")
+    except Exception as exc:
+        return {"error": f"미국 잠금 파일 읽기 실패 — 중단: {exc}"}
+
+    try:
+        with open(TRADE_LOG_PATH, "r", encoding="utf-8") as f:
+            records = json.load(f)
+    except FileNotFoundError:
+        records = []
+    except json.JSONDecodeError as exc:
+        return {"error": f"trade_log.json 파싱 실패 — 장부가 손상됐을 수 있어 중단합니다: {exc}"}
+    if not isinstance(records, list):
+        return {"error": f"trade_log.json 최상위가 list가 아님 ({type(records).__name__})"}
+
+    booked_nos = {str(r.get("order_no") or "").strip() for r in records
+                  if isinstance(r, dict) and r.get("currency") == "USD"}
+
+    targets: list[dict] = []
+    skipped: list[dict] = []
+    planned: list[dict] = []
+    seen: set[str] = set()
+    now_iso = datetime.now(kst).isoformat(timespec="seconds")
+    for ev in events:
+        if not isinstance(ev, dict) or ev.get("kind") != "unfilled":
+            continue
+        if str(ev.get("order_date") or "") != order_date:
+            continue
+        no = str(ev.get("order_no") or "").strip()
+        brief = {"order_no": no, "ticker": ev.get("ticker"), "qty": ev.get("qty"),
+                 "rule_tag": ev.get("rule_tag"), "recorded_at": ev.get("recorded_at")}
+        if not no:
+            skipped.append({**brief, "reason": "order_no 없음 — 자동 기록 대상 아님"}); continue
+        if no in seen:
+            continue
+        seen.add(no)
+        targets.append(brief)
+        if ev.get("rule_tag") not in ("A", "B"):
+            skipped.append({**brief, "reason": "rule_tag가 A/B가 아님 — 수동 판단"}); continue
+        if not ev.get("recorded_at"):
+            skipped.append({**brief, "reason": "recorded_at 없음 — 주문 시각 불명"}); continue
+        if no in booked_nos:
+            skipped.append({**brief, "reason": "같은 주문번호가 이미 장부에 있음 — 두 번 기록하지 않음"}); continue
+        try:
+            qty = int(ev.get("qty"))
+        except (TypeError, ValueError):
+            skipped.append({**brief, "reason": "qty 해석 실패"}); continue
+        ticker = str(ev.get("ticker") or "").strip()
+        f = get_kis_fill_price_us(no, ticker, qty, order_date, max_attempts=1)
+        if not isinstance(f, dict) or "error" in f:
+            skipped.append({**brief, "reason": f"체결 재조회 실패: {(f or {}).get('error') if isinstance(f, dict) else f}"}); continue
+        parsed = parse_us_fill_row(f.get("row"), qty)
+        if not parsed.get("filled"):
+            skipped.append({**brief, "reason": f"전량 체결 확인 안 됨: {parsed.get('reason')}"}); continue
+        entry = {
+            "timestamp": ev.get("recorded_at"),
+            "rule_tag": ev.get("rule_tag"),
+            "ticker": ticker,
+            "side": "BUY",
+            "qty": qty,
+            "price": parsed["fill_price"],
+            "reason": (f"[us_book {now_iso}] 규칙 {ev.get('rule_tag')} 미국 자동매수 사후 기록 "
+                       f"(지정가 {ev.get('limit_price_usd')} USD, 주문 밤 체결 확인 실패 → 잠금 → 체결 재조회)"),
+            "sector": ev.get("sector"),
+            "source_rule": None,
+            "order_no": no,
+            "price_source": "fill_avg_retro",
+            "fill_reason": "us_book: 미국 잠금 unfilled 사건 사후 기록",
+            "currency": "USD",
+            "exchange": ev.get("exchange"),
+            "booked_at": now_iso,
+        }
+        planned.append(entry)
+
+    booked = [{"order_no": e["order_no"], "ticker": e["ticker"], "qty": e["qty"], "price": e["price"],
+               "rule_tag": e["rule_tag"], "timestamp": e["timestamp"]} for e in planned]
+    result = {"date": order_date, "targets": targets, "booked": booked,
+              "skipped": skipped, "dry_run": dry_run}
+    if dry_run or not planned:
+        return result
+
+    backup_path = f"/tmp/trade_log_backup_{datetime.now(kst).strftime('%Y%m%d_%H%M%S')}_usbook.json"
+    try:
+        if os.path.exists(TRADE_LOG_PATH):
+            shutil.copy2(TRADE_LOG_PATH, backup_path)
+    except Exception as exc:
+        return {"error": f"백업 실패 — 기록을 중단합니다: {exc}"}
+    tmp_path = TRADE_LOG_PATH + ".tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(records + planned, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, TRADE_LOG_PATH)
+    except Exception as exc:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        return {"error": f"장부 쓰기 실패(백업은 {backup_path}에 있음): {exc}"}
+    result["backup"] = backup_path
+    return result
 
 
 # ═══════════════════════════════════════════════
@@ -3751,6 +3977,8 @@ def evaluate_buy_rule_A(market: str = "ALL", universe_limit: int | None = None) 
     return {
         "rule":  "A — 점수 집중",
         "as_of": datetime.now().isoformat(timespec="seconds"),
+        "screen_scored": screened.get("scored"),           # 2026-11-06 D6 — 스크리너 점수화 종목 수
+        "screen_total":  screened.get("total_evaluated"),  # 2026-11-06 D6 — 스크리너 평가 대상 수
         "params": {
             "buy_score_min":  BUY_SCORE_MIN,
             "max_candidates": MAX_CANDIDATES,
@@ -3985,6 +4213,8 @@ def evaluate_buy_rule_B(market: str = "ALL", universe_limit: int | None = None) 
     return {
         "rule":  "B — 분산 채우기",
         "as_of": datetime.now().isoformat(timespec="seconds"),
+        "screen_scored": screened.get("scored"),           # 2026-11-06 D6 — 스크리너 점수화 종목 수
+        "screen_total":  screened.get("total_evaluated"),  # 2026-11-06 D6 — 스크리너 평가 대상 수
         "params": {
             "buy_score_min":          BUY_SCORE_MIN,
             "max_candidates":         MAX_CANDIDATES,
@@ -5481,6 +5711,24 @@ if __name__ == "__main__":
             sys.exit(1)
         print(f"\n[reconcile] {'드라이런' if not _write else '실제 보정'} — "
               f"대상 {len(_res['targets'])}건 / 보정 {len(_res['corrected'])}건 / "
+              f"건너뜀 {len(_res['skipped'])}건")
+        sys.exit(0)
+
+    # "./venv/bin/python tools.py us_book 20261116 [--write]" → 미국 잠금 unfilled 사건의
+    # 실제 체결을 재조회해 장부에 사후 기록 (2026-11-10 보완 4a). --write 없으면 드라이런.
+    if "us_book" in sys.argv[1:]:
+        _args = [a for a in sys.argv[1:] if a != "us_book"]
+        _write = "--write" in _args
+        _dates = [a for a in _args if a != "--write"]
+        if len(_dates) != 1:
+            print("사용법: tools.py us_book YYYYMMDD [--write]")
+            sys.exit(2)
+        _res = us_book_from_lock(_dates[0], dry_run=not _write)
+        print(json.dumps(_res, ensure_ascii=False, indent=2, default=str))
+        if "error" in _res:
+            sys.exit(1)
+        print(f"\n[us_book] {'드라이런' if not _write else '실제 기록'} — "
+              f"대상 {len(_res['targets'])}건 / 기록 {len(_res['booked'])}건 / "
               f"건너뜀 {len(_res['skipped'])}건")
         sys.exit(0)
 
