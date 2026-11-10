@@ -3,7 +3,11 @@
 같은 날 20:59 "가장자리 말고 중간화면에 크게" → 사이드바에서 본문으로 옮김).
 
 원칙
-- KIS·네트워크 호출 0. tools.py도 import하지 않는다(토큰·잔고 창구를 절대 건드리지 않음).
+- 기본 화면은 KIS·네트워크 호출 0. tools.py도 import하지 않는다(토큰·잔고 창구를 절대 건드리지 않음).
+- 예외(2026-11-10 21:07 감자 결정): "📡 지금 시세로 다시 계산" 버튼을 **누를 때만** tools.py의 읽기 전용
+  함수(get_auto_trade_positions · get_quote · calc_auto_trade_pnl)로 시세를 가져와 계산한다.
+  시세 출처는 FinanceDataReader(네이버·야후)이고 KIS가 아니다. 결과는 화면에만 보여 주고 저장하지 않는다
+  (kill_switch_state.json 무변경). 회차 시간대(08:50–09:10 · 11:25–11:35 · 23:35–23:50 KST)에는 버튼을 막는다.
 - 봇이 이미 저장한 파일만 읽는다. 봇은 이 파일들을 tmp + os.replace(원자적)로 저장하므로
   회차 도중에 읽어도 깨진 파일을 읽지 않는다.
 - 어떤 파일도 쓰거나 고치지 않는다. 읽기에 실패하면 그 칸만 "확인 불가"로 표시하고 계속한다.
@@ -326,6 +330,10 @@ def render_main() -> None:
         if d.get("lock_kr"):
             st.warning("⛔ 국내 결과 미확인 잠금 중")
 
+        # 2026-11-10 21:07 — 버튼을 누를 때만 지금 시세로 다시 계산(저장 없음)
+        _names = {r["코드"]: r["종목"] for r in _holdings_rows(d)}
+        render_live(_names)
+
         left, right = st.columns([1, 1])
         with left:
             st.markdown("**봇 보유 종목** (장부 기준)")
@@ -366,3 +374,128 @@ def render_main() -> None:
             times.append(f"미국 {d['us_log']['file'][14:22]} {d['us_log']['last_time']}")
         head = ("마지막 회차: " + " / ".join(times) + " · ") if times else ""
         st.caption(head + "숫자는 회차가 끝날 때 바뀝니다(새로고침). ⚠️ 참고용 화면이며 투자 권유가 아닙니다.")
+
+
+# ── 2026-11-10 21:07 — "지금 시세로 다시 계산" (버튼을 누를 때만, 저장 없음) ──
+_BUSY_WINDOWS = (("08:50", "09:10"), ("11:25", "11:35"), ("23:35", "23:50"))
+
+
+def busy_window(now: datetime | None = None) -> str | None:
+    """회차 시간대(KST)면 그 구간 문자열, 아니면 None. 이때는 시세 재계산 버튼을 막는다."""
+    from zoneinfo import ZoneInfo
+    kst = ZoneInfo("Asia/Seoul")
+    now = now.astimezone(kst) if (now and now.tzinfo) else (now.replace(tzinfo=kst) if now else datetime.now(kst))
+    hm = now.strftime("%H:%M")
+    for a, b in _BUSY_WINDOWS:
+        if a <= hm < b:
+            return f"{a}–{b}"
+    return None
+
+
+def live_snapshot(tools_mod=None) -> dict:
+    """
+    지금 시세로 자동매매분 손익을 다시 계산한다(읽기 전용, 저장 없음).
+    시세는 tools.get_quote(FinanceDataReader), 환율은 tools 내부 FinanceDataReader — KIS 호출 없음.
+    하나라도 못 가져오면 {"error": ...} — 근사치 금지(봇과 같은 원칙).
+    """
+    if tools_mod is None:
+        import tools as tools_mod  # 버튼을 누를 때만 불러온다
+    pos = tools_mod.get_auto_trade_positions()
+    if not isinstance(pos, dict) or "error" in pos:
+        return {"error": f"장부 보유 계산 실패: {(pos or {}).get('error') if isinstance(pos, dict) else pos}"}
+    combined = (pos.get("combined") or {}).get("positions") or {}
+    by_rule = pos.get("by_rule") or {}
+    prices: dict = {}
+    for tk in sorted(combined):
+        q = tools_mod.get_quote(tk)
+        if not isinstance(q, dict) or "error" in q or q.get("close") is None:
+            return {"error": f"시세 조회 실패({tk}) — 근사치 없이 중단"}
+        prices[tk] = float(q["close"])
+    pnl = tools_mod.calc_auto_trade_pnl(price_overrides=prices)
+    if not isinstance(pnl, dict) or "error" in pnl:
+        return {"error": f"손익 계산 실패: {(pnl or {}).get('error') if isinstance(pnl, dict) else pnl}"}
+    rows = []
+    for tk, p in sorted(combined.items()):
+        avg = float(p.get("avg_price") or 0)
+        price = prices.get(tk)
+        qa = ((by_rule.get("A") or {}).get("positions") or {}).get(tk, {}).get("qty", 0)
+        qb = ((by_rule.get("B") or {}).get("positions") or {}).get(tk, {}).get("qty", 0)
+        usd = p.get("market") == "US"
+        rows.append({
+            "ticker": tk, "qty": p.get("qty"), "A": qa, "B": qb, "usd": usd,
+            "avg": avg, "price": price,
+            "pct": ((price - avg) / avg * 100) if (avg and price is not None) else None,
+        })
+    br = pnl.get("by_rule") or {}
+    from zoneinfo import ZoneInfo
+    return {
+        "at": datetime.now(ZoneInfo("Asia/Seoul")).isoformat(timespec="seconds"),
+        "cumulative_pct": pnl.get("cumulative_pnl_pct"),
+        "cumulative_krw": pnl.get("cumulative_pnl_krw"),
+        "realized_krw": pnl.get("realized_pnl_krw"),
+        "unrealized_krw": pnl.get("unrealized_pnl_krw"),
+        "eval_krw": pnl.get("eval_krw"),
+        "A_pct": (br.get("A") or {}).get("cumulative_pnl_pct"),
+        "B_pct": (br.get("B") or {}).get("cumulative_pnl_pct"),
+        "A_krw": (br.get("A") or {}).get("cumulative_pnl_krw"),
+        "B_krw": (br.get("B") or {}).get("cumulative_pnl_krw"),
+        "rows": rows,
+        "warnings": list(pnl.get("warnings") or [])[:5],
+    }
+
+
+def _won(v) -> str:
+    return f"{v:+,.0f}원" if isinstance(v, (int, float)) else "확인 불가"
+
+
+def render_live(names: dict | None = None) -> None:
+    """성적표 안에서 호출. 버튼을 누를 때만 시세를 가져온다."""
+    import streamlit as st
+
+    busy = busy_window()
+    c1, c2 = st.columns([1, 3])
+    with c1:
+        clicked = st.button("📡 지금 시세로 다시 계산", disabled=bool(busy),
+                            help="누를 때만 네이버·야후 시세(FinanceDataReader)로 계산합니다. KIS 호출 없음, 저장 없음.")
+    with c2:
+        if busy:
+            st.caption(f"회차 시간대({busy} KST)라 시세 재계산을 잠시 막았습니다. 봇 회차가 끝난 뒤 눌러 주세요.")
+        else:
+            st.caption("위 숫자는 마지막 회차 값입니다. 버튼을 누르면 지금 시세로 다시 계산해 아래에 보여 줍니다(몇 초 걸림, 시세는 몇 분 늦을 수 있음).")
+    if clicked:
+        with st.spinner("시세 가져오는 중…"):
+            try:
+                st.session_state["pv_live"] = live_snapshot()
+            except Exception as e:  # noqa: BLE001
+                st.session_state["pv_live"] = {"error": f"계산 실패: {type(e).__name__}"}
+    live = st.session_state.get("pv_live")
+    if not live:
+        return
+    if "error" in live:
+        st.warning(f"지금 시세 계산 확인 불가 — {live['error']}")
+        return
+    st.markdown(f"**📡 지금 시세 기준** ({str(live['at'])[:19].replace('T', ' ')} 계산 · 저장 안 함)")
+    m0, m1, m2, m3 = st.columns(4)
+    m0.metric("누적 수익률 (A+B)", _pct(live["cumulative_pct"]), _won(live["cumulative_krw"]), delta_color="normal")
+    m1.metric("규칙 A", _pct(live["A_pct"]), _won(live["A_krw"]), delta_color="normal")
+    m2.metric("규칙 B", _pct(live["B_pct"]), _won(live["B_krw"]), delta_color="normal")
+    m3.metric("평가 손익 (보유 중)", _won(live["unrealized_krw"]))
+    st.caption(f"실현 손익(이미 판 것) {_won(live['realized_krw'])} · 평가 손익(들고 있는 것) {_won(live['unrealized_krw'])} "
+               f"= 누적 {_won(live['cumulative_krw'])} · 지금 평가액 {_won(live['eval_krw']).lstrip('+')}")
+    names = names or {}
+    table = []
+    for r in live["rows"]:
+        unit = "USD" if r["usd"] else "원"
+        fmt = (lambda v: f"{v:,.2f}") if r["usd"] else (lambda v: f"{v:,.0f}")
+        table.append({
+            "종목": names.get(r["ticker"]) or r["ticker"], "코드": r["ticker"],
+            "수량": r["qty"], "규칙 A": r["A"], "규칙 B": r["B"],
+            f"평균 매수가": f"{fmt(r['avg'])} {unit}" if r["avg"] else "—",
+            "지금 가격": f"{fmt(r['price'])} {unit}" if r["price"] is not None else "—",
+            "수익률": f"{r['pct']:+.2f}%" if isinstance(r["pct"], (int, float)) else "—",
+        })
+    if table:
+        st.dataframe(table, hide_index=True, use_container_width=True)
+    if live.get("warnings"):
+        st.caption("계산 경고: " + " / ".join(str(w)[:80] for w in live["warnings"]))
+    st.caption("평균 매수가는 장부 기준(규칙 A·B 합산), 수익률은 수수료 제외. 기준 6,000만 원 분모는 킬스위치와 같음.")
