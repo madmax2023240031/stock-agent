@@ -1,5 +1,6 @@
 """
-📈 자동매매 성적표 — 웹앱(app.py) 사이드바용 읽기 전용 화면 (2026-11-10 감자 요청·확정).
+📈 자동매매 성적표 — 웹앱(app.py) 본문 맨 위에 크게 띄우는 읽기 전용 화면 (2026-11-10 감자 요청·확정,
+같은 날 20:59 "가장자리 말고 중간화면에 크게" → 사이드바에서 본문으로 옮김).
 
 원칙
 - KIS·네트워크 호출 0. tools.py도 import하지 않는다(토큰·잔고 창구를 절대 건드리지 않음).
@@ -174,6 +175,18 @@ def collect(base_dir: str | Path | None = None, now: datetime | None = None) -> 
             r.get("decision") in _US_LIVE_DECISIONS
             or (r.get("decision") == "ERROR" and r.get("currency") == "USD"
                 and bool((r.get("execution") or {}).get("executed"))))]
+        # 국내 마지막 매도 평가 요약의 손절 보류 목록 (보유 유지 줄에 안 찍히는 종목)
+        kr_sell = [r for r in recs if isinstance(r, dict) and r.get("rule_tag") == "SELL"
+                   and r.get("decision") == "EVAL_SUMMARY" and str(r.get("timestamp", ""))[11:13] < "20"]
+        if kr_sell:
+            last = kr_sell[-1]
+            ds = (last.get("eval_summary") or {}).get("stop_loss_deferred") or []
+            out["deferred"] = {
+                "timestamp": last.get("timestamp"),
+                "items": [{"ticker": str(x.get("ticker")), "name": x.get("name"),
+                           "pct": x.get("profit_loss_pct"), "note": x.get("trend_note")}
+                          for x in ds if isinstance(x, dict)],
+            }
         out["us_live"] = [
             {"timestamp": r.get("timestamp"), "decision": r.get("decision"), "ticker": r.get("ticker"),
              "limit": (r.get("execution") or {}).get("limit_price_usd"),
@@ -256,3 +269,100 @@ def render_sidebar() -> None:
         if times:
             st.caption("마지막 회차: " + " / ".join(times))
         st.caption("⚠️ 참고용 화면이며 투자 권유가 아닙니다.")
+
+
+def _holdings_rows(d: dict) -> list[dict]:
+    """장부 보유 + 로그 '보유 유지' 수익률 + 손절 보류 목록을 한 표로 합친다."""
+    names, pcts, state = {}, {}, {}
+    for it in (d.get("kr_log") or {}).get("hold", []):
+        names[it["ticker"]] = it["name"]; pcts[it["ticker"]] = it["pct"]; state[it["ticker"]] = "보유 유지"
+    for it in (d.get("deferred") or {}).get("items", []):
+        names.setdefault(it["ticker"], it.get("name"))
+        if isinstance(it.get("pct"), (int, float)):
+            pcts[it["ticker"]] = it["pct"]
+        state[it["ticker"]] = "손절 보류"
+    rows = []
+    for tk, p in sorted(((d.get("ledger") or {}).get("positions") or {}).items()):
+        pct = pcts.get(tk)
+        rows.append({
+            "종목": names.get(tk) or tk,
+            "코드": tk,
+            "규칙 A": p["A"],
+            "규칙 B": p["B"],
+            "수익률": f"{pct:+.2f}%" if isinstance(pct, (int, float)) else "—",
+            "상태": state.get(tk, "로그에 없음" + (" (미국)" if p["currency"] == "USD" else "")),
+        })
+    return rows
+
+
+def render_main() -> None:
+    """app.py 본문 맨 위(제목 아래)에서 호출. 어떤 오류가 나도 사이트는 계속 뜬다."""
+    import streamlit as st
+
+    try:
+        d = collect()
+    except Exception as e:  # noqa: BLE001
+        st.caption(f"📈 자동매매 성적 — 확인 불가({type(e).__name__})")
+        return
+
+    with st.expander("📈 자동매매 성적 (읽기 전용 · KIS 호출 없음)", expanded=True):
+        ks = d.get("ks")
+        if ks:
+            c0, c1, c2, c3 = st.columns(4)
+            c0.metric("누적 수익률 (A+B)", _pct(ks["cumulative"]),
+                      help=f"기준 {KS_BASE_KRW:,}원(A·B 각 3,000만), 실현+평가. 킬스위치 {KS_CUMULATIVE_LIMIT_PCT}%")
+            c1.metric("규칙 A", _pct(ks["A"]))
+            c2.metric("규칙 B", _pct(ks["B"]))
+            c3.metric("오늘", _pct(ks["daily"]), help=f"킬스위치 {KS_DAILY_LIMIT_PCT}%")
+            st.caption(f"계산 시각 {str(ks['at'] or '확인 불가')[:19].replace('T', ' ')} — 마지막 회차가 저장한 킬스위치 계산값. "
+                       f"기준 {KS_BASE_KRW:,}원, 실현+평가.")
+            if ks["daily_triggered"] or ks["cumulative_triggered"]:
+                st.error("⛔ 킬스위치 발동 상태")
+        else:
+            st.caption(f"손익률 확인 불가 — kill_switch_state.json {d.get('ks_error', '')}")
+
+        if d.get("lock_us"):
+            st.warning("⛔ 미국 실주문 잠금 중 — KIS 앱 해외 체결 확인 필요")
+        if d.get("lock_kr"):
+            st.warning("⛔ 국내 결과 미확인 잠금 중")
+
+        left, right = st.columns([1, 1])
+        with left:
+            st.markdown("**봇 보유 종목** (장부 기준)")
+            rows = _holdings_rows(d)
+            if rows:
+                st.dataframe(rows, hide_index=True, use_container_width=True)
+                kr = d.get("kr_log") or {}
+                st.caption(f"수익률: 국내 로그 {kr.get('file', '')[11:19]} {kr.get('hold_time') or ''} '보유 유지' 줄 · "
+                           "손절 보류 종목은 그 회차 매도 평가 요약 값")
+            elif d.get("ledger_error"):
+                st.caption(f"장부 확인 불가 — {d['ledger_error']}")
+            else:
+                st.caption("봇 보유 없음")
+        with right:
+            lg = d.get("ledger")
+            if lg:
+                st.markdown(f"**최근 거래** (장부 {lg['total']}건)")
+                recent = []
+                for t in lg["recent"]:
+                    price = t.get("price")
+                    ptxt = (f"{price:,.2f} USD" if t.get("currency") == "USD" else f"{price:,.0f}원") \
+                        if isinstance(price, (int, float)) else "—"
+                    recent.append({"시각": str(t.get("timestamp"))[:16].replace("T", " "),
+                                   "규칙": t.get("rule_tag"), "매매": t.get("side"), "종목": t.get("ticker"),
+                                   "수량": t.get("qty"), "가격": ptxt})
+                st.dataframe(recent, hide_index=True, use_container_width=True)
+
+        if d.get("us_live"):
+            st.markdown("**미국 실주문 최근 결과**")
+            st.dataframe([{"시각": str(r["timestamp"])[:16].replace("T", " "), "결과": r["decision"],
+                           "종목": r["ticker"], "지정가(USD)": r["limit"], "주문번호": r["order_no"] or "—"}
+                          for r in d["us_live"]], hide_index=True, use_container_width=True)
+
+        times = []
+        if d.get("kr_log"):
+            times.append(f"국내 {d['kr_log']['file'][11:19]} {d['kr_log']['last_time']}")
+        if d.get("us_log"):
+            times.append(f"미국 {d['us_log']['file'][14:22]} {d['us_log']['last_time']}")
+        head = ("마지막 회차: " + " / ".join(times) + " · ") if times else ""
+        st.caption(head + "숫자는 회차가 끝날 때 바뀝니다(새로고침). ⚠️ 참고용 화면이며 투자 권유가 아닙니다.")

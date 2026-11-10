@@ -11,9 +11,6 @@ if "quick_question" not in st.session_state:
 
 # 사이드바 (조직도 — st.expander 방식, HTML 렌더링 오류 없음)
 with st.sidebar:
-    # 2026-11-10 — 자동매매 성적표(봇이 저장한 파일만 읽음, KIS·네트워크 호출 0)
-    pnl_view.render_sidebar()
-
     # CSS: 한 줄 문자열 연결로 작성 → Markdown이 코드 블록으로 오인하는 4칸 들여쓰기 원천 차단
     st.markdown(
         "<style>"
@@ -143,6 +140,9 @@ with st.sidebar:
 
 st.title("🤖 주식 투자 총괄 매니저")
 st.markdown("궁금한 주식 종목이나 시황을 물어보세요! (예: 삼성전자 현재가 알려줘, 애플이랑 테슬라 비교해줘)")
+
+# 2026-11-10 — 자동매매 성적표(봇이 저장한 파일만 읽음, KIS·네트워크 호출 0), 본문 맨 위에 크게
+pnl_view.render_main()
 
 # 기존 대화 표시
 for msg in st.session_state.messages:
