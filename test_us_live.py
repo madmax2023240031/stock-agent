@@ -119,6 +119,7 @@ def _fake_fill(order_no, ticker, expected_qty, order_date_kst, **k):
     return {"error": "가짜 체결 조회 실패"}
 
 
+_REAL_FILL_US = tools.get_kis_fill_price_us   # 2026-11-11 U30: 실제 함수의 주문번호 비교 시험용
 tools.get_kis_fill_price_us = _fake_fill
 
 SCORED = {"n": 500}
@@ -371,10 +372,10 @@ try:
     check("U19 None", not tools.parse_us_fill_row(None, 1)["filled"])
     check("U19 대문자 키", tools.parse_us_fill_row({"FT_CCLD_QTY": "1", "FT_CCLD_UNPR3": "10", "NCCS_QTY": "0"}, 1)["filled"])
 
-    print("[U20] 코드 규칙: auto_trader.py에 dry_run=False 리터럴 0건, US_MODE 기본값 dry_run")
+    print("[U20] 코드 규칙: auto_trader.py에 dry_run=False 리터럴 0건, US_MODE 값 live(2026-11-10 775d8da 운영 반영)")
     src = open(BASE / "auto_trader.py", encoding="utf-8").read()
     check("U20 dry_run=False 0건", src.count("dry_run=False") == 0)
-    check("U20 US_MODE 값 dry_run", '\nUS_MODE = "dry_run"\n' in src)
+    check("U20 US_MODE 값 live", '\nUS_MODE = "live"\n' in src)
 
     # ── 2026-11-10 보완 패치 시험 (U22–U29) ──
     print("[U22] 보완(4b): 체결 확인 6회 × 10초 상수, 미체결이면 6번 조회")
@@ -481,6 +482,47 @@ try:
     check("U29 깨짐 오류", "error" in tools.us_book_from_lock("20261109"))
     check("U29 날짜 오류", "error" in tools.us_book_from_lock("2026-11-09"))
     check("U29 장부 0", ledger() == [])
+
+    # ── 2026-11-11 시험 (U30): 미국 체결 조회의 주문번호 비교 — 앞 0 차이 ──
+    print("[U30] get_kis_fill_price_us: 응답 odno '38202'(앞 0 없음) ↔ 주문번호 '0000038202' 같은 주문으로 찾음")
+    _U30 = {"rows": [], "calls": 0}
+
+    class _U30Resp(_Resp):
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise requests.exceptions.HTTPError(f"{self.status_code}")
+
+    def _u30_get(url, params=None, headers=None, timeout=None, **kw):
+        _U30["calls"] += 1
+        assert "openapivts" in url and "inquire-ccnl" in url, url
+        return _U30Resp(200, {"rt_cd": "0", "msg1": "모의투자 조회가 완료되었습니다.", "output": list(_U30["rows"]),
+                           "ctx_area_nk200": "", "ctx_area_fk200": ""})
+
+    _row = {"odno": "38202", "orgn_odno": "0", "pdno": "APP", "ord_dt": "20261110", "ord_tmd": "234106",
+            "sll_buy_dvsn_cd": "02", "ft_ord_qty": "1", "ft_ccld_qty": "1", "ft_ccld_unpr3": "402.28000000", "nccs_qty": "0"}
+    requests.get = _u30_get
+    try:
+        _U30["rows"] = [_row]
+        _r = _REAL_FILL_US("0000038202", "APP", 1, "20261110", max_attempts=1)
+        check("U30 찾음", "row" in _r and _r["row"]["odno"] == "38202", _r)
+        check("U30 반환 주문번호는 원래 값", _r.get("order_no") == "0000038202", _r)
+        _p = tools.parse_us_fill_row(_r.get("row"), 1)
+        check("U30 판정 전량 402.28", _p.get("filled") is True and _p.get("fill_price") == 402.28, _p)
+        _r = _REAL_FILL_US("38202", "APP", 1, "20261110", max_attempts=1)
+        check("U30 짧은 번호로도 찾음", "row" in _r, _r)
+        _U30["rows"] = [dict(_row, odno="0000038202")]
+        check("U30 응답이 10자리여도 찾음", "row" in _REAL_FILL_US("0000038202", "APP", 1, "20261110", max_attempts=1))
+        print("[U30b] 다른 번호·빈 번호는 찾지 않음")
+        _U30["rows"] = [dict(_row, odno="382020"), dict(_row, odno="138202"), dict(_row, odno=""), dict(_row, odno="0")]
+        _r = _REAL_FILL_US("0000038202", "APP", 1, "20261110", max_attempts=2, retry_interval=0)
+        check("U30b 미발견", "error" in _r and "미발견" in _r["error"], _r)
+        _r = _REAL_FILL_US("", "APP", 1, "20261110", max_attempts=1)
+        check("U30b 빈 주문번호는 빈 odno와 맞추지 않음", "error" in _r, _r)
+        _r = _REAL_FILL_US("0000000000", "APP", 1, "20261110", max_attempts=1)
+        check("U30b 0뿐인 주문번호도 맞추지 않음", "error" in _r, _r)
+        check("U30 조회 수", _U30["calls"] == 7, _U30["calls"])
+    finally:
+        requests.get = _fake_get
 
     print("[U21] 실제 장부 파일 무접촉")
     check("U21 실제 장부 경로 다름", os.path.abspath(tools.TRADE_LOG_PATH) != os.path.abspath(REAL_TRADE_LOG))

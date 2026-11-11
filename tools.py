@@ -1567,7 +1567,11 @@ def get_kis_fill_price_us(
                 return {"error": f"KIS 미국 체결 조회 API 오류: {data.get('msg1', data)}", "raw": data}
             time.sleep(retry_interval); continue
         rows = data.get("output", []) or []
-        hit = [r for r in rows if r.get("odno", r.get("ODNO", "")) == order_no]
+        # 2026-11-11: 모의 응답 odno는 앞 0이 빠진 모양('38202')으로 온다(D″ 실측) — 주문 응답 ODNO는
+        # '0000038202'. 국내 체결 조회(get_kis_fill_price·reconcile)처럼 앞 0을 떼고 비교한다.
+        _want = str(order_no or "").strip().lstrip("0")
+        hit = [r for r in rows
+               if _want and str(r.get("odno", r.get("ODNO", "")) or "").strip().lstrip("0") == _want]
         if hit:
             r = hit[0]
             return {"order_no": order_no, "ticker": ticker,
