@@ -469,7 +469,8 @@ def get_kis_balance() -> dict:
     # 다음 페이지 요청 시: 요청 헤더 tr_cont="N" + CTX_AREA_* 에 직전 응답값.
     _MAX_PAGES = 10   # 무한 루프 방지 상한 (최대 200종목)
     # 국내 잔고 HTTP 5xx(서버 오류) 1회 재시도 대기(초) — 2026-10-14 감자 확정.
-    # 5xx만 대상. 시간 초과·4xx·rt_cd 오류는 재시도하지 않는다(기존 동작 유지).
+    # 2026-11-21 안건 p(감자 확정): 응답 시간 초과(ReadTimeout)도 같은 대기로 1회 재시도.
+    # 연결 시간 초과(ConnectTimeout)·4xx·rt_cd 오류는 재시도하지 않는다(기존 동작 유지).
     _DOM_5XX_RETRY_WAIT = 2.0
 
     # ── 1. 국내주식 잔고 (VTTC8434R, 연속조회) ─────────────
@@ -500,12 +501,23 @@ def get_kis_balance() -> dict:
                 time.sleep(1.1)     # KIS 초당 거래건수 초과 방지
 
             for _dom_try in range(2):
-                resp = requests.get(
-                    f"{_KIS_DOMAIN}/uapi/domestic-stock/v1/trading/inquire-balance",
-                    headers={**base_headers, "tr_id": "VTTC8434R", "tr_cont": tr_cont_req},
-                    params=dom_params,
-                    timeout=10,
-                )
+                try:
+                    resp = requests.get(
+                        f"{_KIS_DOMAIN}/uapi/domestic-stock/v1/trading/inquire-balance",
+                        headers={**base_headers, "tr_id": "VTTC8434R", "tr_cont": tr_cont_req},
+                        params=dom_params,
+                        timeout=10,
+                    )
+                except requests.exceptions.ReadTimeout:
+                    # 안건 p: 응답 시간 초과는 첫 시도에서만 1회 재시도. 재시도도 시간 초과면
+                    # 그대로 올려 보내 기존처럼 "국내 잔고 조회 실패" ERROR가 된다.
+                    # (ConnectTimeout은 ReadTimeout의 자식이 아니므로 여기서 잡히지 않는다.)
+                    if _dom_try == 0:
+                        print(f"⚠️ get_kis_balance: 국내 잔고 요청 시간 초과(Read timed out) "
+                              f"(페이지 {dom_pages + 1}) — {_DOM_5XX_RETRY_WAIT:g}초 후 1회 재시도")
+                        time.sleep(_DOM_5XX_RETRY_WAIT)
+                        continue
+                    raise
                 if _dom_try == 0 and 500 <= resp.status_code < 600:
                     # URL에는 계좌번호가 들어 있으므로 상태 코드만 남긴다
                     print(f"⚠️ get_kis_balance: 국내 잔고 HTTP {resp.status_code} "
