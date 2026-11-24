@@ -60,3 +60,6 @@ order_unknown_lock.json
 
 # 2026-11-06 미국 실주문 잠금 파일 (D4·D5, 상태 파일 — 커밋 대상 아님)
 order_unknown_lock_us.json
+
+# Claude Code local settings/skills (2026-11-24)
+.claude/

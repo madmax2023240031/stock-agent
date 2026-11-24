@@ -1,0 +1,19 @@
+[theme]
+base = "dark"
+primaryColor = "#C8B27C"
+backgroundColor = "#0C0D0F"
+secondaryBackgroundColor = "#16181C"
+textColor = "#E9E6DF"
+borderColor = "#24272D"
+showWidgetBorder = true
+baseRadius = "small"
+greenColor = "#5FBF8F"
+redColor = "#E2706A"
+font = "Pretendard Variable:https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/variable/pretendardvariable-dynamic-subset.css, sans-serif"
+
+[theme.sidebar]
+backgroundColor = "#111215"
+secondaryBackgroundColor = "#17191D"
+
+[client]
+toolbarMode = "minimal"

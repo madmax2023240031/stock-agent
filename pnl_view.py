@@ -211,10 +211,10 @@ def render_sidebar() -> None:
     try:
         d = collect()
     except Exception as e:  # noqa: BLE001
-        st.caption(f"📈 자동매매 성적 — 확인 불가({type(e).__name__})")
+        st.caption(f"자동매매 성적 — 확인 불가({type(e).__name__})")
         return
 
-    with st.expander("📈 자동매매 성적 (읽기 전용 · KIS 호출 없음)", expanded=True):
+    with st.expander("자동매매 성적 · 읽기 전용, KIS 호출 없음", expanded=True):
         ks = d.get("ks")
         if ks:
             st.metric("누적 수익률 (A+B)", _pct(ks["cumulative"]),
@@ -225,14 +225,14 @@ def render_sidebar() -> None:
             c3.metric("오늘", _pct(ks["daily"]))
             st.caption(f"계산 시각 {ks['at'] or '확인 불가'} (마지막 회차 킬스위치 계산값)")
             if ks["daily_triggered"] or ks["cumulative_triggered"]:
-                st.error("⛔ 킬스위치 발동 상태")
+                st.error("킬스위치 발동 상태")
         else:
             st.caption(f"손익률 확인 불가 — kill_switch_state.json {d.get('ks_error', '')}")
 
         if d.get("lock_us"):
-            st.warning("⛔ 미국 실주문 잠금 중 — KIS 앱 해외 체결 확인 필요")
+            st.warning("미국 실주문 잠금 중 — KIS 앱 해외 체결 확인 필요")
         if d.get("lock_kr"):
-            st.warning("⛔ 국내 결과 미확인 잠금 중")
+            st.warning("국내 결과 미확인 잠금 중")
 
         kr = d.get("kr_log")
         if kr and kr.get("hold"):
@@ -272,7 +272,7 @@ def render_sidebar() -> None:
             times.append(f"미국 {d['us_log']['file'][14:22]} {d['us_log']['last_time']}")
         if times:
             st.caption("마지막 회차: " + " / ".join(times))
-        st.caption("⚠️ 참고용 화면이며 투자 권유가 아닙니다.")
+        st.caption("참고용 화면이며 투자 권유가 아닙니다.")
 
 
 def _holdings_rows(d: dict) -> list[dict]:
@@ -306,10 +306,10 @@ def render_main() -> None:
     try:
         d = collect()
     except Exception as e:  # noqa: BLE001
-        st.caption(f"📈 자동매매 성적 — 확인 불가({type(e).__name__})")
+        st.caption(f"자동매매 성적 — 확인 불가({type(e).__name__})")
         return
 
-    with st.expander("📈 자동매매 성적 (읽기 전용 · KIS 호출 없음)", expanded=True):
+    with st.expander("자동매매 성적 · 읽기 전용, KIS 호출 없음", expanded=True):
         ks = d.get("ks")
         if ks:
             c0, c1, c2, c3 = st.columns(4)
@@ -321,14 +321,14 @@ def render_main() -> None:
             st.caption(f"계산 시각 {str(ks['at'] or '확인 불가')[:19].replace('T', ' ')} — 마지막 회차가 저장한 킬스위치 계산값. "
                        f"기준 {KS_BASE_KRW:,}원, 실현+평가.")
             if ks["daily_triggered"] or ks["cumulative_triggered"]:
-                st.error("⛔ 킬스위치 발동 상태")
+                st.error("킬스위치 발동 상태")
         else:
             st.caption(f"손익률 확인 불가 — kill_switch_state.json {d.get('ks_error', '')}")
 
         if d.get("lock_us"):
-            st.warning("⛔ 미국 실주문 잠금 중 — KIS 앱 해외 체결 확인 필요")
+            st.warning("미국 실주문 잠금 중 — KIS 앱 해외 체결 확인 필요")
         if d.get("lock_kr"):
-            st.warning("⛔ 국내 결과 미확인 잠금 중")
+            st.warning("국내 결과 미확인 잠금 중")
 
         # 2026-11-10 21:07 — 버튼을 누를 때만 지금 시세로 다시 계산(저장 없음)
         _names = {r["코드"]: r["종목"] for r in _holdings_rows(d)}
@@ -373,7 +373,7 @@ def render_main() -> None:
         if d.get("us_log"):
             times.append(f"미국 {d['us_log']['file'][14:22]} {d['us_log']['last_time']}")
         head = ("마지막 회차: " + " / ".join(times) + " · ") if times else ""
-        st.caption(head + "숫자는 회차가 끝날 때 바뀝니다(새로고침). ⚠️ 참고용 화면이며 투자 권유가 아닙니다.")
+        st.caption(head + "숫자는 회차가 끝날 때 바뀝니다(새로고침). 참고용 화면이며 투자 권유가 아닙니다.")
 
 
 # ── 2026-11-10 21:07 — "지금 시세로 다시 계산" (버튼을 누를 때만, 저장 없음) ──
@@ -455,7 +455,7 @@ def render_live(names: dict | None = None) -> None:
     busy = busy_window()
     c1, c2 = st.columns([1, 3])
     with c1:
-        clicked = st.button("📡 지금 시세로 다시 계산", disabled=bool(busy),
+        clicked = st.button("지금 시세로 다시 계산", icon=":material/refresh:", disabled=bool(busy),
                             help="누를 때만 네이버·야후 시세(FinanceDataReader)로 계산합니다. KIS 호출 없음, 저장 없음.")
     with c2:
         if busy:
@@ -474,7 +474,7 @@ def render_live(names: dict | None = None) -> None:
     if "error" in live:
         st.warning(f"지금 시세 계산 확인 불가 — {live['error']}")
         return
-    st.markdown(f"**📡 지금 시세 기준** ({str(live['at'])[:19].replace('T', ' ')} 계산 · 저장 안 함)")
+    st.markdown(f"**지금 시세 기준** ({str(live['at'])[:19].replace('T', ' ')} 계산 · 저장 안 함)")
     m0, m1, m2, m3 = st.columns(4)
     m0.metric("누적 수익률 (A+B)", _pct(live["cumulative_pct"]), _won(live["cumulative_krw"]), delta_color="normal")
     m1.metric("규칙 A", _pct(live["A_pct"]), _won(live["A_krw"]), delta_color="normal")
